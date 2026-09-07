@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="Centrale">
+  <title>Centrale</title>
+  <!-- The tile carries its own background, so the glyph's contrast never
+       depends on the colour of the browser chrome behind it: the same
+       white-on-accent mark stays legible in a light tab strip and a dark
+       one. #2563eb is the accent token from static/styles.css, the colour
+       of the sidebar brand dot. -->
+  <rect width="32" height="32" rx="7" fill="#2563eb"/>
+  <path d="M20.93 9.70 A 8 8 0 1 0 20.93 22.30"
+        fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round"/>
+</svg>

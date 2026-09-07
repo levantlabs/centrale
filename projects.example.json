@@ -1,0 +1,14 @@
+{
+  "port": 7420,
+  "worktreeRoot": "@repo",
+  "browserPortBase": 6421,
+  "defaultAgent": "claude",
+  "agents": {
+    "claude": ["claude"],
+    "codex": ["codex"]
+  },
+  "projects": [
+    {"name": "my-app", "path": "~/code/my-app"},
+    {"name": "my-lib", "path": "~/code/my-lib", "checkCommand": "python3 -m unittest discover tests"}
+  ]
+}

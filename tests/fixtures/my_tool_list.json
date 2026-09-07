@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "kind": "task-list",
+  "tasks": [
+    {
+      "id": "TASK-1",
+      "title": "Backend: config loading and board aggregation API",
+      "status": "In Progress",
+      "type": null,
+      "priority": null,
+      "assignees": ["@claude"],
+      "reporter": null,
+      "labels": [],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 1000,
+      "createdAt": "2026-08-29T20:54:00Z",
+      "updatedAt": "2026-08-29T20:55:00Z"
+    },
+    {
+      "id": "TASK-2",
+      "title": "Frontend: kanban board rendering",
+      "status": "To Do",
+      "type": "task",
+      "priority": "medium",
+      "assignees": [],
+      "reporter": null,
+      "labels": [],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 2000,
+      "createdAt": "2026-08-29T20:54:00Z",
+      "updatedAt": null
+    }
+  ]
+}

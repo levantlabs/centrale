@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "kind": "task-view",
+  "task": {
+    "id": "TASK-2",
+    "title": "Cache the widget index between requests",
+    "status": "In Progress",
+    "type": "task",
+    "priority": "medium",
+    "assignees": ["@claude"],
+    "reporter": null,
+    "labels": ["demo"],
+    "milestone": null,
+    "parentTaskId": null,
+    "ordinal": 2000,
+    "createdAt": "2024-01-05T09:00:00Z",
+    "updatedAt": "2024-01-05T11:30:00Z",
+    "path": "backlog/tasks/task-2 - Cache-the-widget-index-between-requests.md",
+    "description": "Keep the widget index in memory and invalidate it when the catalogue changes.",
+    "dependencies": [],
+    "references": ["docs/BACKLOG.md"],
+    "documentation": [],
+    "modifiedFiles": [],
+    "subtasks": [],
+    "acceptanceCriteria": [
+      {"index": 1, "text": "Index is served from cache on a repeat request", "checked": false},
+      {"index": 2, "text": "Cache is invalidated when the catalogue changes", "checked": false}
+    ],
+    "implementationPlan": "1. Add the cache.\n2. Wire up invalidation.\n3. Cover both with tests.",
+    "implementationNotes": null
+  }
+}

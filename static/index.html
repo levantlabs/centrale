@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Centrale</title>
+<!-- Stays inline, in <head>, ahead of the stylesheet: it must run before
+     the first styled paint or the wrong theme flashes. The external
+     frontend files could not (they load at the end of <body>), so this
+     one bootstrap's position is load-bearing and is deliberately not
+     moved. -->
+<script>
+  // Applied before first paint to avoid a flash of the wrong theme.
+  // Three states: an explicit choice (data-theme) always wins; with no
+  // choice stored, plain CSS `@media (prefers-color-scheme)` follows the
+  // system setting live, with no JS needed for that case.
+  (function () {
+    "use strict";
+    var STORAGE_KEY = "centrale-theme";
+
+    function readStored() {
+      try {
+        var v = window.localStorage.getItem(STORAGE_KEY);
+        return (v === "light" || v === "dark") ? v : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function apply(theme) {
+      var root = document.documentElement;
+      if (theme === "light" || theme === "dark") {
+        root.setAttribute("data-theme", theme);
+      } else {
+        root.removeAttribute("data-theme");
+      }
+    }
+
+    apply(readStored());
+
+    window.CentraleTheme = {
+      current: function () {
+        var stored = readStored();
+        if (stored) return stored;
+        try {
+          if (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches) {
+            return "dark";
+          }
+        } catch (e) { /* matchMedia unavailable: fall through to light */ }
+        return "light";
+      },
+      hasExplicitChoice: function () { return !!readStored(); },
+      set: function (theme) {
+        apply(theme);
+        try {
+          if (theme === "light" || theme === "dark") {
+            window.localStorage.setItem(STORAGE_KEY, theme);
+          } else {
+            window.localStorage.removeItem(STORAGE_KEY);
+          }
+        } catch (e) { /* storage unavailable: theme still applied in-memory */ }
+      }
+    };
+  })();
+</script>
+<!-- Declared here so the browser stops guessing at /favicon.ico (which
+     Centrale never served, so every load logged a 404). Sits after the
+     theme bootstrap: that script must stay first in <head>. -->
+<link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+
+  <div id="app">
+    <aside id="sidebar">
+      <div id="sidebar-top">
+        <button id="sidebar-toggle" type="button" title="Collapse sidebar" aria-label="Collapse sidebar">
+          <!-- Same chevron Backlog.md's own sidebar toggle uses, so the two
+               UIs agree on this control: a stroked chevron-left, not the
+               filled ◀ glyph this button used to carry (whose weight and
+               shape varied with the system font). Rotated 180° by CSS when
+               the sidebar is collapsed. -->
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 19l-7-7 7-7"></path>
+          </svg>
+        </button>
+        <div id="brand"><span class="dot"></span><span class="sidebar-full-only">Centrale</span></div>
+      </div>
+
+      <div id="search-box" class="sidebar-full-only">
+        <span class="icon">&#128269;</span>
+        <input id="search-input" type="text" placeholder="Search titles, IDs, labels&hellip;" autocomplete="off">
+        <span class="kbd-hint" id="search-kbd-hint"></span>
+        <button type="button" class="search-clear" id="search-clear" aria-label="Clear search" title="Clear search">&#10005;</button>
+      </div>
+
+      <nav id="sidebar-nav" class="sidebar-full-only">
+        <div class="sidebar-section">
+          <div class="sidebar-section-header">
+            <span class="sidebar-section-title">Projects</span>
+            <span class="sidebar-section-header-right">
+              <button type="button" id="projects-reset-all" class="sidebar-reset-all" hidden>All</button>
+              <span class="sidebar-section-count" id="projects-count">0</span>
+            </span>
+          </div>
+          <div id="project-chips" class="sidebar-list"></div>
+        </div>
+        <div class="sidebar-section">
+          <div class="sidebar-section-header">
+            <span class="sidebar-section-title">Sessions</span>
+            <span class="sidebar-section-count" id="sessions-count">0</span>
+          </div>
+          <div id="sessions-list" class="sidebar-list"></div>
+          <button type="button" id="harvest-all-btn" class="btn btn-sm" title="Merge every task/&lt;id&gt; branch across all projects whose safety gates all pass">Merge all ready</button>
+        </div>
+      </nav>
+
+      <div id="sidebar-footer" class="sidebar-full-only">
+        <div id="refresh-area">
+          <span id="last-updated"></span>
+          <span id="countdown"></span>
+          <button class="btn btn-sm" id="refresh-btn">Refresh</button>
+        </div>
+        <div id="footer-credit">
+          <!-- task-107: the build THIS server process started from, as a
+               quiet credit beside the gear -- not a control. Filled in by
+               shell.js from the board payload; empty until the first
+               board load answers. -->
+          <span id="version"></span>
+          <button type="button" id="settings-open" title="Settings" aria-label="Settings">&#9881;</button>
+        </div>
+      </div>
+    </aside>
+
+    <div id="main">
+      <header id="header">
+        <!-- task-98: the product's own name is its front door -- anyone
+             running Centrale can get from the header to where it came
+             from. Styled by inheritance so the h1 still reads as a
+             title; see "#header h1 > a" in static/styles.css. -->
+        <h1><a href="https://github.com/levantlabs/centrale" target="_blank" rel="noopener noreferrer">Centrale</a> <span class="tagline">a companion to <a href="https://github.com/MrLesk/Backlog.md" target="_blank" rel="noopener noreferrer">Backlog.md</a></span></h1>
+        <button id="theme-toggle" type="button" title="Toggle theme"></button>
+      </header>
+
+      <div id="global-error" hidden></div>
+      <div id="project-errors" hidden></div>
+      <div id="tmux-hint-banner" hidden>
+        <span id="tmux-hint-text"></span>
+        <button type="button" id="tmux-hint-dismiss" aria-label="Dismiss">&#10005;</button>
+      </div>
+      <!-- task-128: shown only while the checkout this server runs from
+           has moved past the commit the process loaded -- the code on
+           disk has changed and a restart is needed. Filled in by
+           shell.js from the board payload's codeDrift; hidden whenever
+           that is null, absent, or the server cannot tell. No dismiss:
+           the one way to make it go away is the restart it asks for. -->
+      <div id="code-drift-banner" hidden role="status">
+        <span id="code-drift-text"></span>
+      </div>
+
+      <main id="board-wrap">
+        <div id="page-heading-row">
+          <h2 id="page-title">Kanban Board</h2>
+        </div>
+        <div id="filter-row">
+          <label class="toggle-field" title="Show only tasks that can be started now: not done, not in progress, and no unfinished dependencies">
+            <span class="switch">
+              <input type="checkbox" id="ready-toggle">
+              <span class="track"><span class="knob"></span></span>
+            </span>
+            Ready to start
+          </label>
+          <label class="select-field" id="milestone-field" hidden title="Show only tasks in one milestone. Populated from the milestones present on the loaded board -- milestones themselves are created and renamed with the backlog CLI, not here.">
+            Milestone
+            <select id="milestone-filter" class="filter-select"></select>
+          </label>
+        </div>
+        <div id="loading-hint">
+          <h2>Loading board&hellip;</h2>
+          <div>Fetching <code>/api/board</code></div>
+        </div>
+        <div id="empty-hint" hidden>
+          <h2>Welcome to Centrale</h2>
+          <div>No projects yet — add one from Settings to get your board started.</div>
+          <button type="button" id="empty-hint-add-project" class="btn btn-primary">Add a project</button>
+          <div id="empty-hint-alt">Or copy <code>projects.example.json</code> to <code>projects.json</code>, edit its <code>projects</code> to point at repos on this machine, and restart.</div>
+        </div>
+        <div id="board" hidden></div>
+      </main>
+    </div>
+  </div>
+
+  <div id="drawer-backdrop"></div>
+  <aside id="drawer" aria-hidden="true">
+    <div id="drawer-header">
+      <div class="top-row">
+        <div>
+          <div id="drawer-title">&nbsp;</div>
+          <div id="drawer-id"></div>
+        </div>
+        <div id="drawer-header-actions">
+          <button id="drawer-open-board" class="btn btn-sm" title="Open this task on the Backlog.md board">Open task</button>
+          <button id="drawer-close" title="Close (Esc)">&#10005;</button>
+        </div>
+      </div>
+      <div id="drawer-meta-row"></div>
+    </div>
+    <!-- tabindex="-1" so a refresh that rebuilt the body has somewhere
+         inside the drawer to put keyboard focus when the element that
+         had it is gone (task-127). Not tab-reachable: only the
+         restore path ever focuses it. -->
+    <div id="drawer-body" tabindex="-1"></div>
+    <div id="drawer-session-area"></div>
+    <div id="drawer-pane-area"></div>
+    <div id="drawer-harvest-area"></div>
+    <div id="drawer-spawn-area"></div>
+  </aside>
+
+  <!-- task-73: session theater. Same skeleton as the settings modal
+       below; its content is the drawer's #drawer-pane-area node, moved
+       in here while open (see openTheater) -- so it is empty otherwise. -->
+  <div id="theater-backdrop"></div>
+  <div id="theater" role="dialog" aria-modal="true" aria-labelledby="drawer-pane-title" aria-hidden="true"></div>
+
+  <div id="settings-backdrop"></div>
+  <div id="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title" aria-hidden="true">
+    <div id="settings-header">
+      <span id="settings-title">Settings</span>
+      <button type="button" id="settings-close" title="Close (Esc)" aria-label="Close settings">&#10005;</button>
+    </div>
+    <div id="settings-body">
+      <div class="settings-section">
+        <label class="toggle-field" for="settings-harvest-mode-toggle" title="When on, a background thread merges any branch that passes all five safety gates on its own, roughly every 30 seconds -- no click needed.">
+          <span class="switch">
+            <input type="checkbox" id="settings-harvest-mode-toggle">
+            <span class="track"><span class="knob"></span></span>
+          </span>
+          Automatically merge branches when all safety gates pass
+        </label>
+        <div class="settings-hint">Read live -- takes effect on the next auto-merge cycle, no restart needed.</div>
+        <div class="settings-field-error" id="settings-error-harvestMode" hidden></div>
+      </div>
+
+      <div class="settings-section">
+        <label class="toggle-field" for="settings-session-preview-toggle" title="When on, the task drawer of a task with a live tmux session shows a read-only, ~2s-refreshing capture of what the agent is displaying. Off disables the drawer section AND the /api/session-pane endpoint.">
+          <span class="switch">
+            <input type="checkbox" id="settings-session-preview-toggle">
+            <span class="track"><span class="knob"></span></span>
+          </span>
+          Show the live session pane in the task drawer
+        </label>
+        <div class="settings-hint">Read-only view of the agent's tmux pane, refreshed about every 2s while the drawer is open. Off also disables the server endpoint, not just the UI.</div>
+        <label class="toggle-field" for="settings-session-reply-toggle" id="settings-session-reply-field" style="margin-top: 10px;" title="When on, the live pane gets a single-line reply box plus Esc and Enter buttons, delivered straight into the agent's tmux session (the line as a bracketed paste plus Enter, the two keys by tmux send-keys). Off removes them AND makes POST /api/session-input refuse, while the read-only pane keeps working. Needs the live pane above.">
+          <span class="switch">
+            <input type="checkbox" id="settings-session-reply-toggle">
+            <span class="track"><span class="knob"></span></span>
+          </span>
+          Allow replying to the agent from the drawer (send text and keys)
+        </label>
+        <div class="settings-hint">Single-line text replies plus the Esc and Enter keys -- no multi-line input, and no other key. Off removes the reply row and makes the reply endpoint refuse; the read-only pane stays on. Stored as <code>sessionPreview.mode</code>: <code>interact</code> / <code>view</code> / <code>off</code>.</div>
+        <div class="settings-field-error" id="settings-error-sessionPreviewMode" hidden></div>
+      </div>
+
+      <div class="settings-section">
+        <label class="settings-label" for="settings-refresh-interval">Board auto-refresh interval (seconds)</label>
+        <input type="number" id="settings-refresh-interval" class="settings-input" min="5" step="1">
+        <div class="settings-hint">Only affects future refreshes -- won't change the countdown already running.</div>
+        <div class="settings-field-error" id="settings-error-refreshIntervalSeconds" hidden></div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-label">Per-project test command</div>
+        <div class="settings-hint" style="margin-top: 0; margin-bottom: 8px;">
+          Run against the merged tree before a merge completes; empty = no test gate. Only affects future merge attempts.
+        </div>
+        <div id="settings-check-commands"></div>
+      </div>
+
+      <!-- task-78: the Agents editor. A <details> collapsed by default so
+           the settings view stays as quiet as before until it is opened;
+           the summary line carries what the old Default-agent section
+           showed (the current default) so nothing is lost while closed.
+           If the modal ever needs a third heavyweight section, THAT is
+           when tabs happen -- not now. -->
+      <details class="settings-section" id="settings-agents-section">
+        <summary id="settings-agents-summary" title="Which CLI gets spawned for a task, by assignee name. Click to expand.">Agents</summary>
+        <div class="settings-agents-body">
+          <div class="settings-hint settings-agents-store">Stored in <code>projects.json</code> (the <code>"agents"</code> map next to <code>server.py</code>) -- hand-edit it there if you prefer; edits made here apply live to the next spawn, no restart.</div>
+          <div id="settings-agents-table"></div>
+          <button type="button" id="settings-add-agent-btn" class="btn btn-sm">+ Add agent</button>
+          <div class="settings-field-error" id="settings-error-agents" hidden></div>
+          <label class="settings-label settings-agents-default-label" for="settings-default-agent">Default agent</label>
+          <select id="settings-default-agent" class="settings-input"></select>
+          <div class="settings-hint">Used to spawn a task when no assignee matches a configured agent name.</div>
+          <div class="settings-field-error" id="settings-error-defaultAgent" hidden></div>
+          <div class="settings-hint">Agent changes are saved with the Save button below, together with the other settings.</div>
+        </div>
+      </details>
+
+      <div class="settings-section">
+        <div class="settings-label">Projects</div>
+        <div class="settings-hint" style="margin-top: 0; margin-bottom: 8px;">
+          Removing a project only removes it from this dashboard's config -- the repo itself is never touched.
+        </div>
+        <div id="settings-projects-list"></div>
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-label">Add a project</div>
+        <input type="text" id="settings-add-project-name" class="settings-input" placeholder="Name (e.g. my-app)">
+        <div class="settings-field-error" id="settings-error-addProject.name" hidden></div>
+        <input type="text" id="settings-add-project-path" class="settings-input" style="margin-top: 6px;" placeholder="Path (e.g. ~/code/my-app)">
+        <div class="settings-field-error" id="settings-error-addProject.path" hidden></div>
+        <label class="toggle-field" style="margin-top: 10px;" title="Only needed if the repo has no backlog/config.yml yet -- runs 'backlog init' in it.">
+          <span class="switch">
+            <input type="checkbox" id="settings-add-project-init">
+            <span class="track"><span class="knob"></span></span>
+          </span>
+          Initialize Backlog.md in this repo
+        </label>
+        <div id="settings-add-project-status" class="settings-hint"></div>
+        <button type="button" id="settings-add-project-btn" class="btn btn-sm" style="margin-top: 10px;">Add project</button>
+      </div>
+    </div>
+    <div id="settings-footer">
+      <div id="settings-status"></div>
+      <button type="button" id="settings-save" class="btn btn-primary">Save</button>
+    </div>
+  </div>
+
+  <div id="toast-container"></div>
+
+<!-- The frontend: one plain script tag per concern (task-89), all of
+     them here at the end of <body> rather than in <head>, because the
+     code queries and wires up the markup above as soon as it runs -- so
+     this position (DOM already parsed) is load-bearing and there is no
+     defer/async. No build step, no bundler, no modules: the files share
+     one window.Centrale namespace object, and every cross-file reference
+     goes through it (see static/state.js for that seam), which makes
+     those references late-bound and this order almost free.
+
+     Almost: a few of the files run statements as they load -- state.js
+     reads localStorage, pane.js/shell.js/settings.js attach listeners to
+     the markup, main.js fires the first refresh -- so state.js and
+     dom.js have to come before those, and main.js has to come last.
+     Otherwise the files keep the order the sections had inside the
+     single app.js they were split out of. -->
+<script src="/static/state.js"></script>
+<script src="/static/dom.js"></script>
+<script src="/static/api.js"></script>
+<script src="/static/tasks.js"></script>
+<script src="/static/feedback.js"></script>
+<script src="/static/board.js"></script>
+<script src="/static/spawn.js"></script>
+<script src="/static/harvest.js"></script>
+<script src="/static/sessions.js"></script>
+<script src="/static/drawer.js"></script>
+<script src="/static/pane.js"></script>
+<script src="/static/shell.js"></script>
+<script src="/static/settings.js"></script>
+<script src="/static/main.js"></script>
+</body>
+</html>

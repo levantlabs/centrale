@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# task-49: a spawn adds its worktree root to the TARGET project's own
+# .git/info/exclude -- for the shipped "@repo" worktreeRoot default,
+# that root lives inside the project itself, so spawning centrale against
+# its own board puts one right here. info/exclude is local-only and
+# never travels with a clone, so without this a stranger's first spawn
+# against this repo would show up as untracked/dirty in `git status`.
+.centrale-worktrees/
+
+# Local scratch/log artifacts -- e.g. the README's own backgrounding
+# example (`nohup python3 server.py > centrale.log 2>&1 &`).
+*.log
+
+# The real local config never ships -- projects.example.json is the
+# documented starting point (task-49 audit / owner decision).
+projects.json
+
+# task-56: scripts/release.sh's own config -- the public remote URL and
+# a clean release identity. Deliberately untracked: since release.sh
+# builds every release from `git archive HEAD` (tracked content only),
+# this being gitignored is what guarantees it can never ride along into
+# a published snapshot even by accident.
+.release-remote

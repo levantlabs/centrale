@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "kind": "task-list",
+  "tasks": [
+    {
+      "id": "TASK-1",
+      "title": "Add a health-check endpoint",
+      "status": "To Do",
+      "type": "task",
+      "priority": "high",
+      "assignees": [],
+      "reporter": null,
+      "labels": [],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 1000,
+      "createdAt": "2024-01-05T09:00:00Z",
+      "updatedAt": null
+    },
+    {
+      "id": "TASK-3",
+      "title": "Write the getting-started guide",
+      "status": "Done",
+      "type": "task",
+      "priority": "low",
+      "assignees": [],
+      "reporter": null,
+      "labels": ["demo"],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 3000,
+      "createdAt": "2024-01-05T09:00:00Z",
+      "updatedAt": "2024-01-05T14:00:00Z"
+    }
+  ]
+}

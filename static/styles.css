@@ -1,0 +1,2071 @@
+  /* Palette mirrors Backlog.md's own web UI: Tailwind gray/blue, white
+     surfaces over a gray-50 canvas in light, gray-800 surfaces over a
+     gray-900 canvas in dark. Light is the default; dark applies either
+     automatically (prefers-color-scheme, no stored choice) or explicitly
+     ([data-theme], set by the toggle button and persisted). */
+  :root {
+    color-scheme: light dark;
+    --bg: #f9fafb;
+    --bg-elevated: #ffffff;
+    --bg-card: #ffffff;
+    --bg-card-hover: #f9fafb;
+    --bg-hover: #f3f4f6;
+    --bg-input: #ffffff;
+    --border: #e5e7eb;
+    --border-strong: #d1d5db;
+    --text: #111827;
+    --text-dim: #4b5563;
+    --text-faint: #6b7280;
+    --accent: #2563eb;
+    --accent-strong: #1d4ed8;
+    --accent-dim: #eff6ff;
+    --focus-ring: rgba(59, 130, 246, 0.5);
+    --danger: #b91c1c;
+    --danger-dim: #fee2e2;
+    --warning: #92400e;
+    --warning-dim: #fef3c7;
+    --success: #15803d;
+    --success-dim: #dcfce7;
+    --low: #374151;
+    --low-dim: #f3f4f6;
+    --backdrop: rgba(0, 0, 0, 0.4);
+    --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+    --shadow-md: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+    --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.1), 0 4px 6px -4px rgb(0 0 0 / 0.1);
+    --shadow-drawer: -8px 0 24px rgb(0 0 0 / 0.08);
+    --scrollbar-thumb: rgba(0, 0, 0, 0.22);
+    --scrollbar-thumb-hover: rgba(0, 0, 0, 0.36);
+    --radius-sm: 6px;
+    --radius: 8px;
+    --radius-lg: 12px;
+    --font: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    /* Only when the user hasn't made an explicit choice (no [data-theme]) --
+       an explicit choice always wins over the system preference. */
+    :root:not([data-theme]) {
+      color-scheme: dark;
+      --bg: #111827;
+      --bg-elevated: #111827;
+      --bg-card: #1f2937;
+      --bg-card-hover: #374151;
+      --bg-hover: #374151;
+      --bg-input: #374151;
+      --border: #374151;
+      --border-strong: #4b5563;
+      --text: #f3f4f6;
+      --text-dim: #9ca3af;
+      --text-faint: #6b7280;
+      --accent-dim: rgba(37, 99, 235, 0.2);
+      --focus-ring: rgba(96, 165, 250, 0.5);
+      --danger: #fca5a5;
+      --danger-dim: rgba(127, 29, 29, 0.35);
+      --warning: #fcd34d;
+      --warning-dim: rgba(120, 53, 15, 0.35);
+      --success: #86efac;
+      --success-dim: rgba(20, 83, 45, 0.35);
+      --low: #d1d5db;
+      --low-dim: rgba(55, 65, 81, 0.6);
+      --backdrop: rgba(0, 0, 0, 0.6);
+      --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
+      --shadow-md: 0 1px 3px 0 rgb(0 0 0 / 0.4), 0 1px 2px -1px rgb(0 0 0 / 0.4);
+      --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.4), 0 4px 6px -4px rgb(0 0 0 / 0.4);
+      --shadow-drawer: -8px 0 28px rgb(0 0 0 / 0.45);
+      --scrollbar-thumb: rgba(255, 255, 255, 0.2);
+      --scrollbar-thumb-hover: rgba(255, 255, 255, 0.36);
+    }
+  }
+
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --bg: #111827;
+    --bg-elevated: #111827;
+    --bg-card: #1f2937;
+    --bg-card-hover: #374151;
+    --bg-hover: #374151;
+    --bg-input: #374151;
+    --border: #374151;
+    --border-strong: #4b5563;
+    --text: #f3f4f6;
+    --text-dim: #9ca3af;
+    --text-faint: #6b7280;
+    --accent-dim: rgba(37, 99, 235, 0.2);
+    --focus-ring: rgba(96, 165, 250, 0.5);
+    --danger: #fca5a5;
+    --danger-dim: rgba(127, 29, 29, 0.35);
+    --warning: #fcd34d;
+    --warning-dim: rgba(120, 53, 15, 0.35);
+    --success: #86efac;
+    --success-dim: rgba(20, 83, 45, 0.35);
+    --low: #d1d5db;
+    --low-dim: rgba(55, 65, 81, 0.6);
+    --backdrop: rgba(0, 0, 0, 0.6);
+    --shadow-sm: 0 1px 2px 0 rgb(0 0 0 / 0.3);
+    --shadow-md: 0 1px 3px 0 rgb(0 0 0 / 0.4), 0 1px 2px -1px rgb(0 0 0 / 0.4);
+    --shadow-lg: 0 10px 15px -3px rgb(0 0 0 / 0.4), 0 4px 6px -4px rgb(0 0 0 / 0.4);
+    --shadow-drawer: -8px 0 28px rgb(0 0 0 / 0.45);
+    --scrollbar-thumb: rgba(255, 255, 255, 0.2);
+    --scrollbar-thumb-hover: rgba(255, 255, 255, 0.36);
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 14px;
+    line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body {
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transition: background-color .15s ease, color .15s ease;
+  }
+
+  * { scrollbar-width: thin; scrollbar-color: var(--scrollbar-thumb) transparent; }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background-color: var(--scrollbar-thumb); border-radius: 6px; border: 2px solid transparent; background-clip: padding-box; }
+  ::-webkit-scrollbar-thumb:hover { background-color: var(--scrollbar-thumb-hover); background-clip: padding-box; }
+
+  button {
+    font-family: inherit;
+    font-size: inherit;
+    cursor: pointer;
+  }
+
+  button:disabled { cursor: not-allowed; opacity: 0.55; }
+
+  input[type="text"], input[type="search"] {
+    font-family: inherit;
+    font-size: inherit;
+  }
+
+  a { color: var(--accent); }
+
+  /* ---------------- App shell: sidebar + main ---------------- */
+
+  #app {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+    overflow: hidden;
+  }
+
+  #sidebar {
+    flex: none;
+    width: 280px;
+    background: var(--bg);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    transition: width .2s ease;
+  }
+  #sidebar.collapsed { width: 60px; }
+  #sidebar.collapsed .sidebar-full-only { display: none; }
+
+  #main {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  #sidebar-top {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 14px;
+    min-height: 72px;
+  }
+
+  #sidebar-toggle {
+    flex: none;
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-card);
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 11px;
+    line-height: 1;
+    transition: border-color .12s ease, color .12s ease, transform .2s ease;
+  }
+  #sidebar-toggle svg { width: 15px; height: 15px; display: block; }
+  #sidebar-toggle:hover { color: var(--text); border-color: var(--accent); }
+  #sidebar.collapsed #sidebar-toggle { transform: rotate(180deg); }
+
+  #brand {
+    font-weight: 700;
+    font-size: 14px;
+    letter-spacing: 0.2px;
+    color: var(--text);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+  }
+  #brand .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+
+  #search-box {
+    flex: none;
+    position: relative;
+    display: flex;
+    align-items: center;
+    padding: 10px 14px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  #search-box input {
+    width: 100%;
+    background: var(--bg-input);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    border-radius: var(--radius);
+    padding: 7px 28px 7px 30px;
+    outline: none;
+    font-size: 13px;
+    transition: border-color .12s ease, box-shadow .12s ease;
+  }
+  #search-box input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+  #search-box .icon {
+    position: absolute;
+    left: 24px;
+    color: var(--text-faint);
+    pointer-events: none;
+    font-size: 12px;
+  }
+  #search-box .kbd-hint {
+    position: absolute;
+    right: 22px;
+    color: var(--text-faint);
+    background: var(--bg-hover);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 10px;
+    font-family: var(--mono);
+    line-height: 1.5;
+    pointer-events: none;
+    white-space: nowrap;
+  }
+  /* Hidden once the field is focused or has a query, so it never
+     overlaps typed text (mirrors the same idle-hint convention as
+     search bars with a visible keyboard shortcut elsewhere). */
+  #search-box input:focus ~ .kbd-hint,
+  #search-box input:not(:placeholder-shown) ~ .kbd-hint {
+    display: none;
+  }
+
+  /* The right-hand slot swaps with the kbd hint: empty shows the
+     shortcut chip above, a non-empty query shows this clear button
+     instead (regardless of focus) -- the two conditions never overlap,
+     since :placeholder-shown reflects the value alone. */
+  #search-box .search-clear {
+    display: none;
+    position: absolute;
+    /* Positioned against #search-box, which carries 14px of horizontal
+       padding -- so an 8px inset INSIDE the input's right edge is 22px
+       from the box. At 8px the button overhung the input's border by
+       exactly 6px and read as sitting outside the field. */
+    right: 22px;
+    align-items: center;
+    justify-content: center;
+    width: 20px;
+    height: 20px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    color: var(--text-faint);
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+    transition: color .12s ease, background .12s ease;
+  }
+  #search-box input:not(:placeholder-shown) ~ .search-clear { display: flex; }
+  #search-box .search-clear:hover { color: var(--text-dim); background: var(--bg-hover); }
+  #search-box .search-clear:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+
+  #sidebar-nav {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    overflow-x: hidden;
+    min-height: 0;
+    padding: 8px 0;
+  }
+
+  .sidebar-section { padding: 6px 0; }
+  .sidebar-section + .sidebar-section { border-top: 1px solid var(--border); margin-top: 4px; }
+  .sidebar-section-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 14px 6px;
+  }
+  .sidebar-section-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-faint);
+  }
+  .sidebar-section-count {
+    font-size: 10.5px;
+    color: var(--text-faint);
+    background: var(--bg-hover);
+    border-radius: 999px;
+    padding: 1px 7px;
+  }
+  .sidebar-section-header-right {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .sidebar-reset-all {
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--accent);
+    background: transparent;
+    border: none;
+    padding: 1px 4px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  .sidebar-reset-all:hover { background: var(--accent-dim); }
+  .sidebar-reset-all:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+  .sidebar-list {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 0 8px;
+  }
+  .sidebar-empty {
+    color: var(--text-faint);
+    font-size: 12px;
+    font-style: italic;
+    padding: 6px 14px;
+  }
+
+  #harvest-all-btn {
+    display: block;
+    width: calc(100% - 16px);
+    margin: 8px 8px 0;
+  }
+
+  #sidebar-footer {
+    /* Refresh status on the left, the version credit and the settings
+       gear together on the right (task-107) -- the two are one flex
+       child so space-between keeps the credit BESIDE the gear instead
+       of centring it between the two ends. */
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 10px 14px;
+    border-top: 1px solid var(--border);
+  }
+
+  #footer-credit {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  /* task-107: which build this server process is running. Deliberately
+     quiet -- the same faint colour and size as the refresh status
+     across the footer, no border, no hover, no pointer: it is a credit
+     to read, not a control to press. Ellipsised rather than wrapped so
+     a long describe string ("v0.1.0-14-g4570911-dirty") can never push
+     the gear off the row. */
+  #version {
+    font-size: 11px;
+    color: var(--text-faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-variant-numeric: tabular-nums;
+  }
+
+  #theme-toggle, #settings-open {
+    background: transparent;
+    border: none;
+    color: var(--text-dim);
+    width: 34px; height: 34px;
+    border-radius: var(--radius);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    font-size: 15px;
+    line-height: 1;
+    transition: background .12s ease, color .12s ease;
+  }
+  #theme-toggle:hover, #settings-open:hover { color: var(--text); background: var(--bg-hover); }
+  #theme-toggle:focus-visible, #settings-open:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+
+  /* Project + session rows, both rendered as full-width list rows (not
+     pill chips) inside the sidebar's PROJECTS / SESSIONS sections. */
+  .chip {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 8px;
+    border-radius: var(--radius-sm);
+    font-size: 12.5px;
+    font-weight: 500;
+    background: transparent;
+    color: var(--text-dim);
+    user-select: none;
+  }
+  .chip-btn { transition: background .12s ease, color .12s ease, opacity .12s ease; }
+  .chip-btn.active { background: var(--accent-dim); color: var(--accent); font-weight: 600; }
+  .chip-btn:not(.active) { opacity: 0.6; }
+  .chip-btn:hover { background: var(--bg-hover); opacity: 1; }
+  .chip-btn .warn-mark { color: var(--warning); font-weight: 800; }
+  .chip-checkbox {
+    flex: none;
+    width: 13px;
+    height: 13px;
+    margin: 0;
+    accent-color: var(--text-dim);
+    cursor: pointer;
+  }
+  .chip-checkbox:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); border-radius: 3px; }
+  .chip .proj-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip .proj-count {
+    flex: none;
+    font-size: 10.5px;
+    font-weight: 600;
+    color: var(--text-faint);
+    background: var(--bg-hover);
+    border-radius: 999px;
+    padding: 1px 6px;
+  }
+
+  /* ---------------- Slim main-content top bar ---------------- */
+
+  #header {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 32px;
+    height: 72px;
+    background: var(--bg-elevated);
+    border-bottom: 1px solid var(--border);
+    z-index: 20;
+  }
+  #header h1 {
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0;
+    color: var(--text);
+  }
+  #header h1 .tagline {
+    margin-left: 10px;
+    font-size: 12.5px;
+    font-weight: 400;
+    color: var(--text-faint);
+  }
+  /* task-98: the name links to Centrale's own repository, the same quiet
+     treatment the tagline's Backlog.md credit gets one rule below -- the
+     text's own colour, a dotted underline that goes solid on hover. The
+     underline is drawn at the tagline's faint colour rather than at
+     currentColor: under 20px bold at the title's full strength a dotted
+     rule reads as a solid one, which both shouts and leaves the hover
+     state indistinguishable from the resting one. Faint at rest,
+     currentColor and solid on hover, so the header stays a title with
+     two links in it rather than a row of links. */
+  #header h1 > a {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dotted var(--text-faint);
+  }
+  #header h1 > a:hover {
+    border-bottom-style: solid;
+    border-bottom-color: currentColor;
+  }
+  #header h1 > a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+  /* The tagline names Backlog.md, so it links to it -- the credit belongs
+     where the name is. Styled as part of the tagline (same faint colour,
+     underline only on hover) so it stays a quiet credit rather than a
+     call to action; the rule above gives the title's own link the same
+     treatment at the title's colour. */
+  #header h1 .tagline a {
+    color: inherit;
+    text-decoration: none;
+    border-bottom: 1px dotted currentColor;
+  }
+  #header h1 .tagline a:hover { color: var(--text-dim); border-bottom-style: solid; }
+  #header h1 .tagline a:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  /* ---------------- Page heading + filter row ---------------- */
+
+  #page-heading-row {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 14px;
+  }
+  #page-title {
+    font-size: 20px;
+    font-weight: 700;
+    margin: 0;
+    color: var(--text);
+  }
+
+  #filter-row {
+    flex: none;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 16px;
+  }
+
+  .toggle-field {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+    user-select: none;
+  }
+
+  .switch {
+    position: relative;
+    width: 34px;
+    height: 19px;
+    flex: none;
+  }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-input);
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    transition: background .15s ease, border-color .15s ease;
+  }
+  .switch .knob {
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 13px; height: 13px;
+    background: var(--text-faint);
+    border-radius: 50%;
+    transition: transform .15s ease, background .15s ease;
+  }
+  .switch input:checked + .track { background: var(--accent-dim); border-color: var(--accent); }
+  .switch input:checked + .track .knob { transform: translateX(15px); background: var(--accent); }
+  .switch input:disabled + .track { opacity: .45; cursor: not-allowed; }
+  .toggle-field.disabled { color: var(--text-faint); cursor: not-allowed; }
+
+  /* task-86: the milestone dropdown sits in the same filter row as the
+     ready toggle and borrows its label typography. */
+  .select-field {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 12.5px;
+    color: var(--text-dim);
+    user-select: none;
+  }
+  .filter-select {
+    background: var(--bg-input);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    padding: 3px 6px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-family: inherit;
+    max-width: 260px;
+  }
+  .filter-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+
+  /* ---------------- Settings modal ---------------- */
+
+  #settings-backdrop {
+    position: fixed;
+    inset: 0;
+    background: var(--backdrop);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .16s ease;
+    z-index: 60;
+  }
+  #settings-backdrop.open { opacity: 1; pointer-events: auto; }
+
+  #settings-modal {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -48%);
+    width: 480px;
+    max-width: 92vw;
+    max-height: 84vh;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-drawer);
+    z-index: 70;
+    display: flex;
+    flex-direction: column;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .16s ease, transform .16s ease;
+  }
+  #settings-modal.open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%); }
+
+  #settings-header {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 700;
+    font-size: 15px;
+  }
+  #settings-close {
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--text-dim);
+    width: 26px; height: 26px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    font-size: 12px;
+    line-height: 1;
+  }
+  #settings-close:hover { color: var(--text); border-color: var(--accent); }
+  #settings-close:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+
+  #settings-body {
+    flex: 1 1 auto;
+    overflow-y: auto;
+    padding: 16px 18px;
+  }
+  .settings-section { margin-bottom: 20px; }
+  .settings-section:last-child { margin-bottom: 0; }
+  .settings-label {
+    display: block;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 6px;
+  }
+  .settings-hint {
+    font-size: 11.5px;
+    color: var(--text-faint);
+    margin-top: 5px;
+  }
+  .settings-hint.error { color: var(--danger); }
+  .settings-hint.success { color: var(--success); }
+  .settings-input {
+    width: 100%;
+    background: var(--bg-input);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    padding: 6px 9px;
+    border-radius: var(--radius-sm);
+    font-size: 12.5px;
+    font-family: inherit;
+  }
+  .settings-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+  .settings-field-error {
+    font-size: 11.5px;
+    color: var(--danger);
+    margin-top: 4px;
+  }
+  .settings-check-command-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .settings-check-command-row:last-child { margin-bottom: 0; }
+  .settings-check-command-name {
+    flex: none;
+    width: 88px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .settings-project-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+  .settings-project-row:last-child { margin-bottom: 0; }
+  .settings-project-info { flex: 1 1 auto; min-width: 0; }
+  .settings-project-name {
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .settings-project-path {
+    font-size: 11px;
+    color: var(--text-faint);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  /* task-78: Agents editor (collapsed <details> section). */
+  #settings-agents-section > summary {
+    cursor: pointer;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12.5px;
+    font-weight: 600;
+    color: var(--text);
+    user-select: none;
+    border-radius: var(--radius-sm);
+  }
+  #settings-agents-section > summary::-webkit-details-marker { display: none; }
+  #settings-agents-section > summary::before {
+    content: "\25B8";
+    font-size: 10px;
+    color: var(--text-faint);
+    transition: transform .12s ease;
+  }
+  #settings-agents-section[open] > summary::before { transform: rotate(90deg); }
+  #settings-agents-section > summary:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+  .settings-agents-summary-detail { font-weight: 400; color: var(--text-faint); }
+  .settings-agents-body { margin-top: 8px; }
+  .settings-agents-store { margin-top: 0; margin-bottom: 8px; }
+  .settings-agents-default-label { margin-top: 14px; }
+  .settings-agent-row {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px;
+    margin-bottom: 8px;
+  }
+  .settings-agent-row.builtin { border-style: dashed; }
+  .settings-agent-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .settings-agent-name { flex: 1 1 auto; min-width: 0; font-weight: 600; }
+  .settings-agent-row.builtin .settings-agent-name {
+    background: transparent;
+    border-color: transparent;
+    color: var(--text-dim);
+    padding-left: 0;
+  }
+  .settings-agent-tag {
+    flex: none;
+    font-size: 10.5px;
+    color: var(--text-faint);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 7px;
+    white-space: nowrap;
+  }
+  .settings-agent-tag.warn { color: var(--warning); border-color: var(--warning); background: var(--warning-dim); }
+  .settings-agent-cmd, .settings-agent-suffix { margin-top: 6px; }
+  .settings-agent-cmd { font-family: var(--mono); font-size: 12px; }
+  .settings-agent-warning {
+    font-size: 11.5px;
+    color: var(--warning);
+    margin-top: 4px;
+  }
+  #settings-status.warning { color: var(--warning); }
+
+  #settings-footer {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 12px 18px;
+    border-top: 1px solid var(--border);
+  }
+  #settings-status {
+    font-size: 12px;
+    color: var(--text-faint);
+  }
+  #settings-status.error { color: var(--danger); }
+  #settings-status.success { color: var(--success); }
+
+  #refresh-area {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-faint);
+  }
+
+  .btn {
+    background: var(--bg-card);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    padding: 6px 12px;
+    border-radius: var(--radius-sm);
+    font-weight: 600;
+    font-size: 12.5px;
+    transition: background .12s ease, border-color .12s ease, box-shadow .12s ease;
+  }
+  .btn:hover:not(:disabled) { background: var(--bg-hover); border-color: var(--border-strong); }
+  .btn:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+  .btn-primary { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-strong); border-color: var(--accent-strong); }
+  .btn-sm { padding: 3px 9px; font-size: 11.5px; border-radius: var(--radius-sm); }
+  .btn-danger-outline { border-color: var(--danger); color: var(--danger); background: transparent; }
+  /* task-116: the alternative offered under a primary action (the
+     drawer's Re-spawn beneath Resume) -- reachable, but visibly not
+     the one being recommended. */
+  .btn-quiet { background: transparent; border-color: var(--border); color: var(--text-dim); font-weight: 500; }
+
+  /* task-125: the drawer action area's second tier. One wrapping row
+     holding every secondary action a branch has -- Resume, Re-spawn and
+     the two ways out of a bad attempt -- so none of them reads as a
+     stray pill orphaned at its own width beneath the full-width
+     primary. Order is DOM order; static/drawer.js sets it by how often
+     each action is the right one. */
+  .drawer-action-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+  }
+
+  /* Armed "spawn anyway?" confirm state -- a live session exists elsewhere
+     in the same project; a second click within the window proceeds. */
+  .btn.confirming, .btn.confirming.btn-primary {
+    background: var(--warning-dim);
+    border-color: var(--warning);
+    color: var(--warning);
+  }
+  .btn.confirming:hover:not(:disabled) { background: var(--warning-dim); border-color: var(--warning); }
+  /* task-125: the armed DESTRUCTIVE confirm, in the drawer's action row.
+     The amber above is the "spawn anyway?" tone; an armed discard is one
+     click from deleting a branch, so it says so -- and only here, since
+     the resting button is quiet like every other member of the row.
+     Scoped to the row so the confirms elsewhere on the page keep the
+     tone they already have. */
+  .drawer-action-row .btn.confirming.btn-danger-outline {
+    background: var(--danger-dim);
+    border-color: var(--danger);
+    color: var(--danger);
+  }
+  .drawer-action-row .btn.confirming.btn-danger-outline:hover:not(:disabled) {
+    background: var(--danger-dim);
+    border-color: var(--danger);
+  }
+
+  /* ---------------- Global error / hint banners ---------------- */
+
+  #global-error {
+    flex: none;
+    background: var(--danger-dim);
+    border-bottom: 1px solid var(--danger);
+    color: var(--danger);
+    padding: 8px 18px;
+    font-size: 12.5px;
+  }
+
+  #project-errors[hidden] { display: none; }
+  #project-errors {
+    flex: none;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 18px;
+    background: var(--warning-dim);
+    border-bottom: 1px solid var(--border);
+  }
+  #project-errors .row {
+    font-size: 12px;
+    color: var(--warning);
+    display: flex;
+    gap: 6px;
+  }
+  #project-errors .row b { color: var(--warning); }
+
+  #tmux-hint-banner[hidden] { display: none; }
+  #tmux-hint-banner {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 18px;
+    background: var(--warning-dim);
+    border-bottom: 1px solid var(--border);
+    color: var(--warning);
+    font-size: 12.5px;
+  }
+  #tmux-hint-banner code {
+    font-family: var(--mono);
+    background: var(--bg-hover);
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  #tmux-hint-dismiss {
+    flex: none;
+    background: transparent;
+    border: none;
+    color: inherit;
+    opacity: 0.75;
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  /* task-128: the running process is behind its checkout. Same warning
+     tint and placement as the tmux hint above -- it is advice, not an
+     error -- but with no dismiss control: the restart it asks for is
+     the only thing that should make it go away. */
+  #code-drift-banner[hidden] { display: none; }
+  #code-drift-banner {
+    flex: none;
+    padding: 8px 18px;
+    background: var(--warning-dim);
+    border-bottom: 1px solid var(--border);
+    color: var(--warning);
+    font-size: 12.5px;
+  }
+  #code-drift-banner code {
+    font-family: var(--mono);
+    background: var(--bg-hover);
+    padding: 1px 5px;
+    border-radius: 4px;
+    font-variant-numeric: tabular-nums;
+  }
+  #tmux-hint-dismiss:hover { opacity: 1; }
+  #tmux-hint-dismiss:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); border-radius: 4px; }
+
+  /* ---------------- Board ---------------- */
+
+  #board-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    padding: 20px 24px 0;
+  }
+
+  /* Columns share the available width equally (flex: 1 1 0) down to a
+     min-width floor, below which the row scrolls horizontally instead of
+     squeezing columns further. */
+  #board {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 16px;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding-bottom: 16px;
+  }
+
+  .column {
+    flex: 1 1 0;
+    min-width: 256px;
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    min-height: 0;
+  }
+
+  .column-header {
+    flex: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .column-header .name {
+    font-weight: 700;
+    font-size: 13px;
+    letter-spacing: 0.2px;
+  }
+  .column-header .count {
+    font-size: 11.5px;
+    color: var(--text-faint);
+    background: var(--bg-input);
+    border-radius: 999px;
+    padding: 1px 8px;
+  }
+
+  .column-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 9px;
+  }
+
+  .column-empty {
+    color: var(--text-faint);
+    font-size: 12px;
+    text-align: center;
+    padding: 24px 8px;
+    font-style: italic;
+  }
+
+  /* ---------------- Cards ---------------- */
+
+  .card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-sm);
+    padding: 10px 11px;
+    cursor: pointer;
+    transition: border-color .12s ease, background .12s ease, transform .08s ease, box-shadow .12s ease;
+    outline: none;
+  }
+  .card:hover { border-color: var(--border-strong); background: var(--bg-hover); }
+  .card:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+  .card:active { transform: scale(0.995); }
+
+  .card-id {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--text-faint);
+    margin-bottom: 2px;
+  }
+
+  .card-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    margin-bottom: 8px;
+    word-break: break-word;
+  }
+
+  .card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+  }
+
+  .proj-chip {
+    font-size: 10.5px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 999px;
+    letter-spacing: 0.2px;
+  }
+
+  .priority-pill {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    padding: 2px 7px;
+    border-radius: 999px;
+  }
+  .priority-high { background: var(--danger-dim); color: var(--danger); }
+  .priority-medium { background: var(--warning-dim); color: var(--warning); }
+  .priority-low { background: var(--low-dim); color: var(--low); }
+
+  .status-dot-ready {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10.5px;
+    color: var(--success);
+    font-weight: 600;
+  }
+  .status-dot-ready::before {
+    content: "";
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--success);
+  }
+
+  .status-dot-branch {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10.5px;
+    color: var(--warning);
+    font-weight: 600;
+  }
+  .status-dot-branch::before {
+    content: "";
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    background: var(--warning);
+  }
+
+  /* A branch with uncommitted changes and no live session -- an agent's
+     session died mid-work. More prominent than .status-dot-branch (a
+     filled pill, not just a dot) since it calls for attention: this
+     needs a deliberate Resume, not just an eventual Merge. */
+  .badge-interrupted {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--warning);
+    background: var(--warning-dim);
+    border: 1px solid var(--warning);
+    border-radius: 999px;
+    padding: 2px 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  /* task-70: a branch checked out in a worktree Centrale doesn't manage
+     (.worktrees/, /tmp, ...) -- work may be continuing there. Same
+     filled-pill shape as .badge-interrupted, accent-coloured rather than
+     amber: it's information, not a call to Resume. */
+  .badge-external {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--accent-strong);
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    padding: 2px 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  .badge-blocked {
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text-faint);
+    background: var(--bg-input);
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    padding: 2px 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
+  /* task-38/task-62: agentState badges, including codex's honest idle
+     turn-end state, plus "likely finished" -- the unknown-but-probably-done fallback (see
+     effectiveAgentState()). Same filled-pill shape as .badge-interrupted/
+     .badge-blocked above; "likely finished" alone is drawn outlined
+     (dashed border, transparent fill) rather than filled, so it never
+     reads as confidently as a hook-confirmed "finished". */
+  .agent-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 2px 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .agent-badge-working {
+    color: var(--accent-strong);
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+  }
+  .agent-badge-waiting {
+    color: var(--warning);
+    background: var(--warning-dim);
+    border: 1px solid var(--warning);
+  }
+  .agent-badge-finished {
+    color: var(--success);
+    background: var(--success-dim);
+    border: 1px solid var(--success);
+  }
+  .agent-badge-idle {
+    color: var(--text-muted);
+    background: var(--bg-input);
+    border: 1px solid var(--text-faint);
+  }
+  .agent-badge-likely-finished {
+    color: var(--success);
+    background: transparent;
+    border: 1px dashed var(--success);
+  }
+  .agent-badge-unknown {
+    color: var(--text-faint);
+    background: var(--bg-input);
+    border: 1px solid var(--border-strong);
+  }
+
+  .session-row .top .agent-badge { flex: none; }
+
+  .card-labels {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+    margin-bottom: 6px;
+  }
+  .label-chip {
+    font-size: 10.5px;
+    color: var(--text-dim);
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 1px 7px;
+  }
+
+  /* task-86: a milestone reads as a release wave, not another label --
+     accent-tinted and pill-shaped so it never blends into the neutral,
+     square-ish .label-chip chips sitting beside it in the same row. */
+  .milestone-chip {
+    font-size: 10.5px;
+    color: var(--accent);
+    background: var(--accent-dim);
+    border: 1px solid var(--accent);
+    border-radius: 999px;
+    padding: 1px 8px;
+    font-weight: 600;
+  }
+
+  /* task-86: the drawer's milestone row -- one chip under its heading,
+     matching the card's chip. */
+  .drawer-milestone-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+  }
+
+  .card-footer {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 4px;
+  }
+
+  .spawn-inline {
+    width: 100%;
+    margin-top: 2px;
+    font-size: 11px;
+  }
+  .spawn-status-line {
+    font-size: 10.5px;
+    margin-top: 6px;
+    padding: 6px 8px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-input);
+    word-break: break-all;
+  }
+  .spawn-status-line.error { color: var(--danger); background: var(--danger-dim); }
+  .spawn-status-line.success { color: var(--success); }
+  .spawn-status-line .attach-row { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
+  .spawn-status-line code {
+    font-family: var(--mono);
+    background: var(--bg-card);
+    padding: 2px 5px;
+    border-radius: 4px;
+    flex: 1 1 auto;
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  /* ---------------- Empty / loading states ---------------- */
+
+  #empty-hint, #loading-hint {
+    margin: auto;
+    text-align: center;
+    color: var(--text-dim);
+    max-width: 420px;
+    padding: 30px;
+  }
+  #empty-hint h2, #loading-hint h2 { color: var(--text); font-size: 16px; margin: 0 0 8px; }
+  #empty-hint code, #loading-hint code {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-family: var(--mono);
+  }
+  /* task-53: the first-run empty state's own call to action + fallback
+     copy-the-example note, spaced apart from the plain descriptive text
+     #empty-hint/#loading-hint otherwise share. */
+  #empty-hint-add-project { margin-top: 14px; }
+  #empty-hint-alt { margin-top: 12px; font-size: 12px; color: var(--text-faint); }
+
+  /* ---------------- Drawer ---------------- */
+
+  #drawer-backdrop {
+    position: fixed;
+    inset: 0;
+    background: var(--backdrop);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .16s ease;
+    z-index: 40;
+  }
+  #drawer-backdrop.open { opacity: 1; pointer-events: auto; }
+
+  #drawer {
+    position: fixed;
+    top: 0; right: 0;
+    height: 100%;
+    width: 440px;
+    max-width: 94vw;
+    background: var(--bg-elevated);
+    border-left: 1px solid var(--border);
+    box-shadow: var(--shadow-drawer);
+    transform: translateX(100%);
+    transition: transform .18s ease, width .18s ease;
+    z-index: 50;
+    display: flex;
+    flex-direction: column;
+  }
+  #drawer.open { transform: translateX(0); }
+  /* task-68: wide mode, for READING the live pane rather than glancing
+     at it. 440px is a summary width; the tmux grid is 80 columns of
+     11.5px monospace (~7px per cell => ~560px) plus the <pre>'s own
+     padding/border and the section padding, so 660px shows the whole
+     grid without a horizontal scrollbar. Capped at 90vw so the backdrop
+     (and its click-to-close) always stays reachable. Only ever set
+     while the pane section is present -- the toggle lives in that
+     section's header, so the drawer is never stuck wide with no way
+     back (see applyDrawerWidth). */
+  #drawer.wide {
+    width: 660px;
+    max-width: 90vw;
+  }
+  #drawer.wide .drawer-pane-pre { max-height: 560px; }
+
+  #drawer-header {
+    flex: none;
+    padding: 16px 18px 12px;
+    border-bottom: 1px solid var(--border);
+  }
+  #drawer-header .top-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 10px;
+  }
+  #drawer-title {
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 1.3;
+  }
+  #drawer-id {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--text-faint);
+    margin-top: 3px;
+  }
+  #drawer-close {
+    background: transparent;
+    border: 1px solid var(--border-strong);
+    color: var(--text-dim);
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    font-size: 15px;
+    line-height: 1;
+  }
+  #drawer-close:hover { color: var(--text); border-color: var(--accent); }
+  #drawer-close:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
+
+  #drawer-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+  }
+
+  #drawer-body {
+    /* flex-shrink is deliberately huge: the body scrolls internally, so
+       when the drawer is short of room the body must give up its height
+       FIRST -- otherwise proportional shrink squeezes the pane footer to
+       its floor even on windows tall enough to show a full capture. */
+    flex: 1 1000 auto;
+    overflow-y: auto;
+    padding: 16px 18px 24px;
+    min-height: 0;
+  }
+  /* The body is tabindex="-1" only so a refresh that rebuilt it has
+     somewhere inside the drawer to put keyboard focus when the element
+     that had it is gone (task-127). It is a holding position, not a
+     control, and it is not tab-reachable -- but a viewer who reached
+     the lost element by keyboard has :focus-visible primed, and the
+     UA's ring would then be drawn around the whole scrolling body (a
+     black box the width of the drawer -- measured). The next Tab lands
+     on a real control, which shows its own ring. */
+  #drawer-body:focus, #drawer-body:focus-visible { outline: none; }
+
+  .drawer-section {
+    margin-bottom: 22px;
+  }
+  .drawer-section h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-faint);
+    margin: 0 0 8px;
+    font-weight: 700;
+  }
+
+  /* task-97: the self-announcing section header. The <h3> keeps the
+     look it always had; the button inside it is the whole header row --
+     caret, name, and the count that says what the section holds ("2/6",
+     "1", "214 words") without anyone having to scroll to it. A folded
+     section keeps its header and drops its body, so a 200-word
+     description can no longer bury everything under it. */
+  .drawer-section-toggle {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    width: 100%;
+    padding: 2px 0;
+    background: none;
+    border: none;
+    border-radius: var(--radius-sm);
+    color: inherit;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .drawer-section-toggle:hover { color: var(--text-dim); }
+  .drawer-section-toggle:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+  .drawer-section-caret {
+    flex: none;
+    width: 7px;
+    height: 7px;
+    margin-left: 2px;
+    border-right: 1.5px solid currentColor;
+    border-bottom: 1.5px solid currentColor;
+    transform: rotate(45deg) translate(-1px, -1px);
+    transition: transform .12s ease;
+  }
+  .drawer-section.collapsed .drawer-section-caret {
+    transform: rotate(-45deg) translate(-1px, 1px);
+  }
+  .drawer-section-name { min-width: 0; }
+  .drawer-section-count {
+    margin-left: auto;
+    flex: none;
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0;
+    text-transform: none;
+    font-weight: 600;
+    color: var(--text-dim);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 1px 7px;
+  }
+  .drawer-section.collapsed > .drawer-section-body { display: none; }
+  .drawer-section.collapsed > h3 { margin-bottom: 0; }
+  /* Folded sections stack tightly on purpose: the point of folding is
+     to fit the headers below into the same glance. */
+  .drawer-section.collapsed { margin-bottom: 10px; }
+
+  /* The cue that there is more ticket below. Sticky rather than fixed
+     so it rides the bottom edge of the scrollport with no scroll
+     handler of its own to position it; the .has-more class (set by
+     syncDrawerBodyFade) is what decides whether it is painted at all,
+     so a drawer whose content fits shows no false bottom. */
+  .drawer-body-fade {
+    position: sticky;
+    bottom: 0;
+    height: 28px;
+    margin-top: -28px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity .12s ease;
+    background: linear-gradient(to bottom, transparent, var(--bg-elevated));
+  }
+  #drawer-body.has-more .drawer-body-fade { opacity: 1; }
+  .drawer-text {
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text);
+    font-size: 13px;
+  }
+  .drawer-empty {
+    color: var(--text-faint);
+    font-size: 12.5px;
+    font-style: italic;
+  }
+
+  .ac-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 5px 0;
+    font-size: 13px;
+  }
+  .ac-item input[type="checkbox"] {
+    margin-top: 3px;
+    accent-color: var(--accent);
+  }
+  .ac-item.checked span { color: var(--text-faint); text-decoration: line-through; }
+
+  .drawer-branch-section {
+    border: 1px solid var(--warning);
+    background: var(--warning-dim);
+    border-radius: 8px;
+    padding: 12px 14px;
+  }
+  .drawer-branch-section h3 { color: var(--warning); }
+  .drawer-branch-section h4 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-faint);
+    margin: 14px 0 6px;
+    font-weight: 700;
+  }
+  .drawer-branch-hint {
+    font-size: 12px;
+    color: var(--text-faint);
+    margin-bottom: 10px;
+  }
+  .drawer-branch-status { margin-bottom: 6px; }
+
+  .dep-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    margin-bottom: 6px;
+    font-size: 12.5px;
+    outline: none;
+  }
+  .dep-item .dep-id { font-family: var(--mono); color: var(--text); flex-shrink: 0; }
+  .dep-item .dep-title { color: var(--text); flex: 1; word-break: break-word; }
+  .dep-item .dep-title.unknown { color: var(--text-faint); font-style: italic; }
+  .dep-item .dep-status { color: var(--text-dim); font-size: 11.5px; flex-shrink: 0; }
+  .dep-item .dep-status.unknown { color: var(--text-faint); font-style: italic; }
+  .dep-item-linked { cursor: pointer; transition: border-color .12s ease, background .12s ease; }
+  .dep-item-linked:hover { border-color: var(--border-strong); background: var(--bg-hover); }
+  .dep-item-linked:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+
+  #drawer-detail-loading, #drawer-detail-error {
+    color: var(--text-dim);
+    font-size: 13px;
+    padding: 10px 0;
+  }
+  #drawer-detail-error { color: var(--danger); }
+
+  /* :not(:empty) rather than unconditional -- either area is left with
+     no children when it doesn't apply to the task's current lifecycle
+     state (see renderDrawerSpawnArea/renderDrawerHarvestArea), and an
+     empty div shouldn't draw a stray divider/padding. Harvest (Merge,
+     the primary action when a branch exists) is above spawn (Spawn, or
+     the subtler Re-spawn) in the DOM, so each gets its own divider from
+     whatever's above it when both are populated at once. */
+  #drawer-session-area:not(:empty), #drawer-pane-area:not(:empty), #drawer-harvest-area:not(:empty), #drawer-spawn-area:not(:empty) {
+    flex: none;
+    padding: 14px 18px 18px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-elevated);
+  }
+  /* The pane footer is the tall one, so it alone is allowed to shrink:
+     on a short window the capture <pre> compresses (scrolling
+     internally, never below ~4 lines) instead of the footer stack
+     pushing the drawer's bottom off screen. */
+  #drawer-pane-area:not(:empty) {
+    /* overflow: hidden is load-bearing: it disables the flex automatic
+       minimum size (which would otherwise pin this footer at its full
+       content height and push the drawer's bottom off screen on a short
+       window). The explicit min-height is the floor -- room for the
+       section header, a ~4-line capture, and the reply row -- so
+       shrinking stops there and the <pre> scrolls internally. */
+    flex: 0 1 auto;
+    min-height: 168px;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+  }
+  /* task-97: and the pane footer is capped, because the ticket body has
+     to keep a real share of the drawer when a session is live -- it was
+     measured at 155px against 1113px of content while the pane below it
+     took 468px. Only the ceiling moves: the flex model above is
+     untouched, so on a short window the pane still shrinks to its floor
+     exactly as before. 248px is the floor of a USEFUL pane (header +
+     ~4-line capture + reply row), so the cap never clips the reply row;
+     above ~830px of window the 30vh share takes over and a taller
+     window still gives the pane more. Scoped to the drawer's own child:
+     the theater (which MOVES this element into itself, see task-73) and
+     wide mode below both exist for reading the pane, and neither is
+     capped. */
+  #drawer > #drawer-pane-area:not(:empty) { max-height: max(248px, 30vh); }
+  #drawer.wide > #drawer-pane-area:not(:empty) { max-height: none; }
+  #drawer-pane-area:not(:empty) > * { flex: none; }
+  #drawer-pane-area:not(:empty) > .drawer-pane-pre {
+    flex: 0 1 auto;
+    min-height: 66px;
+  }
+
+  /* task-60: the read-only live pane. Its own element, filled and
+     emptied ONLY by the pane poller (syncDrawerPanePolling and friends),
+     never by renderAll()/renderDrawerSessionArea() -- so a ~2s pane
+     refresh touches this subtree alone and the board's render-skip
+     gate / lane scroll positions (task-50) never notice it. */
+  .drawer-pane-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+  .drawer-pane-header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+  }
+  .drawer-pane-wide-toggle { white-space: nowrap; }
+  .drawer-pane-wide-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--text); }
+  .drawer-pane-header h3 {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-faint);
+    margin: 0;
+    font-weight: 700;
+  }
+  .drawer-pane-age {
+    font-size: 11px;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+  .drawer-pane-age.stale { color: var(--warning); }
+  .drawer-pane-pre {
+    margin: 0;
+    padding: 8px 10px;
+    max-height: 280px;
+    overflow: auto;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.35;
+    white-space: pre;
+    color: var(--text);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .drawer-pane-pre.empty { color: var(--text-faint); font-style: italic; white-space: pre-wrap; }
+  .drawer-pane-error {
+    margin-top: 6px;
+    font-size: 11.5px;
+    color: var(--danger);
+  }
+
+  /* task-61: the reply row under the pane. Also written only by the pane
+     poller code (see syncDrawerPaneReplyRow), for the same task-50 reason
+     as the pane itself. */
+  .drawer-pane-reply { margin-top: 8px; }
+  .drawer-pane-reply-form { display: flex; gap: 6px; align-items: center; }
+  .drawer-pane-reply-input { flex: 1 1 auto; font-family: var(--mono); font-size: 12px; padding: 5px 8px; }
+  .drawer-pane-reply-input:disabled { opacity: .55; cursor: not-allowed; }
+  /* task-135: Esc / Enter read as keycaps beside Send, not as more verbs. */
+  .drawer-pane-reply-key { font-family: var(--mono); min-width: 34px; flex: 0 0 auto; }
+  .drawer-pane-reply-status {
+    display: block;
+    margin-top: 6px;
+    font-size: 11px;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .drawer-pane-reply-status.stale, .drawer-pane-reply-status.error { color: var(--warning); }
+  .drawer-pane-reply-status.error { color: var(--danger); }
+  .drawer-pane-reply-status.success { color: var(--success, var(--accent)); }
+  .drawer-pane-reply-note { margin-top: 6px; font-size: 11px; color: var(--text-faint); line-height: 1.35; }
+
+  /* ---------------- Session theater (task-73) ---------------- */
+  /* The READING/REPLYING tier above the drawer's wide mode (task-68 is
+     the glance tier): the settings-modal skeleton -- a fixed dimmed
+     backdrop plus a fixed, centered dialog layer with .open classes --
+     at ~90vw x 85vh, stacked above the drawer (z 50) so the drawer sits
+     untouched underneath for when the theater closes. Never a browser
+     window. #drawer-pane-area is MOVED into #theater while open (see
+     openTheater), so the rules below key on the very same ids/classes
+     the drawer uses and only relax the drawer footer's constraints: the
+     capture <pre> grows to fill the dialog (80 columns fit with room to
+     spare at this width) and the reply row, when the tier has one,
+     docks at the bottom. The Expand/Narrow toggle is meaningless in
+     here and hidden; the task label is shown only in here, where the
+     drawer header that normally names the task is behind the backdrop. */
+  #theater-backdrop {
+    position: fixed;
+    inset: 0;
+    background: var(--backdrop);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .16s ease;
+    z-index: 60;
+  }
+  #theater-backdrop.open { opacity: 1; pointer-events: auto; }
+  #theater {
+    position: fixed;
+    top: 50%; left: 50%;
+    transform: translate(-50%, -48%);
+    width: 90vw;
+    height: 85vh;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-drawer);
+    z-index: 70;
+    display: flex;
+    flex-direction: column;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .16s ease, transform .16s ease;
+  }
+  #theater.open { opacity: 1; pointer-events: auto; transform: translate(-50%, -50%); }
+  #theater > #drawer-pane-area:not(:empty) {
+    flex: 1 1 auto;
+    min-height: 0;
+    border-top: 0;
+  }
+  #theater > #drawer-pane-area:not(:empty) > .drawer-pane-pre {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+    font-size: 13px;
+  }
+  #theater .drawer-pane-wide-toggle { display: none; }
+  .drawer-pane-header-left { display: flex; align-items: baseline; gap: 10px; min-width: 0; }
+  .drawer-pane-theater-task {
+    display: none;
+    font-size: 12px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #theater .drawer-pane-theater-task { display: inline; }
+  .drawer-pane-theater-toggle { white-space: nowrap; }
+  .drawer-pane-theater-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--text); }
+
+  /* ---------------- Session theater: task rail (task-93) ---------------- */
+  /* A second column in the theater carrying the open ticket's read-only
+     detail, so reading what the agent is doing no longer hides what it
+     was asked to do. Deliberately a block of its own: delete these rules,
+     the task-93 block in static/pane.js with its two call lines in
+     openTheater/closeTheater, the detail stash in static/drawer.js and
+     the centrale-theater-rail-collapsed key in static/state.js, and the
+     theater above is exactly task-73's again. Nothing here modifies a
+     rule above it -- the row layout and the pane's min-width are keyed on
+     .has-rail, a class that exists only while the rail node does. */
+  #theater.has-rail { flex-direction: row; }
+  #theater.has-rail > #drawer-pane-area:not(:empty) { min-width: 0; }
+  .theater-rail {
+    flex: 0 0 320px;
+    width: 320px;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 16px 16px 18px;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+    background: var(--bg);
+  }
+  /* Collapsed (by choice, or automatically below the viewport threshold):
+     out of the layout entirely, so the pane gets the full theater width. */
+  #theater.rail-collapsed .theater-rail { display: none; }
+  .theater-rail-head { display: flex; flex-direction: column; gap: 6px; }
+  .theater-rail-id {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--text-faint);
+  }
+  .theater-rail-title { font-size: 15px; font-weight: 600; line-height: 1.3; color: var(--text); }
+  .theater-rail-chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+  .theater-rail-branch-chip {
+    border-color: var(--warning);
+    color: var(--warning);
+    background: var(--warning-dim);
+  }
+  .theater-rail-section { display: flex; flex-direction: column; }
+  .theater-rail-h {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin: 0 0 6px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    color: var(--text-faint);
+  }
+  /* Which copy of the acceptance criteria is on screen -- the agent's
+     branch or main -- said out loud, never inferred from the ticks. */
+  .theater-rail-source {
+    text-transform: none;
+    letter-spacing: 0;
+    font-weight: 500;
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 999px;
+    border: 1px solid var(--border-strong);
+    color: var(--text-dim);
+  }
+  .theater-rail-h .theater-rail-source { margin-left: auto; }
+  .theater-rail-hint { font-size: 11px; color: var(--text-faint); line-height: 1.4; margin-bottom: 4px; }
+  .theater-rail-text { max-height: 40vh; overflow-y: auto; }
+  .theater-rail-foot {
+    margin-top: auto;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-faint);
+    line-height: 1.4;
+  }
+  .theater-rail-toggle { white-space: nowrap; }
+  .theater-rail-toggle[aria-pressed="true"] { border-color: var(--accent); color: var(--text); }
+  /* The rail is a theater column and nothing else: never visible in the
+     drawer, where the same detail is already the drawer's own body. */
+  #drawer .theater-rail, #drawer .theater-rail-toggle { display: none; }
+
+  #drawer-session-area .agent-badge { margin-bottom: 8px; }
+
+  /* task-38: the attach command needs to be impossible to miss for a
+     waiting session -- the agent asked a question and is blocked on the
+     user. Amber-tinted, like the badge itself, rather than the neutral
+     .spawn-status-line/.attach-row treatment used elsewhere. */
+  .drawer-waiting-attach {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 0;
+    padding: 8px 9px;
+    border-radius: var(--radius-sm);
+    background: var(--warning-dim);
+    border: 1px solid var(--warning);
+  }
+  .drawer-waiting-attach code {
+    font-family: var(--mono);
+    background: var(--bg-card);
+    padding: 2px 5px;
+    border-radius: 4px;
+    flex: 1 1 auto;
+    overflow-x: auto;
+    white-space: nowrap;
+    font-size: 11.5px;
+  }
+
+  /* ---------------- Sessions list (sidebar section) ---------------- */
+
+  #sessions-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0 8px;
+  }
+
+  .session-row {
+    padding: 8px 9px;
+    border-radius: var(--radius-sm);
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    font-size: 12px;
+  }
+  /* task-46: a row whose project/task resolves to real board data opens
+     the drawer on click -- same affordance pattern as .card/.dep-item-
+     linked (cursor, hover border/background, focus-visible ring). A row
+     that can't be resolved (unparseable session name, or the task isn't
+     in the currently loaded board data) never gets this class and stays
+     inert. */
+  .session-row-linked { cursor: pointer; outline: none; transition: border-color .12s ease, background .12s ease; }
+  .session-row-linked:hover { border-color: var(--border-strong); background: var(--bg-hover); }
+  .session-row-linked:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+  .session-row .top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 6px;
+  }
+  .session-row .name { font-family: var(--mono); color: var(--text); font-size: 11px; word-break: break-all; }
+  .session-row .live-dot { color: var(--success); font-size: 10px; }
+  .session-row .created { color: var(--text-faint); font-size: 10.5px; margin-top: 3px; }
+  .session-row .session-files {
+    color: var(--text-faint);
+    font-size: 10.5px;
+    margin-top: 3px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: var(--mono);
+  }
+  .session-row .attach-row { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
+  .session-row code {
+    font-family: var(--mono);
+    background: var(--bg-input);
+    padding: 2px 5px;
+    border-radius: 4px;
+    flex: 1 1 auto;
+    overflow-x: auto;
+    white-space: nowrap;
+    font-size: 10.5px;
+  }
+  .sessions-empty { color: var(--text-faint); font-size: 12px; font-style: italic; padding: 6px 6px; }
+
+  .tooltip-host { position: relative; }
+
+  .chip:focus-visible, #sidebar-toggle:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px var(--focus-ring);
+  }
+
+  /* ---------------- Open-board buttons ---------------- */
+
+  .chip-open-board {
+    background: transparent;
+    border: none;
+    color: inherit;
+    font-size: 12px;
+    line-height: 1;
+    padding: 0 0 0 3px;
+    opacity: 0.7;
+    display: inline-flex;
+    align-items: center;
+  }
+  .chip-open-board:hover { opacity: 1; }
+  .chip-open-board:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); border-radius: 3px; }
+
+  #drawer-header-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+  }
+
+  /* ---------------- Toasts ---------------- */
+
+  #toast-container {
+    position: fixed;
+    top: 14px;
+    right: 14px;
+    z-index: 60;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 360px;
+  }
+
+  .toast {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    padding: 10px 12px;
+    font-size: 12.5px;
+    box-shadow: var(--shadow-lg);
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+  }
+  .toast.error { border-color: var(--danger); color: var(--danger); }
+  .toast.success { border-color: var(--success); color: var(--success); }
+  /* task-157: a stale board is not a failure and not a success -- it is
+     something to act on when convenient, which is what the amber says. */
+  .toast.warn { border-color: var(--warning); color: var(--warning); }
+  .toast .toast-msg { flex: 1 1 auto; word-break: break-word; }
+  .toast .toast-close {
+    background: transparent;
+    border: none;
+    color: inherit;
+    opacity: 0.7;
+    font-size: 13px;
+    line-height: 1;
+    flex: none;
+  }
+  .toast .toast-close:hover { opacity: 1; }
+
+  /* task-97: on a short window the drawer's own chrome -- header, body
+     and footer padding -- is what the ticket body is competing with, so
+     it tightens up. Nothing is hidden or reordered and no flex rule
+     changes; this is vertical rhythm only, and it applies to the drawer
+     alone (the board and the theater keep their spacing). Measured at
+     640px of viewport with a live session: it roughly doubles the
+     body's visible content region. */
+  @media (max-height: 760px) {
+    #drawer-header { padding: 10px 18px 8px; }
+    #drawer-meta-row { margin-top: 6px; }
+    #drawer-body { padding: 10px 18px 14px; }
+    #drawer .drawer-section { margin-bottom: 16px; }
+    #drawer .drawer-section.collapsed { margin-bottom: 7px; }
+    #drawer-session-area:not(:empty), #drawer-harvest-area:not(:empty), #drawer-spawn-area:not(:empty) {
+      padding: 10px 18px 12px;
+    }
+  }
+
+  /* Below this width there isn't room for the sidebar to sit alongside
+     the board in normal flow, so it floats over the content instead
+     (like the drawer already does) rather than shrinking the board. */
+  @media (max-width: 880px) {
+    #sidebar {
+      position: fixed;
+      top: 0; left: 0; bottom: 0;
+      z-index: 45;
+      box-shadow: var(--shadow-lg);
+    }
+    #drawer, #drawer.wide { width: 100vw; max-width: 100vw; }
+  }

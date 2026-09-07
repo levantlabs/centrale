@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "kind": "task-list",
+  "tasks": [
+    {
+      "id": "TASK-2",
+      "title": "Frontend: kanban board rendering",
+      "status": "To Do",
+      "type": "task",
+      "priority": "medium",
+      "assignees": [],
+      "reporter": null,
+      "labels": [],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 2000,
+      "createdAt": "2026-08-29T20:54:00Z",
+      "updatedAt": null
+    }
+  ]
+}

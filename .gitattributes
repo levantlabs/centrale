@@ -1,0 +1,14 @@
+# What ships in a public release.
+#
+# scripts/release.sh builds every published snapshot from `git archive
+# HEAD`, and git archive honours `export-ignore`. Anything marked here is
+# therefore absent from the snapshot by construction -- no script logic to
+# keep in step, and it keeps working if the snapshot method ever changes.
+#
+# backlog/ is this repo's own Backlog.md board: the development history of
+# the project, written for the maintainer rather than for a reader of the
+# published source. Agents working here routinely write filesystem paths
+# and cross-repo references into task notes, so it is not a surface a
+# one-time scrub could keep clean. See the decision record filed with
+# TASK-101 for what this costs and when a curated subset might ship.
+backlog/ export-ignore

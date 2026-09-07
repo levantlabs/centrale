@@ -1,0 +1,287 @@
+{
+  "_readme": [
+    "The synthetic world docs/img/*.png is shot against -- see scripts/screenshots.py.",
+    "Every project, task, branch, session and pane line here is invented. Nothing in",
+    "this file names a real repository, a real task or a real path, and the script",
+    "cannot be pointed at a real board: it builds a throwaway sandbox from this file",
+    "and its faked git/backlog/tmux boundaries refuse any directory outside it.",
+    "Timestamps are pinned so a re-shoot with no UI change produces no diff."
+  ],
+  "clock": {
+    "pageNowEpoch": 1704465000,
+    "_pageNowEpoch": "2024-01-05T14:30:00Z -- the browser's frozen wall clock"
+  },
+  "projects": [
+    {
+      "name": "my-app",
+      "baseBranch": "main",
+      "taskBranches": [
+        "task/task-2"
+      ],
+      "worktreeDiff": {
+        "TASK-2": [
+          "src/reports/pagination.py",
+          "tests/test_pagination.py"
+        ]
+      },
+      "worktreeStatus": {},
+      "tasks": [
+        {
+          "id": "TASK-1",
+          "title": "Add dark mode toggle to the settings panel",
+          "status": "Done",
+          "type": "feature",
+          "priority": "medium",
+          "assignees": [],
+          "labels": [],
+          "ordinal": 1000,
+          "createdAt": "2024-01-04T09:00:00Z",
+          "updatedAt": "2024-01-05T10:12:00Z"
+        },
+        {
+          "id": "TASK-2",
+          "title": "Fix pagination off-by-one on the reports page",
+          "status": "In Progress",
+          "type": "bug",
+          "priority": "high",
+          "assignees": [
+            "@claude"
+          ],
+          "labels": [
+            "bug"
+          ],
+          "ordinal": 2000,
+          "createdAt": "2024-01-05T09:00:00Z",
+          "updatedAt": "2024-01-05T13:58:00Z"
+        },
+        {
+          "id": "TASK-3",
+          "title": "Write an onboarding checklist for new contributors",
+          "status": "To Do",
+          "type": "chore",
+          "priority": "low",
+          "assignees": [],
+          "labels": [],
+          "ordinal": 3000,
+          "createdAt": "2024-01-05T09:05:00Z",
+          "updatedAt": null
+        },
+        {
+          "id": "TASK-4",
+          "title": "Investigate the flaky checkout test",
+          "status": "To Do",
+          "type": null,
+          "priority": null,
+          "assignees": [],
+          "labels": [
+            "bug"
+          ],
+          "ordinal": 4000,
+          "createdAt": "2024-01-05T09:10:00Z",
+          "updatedAt": null
+        }
+      ],
+      "ready": [
+        "TASK-2",
+        "TASK-3"
+      ],
+      "views": {
+        "TASK-2": {
+          "path": "backlog/tasks/task-2 - Fix-pagination-off-by-one-on-the-reports-page.md",
+          "description": "Page 3 of a 40-row report with a page size of 10 returns 9 rows: the last row of every full page is dropped. Fix the slice bound and cover it with a regression test.",
+          "acceptanceCriteria": [
+            {
+              "index": 1,
+              "text": "Off-by-one fixed in the pagination helper",
+              "checked": false
+            },
+            {
+              "index": 2,
+              "text": "A regression test covers a full final page",
+              "checked": false
+            }
+          ],
+          "implementationPlan": "1. Reproduce with a seeded table.\n2. Fix the slice bound.\n3. Add the regression test.",
+          "implementationNotes": null
+        }
+      },
+      "branchViews": {
+        "TASK-2": {
+          "status": "Done",
+          "acceptanceCriteria": [
+            {
+              "index": 1,
+              "text": "Off-by-one fixed in the pagination helper",
+              "checked": true
+            },
+            {
+              "index": 2,
+              "text": "A regression test covers a full final page",
+              "checked": true
+            }
+          ],
+          "implementationNotes": "The slice upper bound was computed from an inclusive index but used as an exclusive one, so the final row of every full page was dropped. Fixed in the helper; test_last_page_is_complete covers it."
+        }
+      }
+    },
+    {
+      "name": "my-lib",
+      "baseBranch": "main",
+      "taskBranches": [
+        "task/task-2",
+        "task/task-4"
+      ],
+      "worktreeDiff": {},
+      "worktreeStatus": {},
+      "tasks": [
+        {
+          "id": "TASK-1",
+          "title": "Publish the v2.4 changelog",
+          "status": "Done",
+          "type": "chore",
+          "priority": "low",
+          "assignees": [],
+          "labels": [],
+          "ordinal": 1000,
+          "createdAt": "2024-01-03T09:00:00Z",
+          "updatedAt": "2024-01-04T16:20:00Z"
+        },
+        {
+          "id": "TASK-2",
+          "title": "Refactor retry backoff into its own module",
+          "status": "In Progress",
+          "type": "chore",
+          "priority": "medium",
+          "assignees": [
+            "@codex"
+          ],
+          "labels": [
+            "refactor"
+          ],
+          "ordinal": 2000,
+          "createdAt": "2024-01-05T08:40:00Z",
+          "updatedAt": "2024-01-05T13:44:00Z"
+        },
+        {
+          "id": "TASK-3",
+          "title": "Add type hints to the parser module",
+          "status": "To Do",
+          "type": "chore",
+          "priority": "low",
+          "assignees": [],
+          "labels": [],
+          "ordinal": 3000,
+          "createdAt": "2024-01-05T08:45:00Z",
+          "updatedAt": null
+        },
+        {
+          "id": "TASK-4",
+          "title": "Improve error messages for an invalid config",
+          "status": "In Progress",
+          "type": "bug",
+          "priority": "high",
+          "assignees": [
+            "@claude"
+          ],
+          "labels": [
+            "bug"
+          ],
+          "ordinal": 4000,
+          "createdAt": "2024-01-05T08:50:00Z",
+          "updatedAt": "2024-01-05T12:05:00Z"
+        }
+      ],
+      "ready": [
+        "TASK-2",
+        "TASK-3",
+        "TASK-4"
+      ],
+      "views": {},
+      "branchViews": {}
+    }
+  ],
+  "sessions": [
+    {
+      "name": "centrale-my-app-task-2",
+      "created": 1704455400,
+      "attached": false,
+      "project": "my-app",
+      "task": "TASK-2",
+      "agentState": "working",
+      "agentKind": "claude"
+    },
+    {
+      "name": "centrale-my-lib-task-2",
+      "created": 1704456300,
+      "attached": false,
+      "project": "my-lib",
+      "task": "TASK-2",
+      "agentState": "waiting",
+      "agentKind": "codex"
+    }
+  ],
+  "panes": {
+    "centrale-my-app-task-2": [
+      "> The reports page skips the last row when the page size evenly divides the",
+      "  total row count. Fix the off-by-one and add a regression test.",
+      "",
+      "● I reproduced it with a seeded 40-row table and a page size of 10: page 3",
+      "  returns 9 rows instead of 10.",
+      "",
+      "● Read(src/reports/pagination.py)",
+      "  ⎿  Read 61 lines",
+      "",
+      "● The slice upper bound is computed from an inclusive index but used as an",
+      "  exclusive one, so the final row of every full page is dropped.",
+      "",
+      "● Update(src/reports/pagination.py)",
+      "  ⎿  Updated 1 addition and 1 removal",
+      "",
+      "● Write(tests/test_pagination.py)",
+      "  ⎿  Added test_last_page_is_complete",
+      "",
+      "● Bash(python3 -m pytest tests/test_pagination.py -q)",
+      "  ⎿  2 passed in 0.31s",
+      "",
+      "● Both acceptance criteria are met and the suite is green. Should I also",
+      "  backfill a test for the empty-table case, or is that out of scope here?",
+      "",
+      ">"
+    ],
+    "centrale-my-lib-task-2": [
+      "> Split the retry backoff out of client.py into its own module.",
+      "",
+      "● The backoff is used by both the sync and async clients, and only the sync",
+      "  one caps the delay. Should the new module keep both behaviours behind a",
+      "  flag, or should I make the cap unconditional?",
+      "",
+      ">"
+    ]
+  },
+  "shots": [
+    {
+      "name": "board-light",
+      "kind": "board",
+      "theme": "light"
+    },
+    {
+      "name": "board-dark",
+      "kind": "board",
+      "theme": "dark"
+    },
+    {
+      "name": "drawer-pane",
+      "kind": "drawer",
+      "theme": "light",
+      "project": "my-app",
+      "task": "TASK-2"
+    },
+    {
+      "name": "session-theater",
+      "kind": "theater",
+      "theme": "light",
+      "project": "my-app",
+      "task": "TASK-2"
+    }
+  ]
+}

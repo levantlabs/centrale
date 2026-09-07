@@ -1,0 +1,66 @@
+{
+  "schemaVersion": 1,
+  "kind": "task-list",
+  "tasks": [
+    {
+      "id": "TASK-1",
+      "title": "Add a health-check endpoint",
+      "status": "To Do",
+      "type": "task",
+      "priority": "high",
+      "assignees": [],
+      "reporter": null,
+      "labels": [],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 1000,
+      "createdAt": "2024-01-05T09:00:00Z",
+      "updatedAt": null
+    },
+    {
+      "id": "TASK-2",
+      "title": "Cache the widget index between requests",
+      "status": "In Progress",
+      "type": "task",
+      "priority": "medium",
+      "assignees": ["@claude"],
+      "reporter": null,
+      "labels": ["demo"],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 2000,
+      "createdAt": "2024-01-05T09:00:00Z",
+      "updatedAt": "2024-01-05T11:30:00Z"
+    },
+    {
+      "id": "TASK-3",
+      "title": "Write the getting-started guide",
+      "status": "Done",
+      "type": "task",
+      "priority": "low",
+      "assignees": [],
+      "reporter": null,
+      "labels": ["demo"],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 3000,
+      "createdAt": "2024-01-05T09:00:00Z",
+      "updatedAt": "2024-01-05T14:00:00Z"
+    },
+    {
+      "id": "TASK-4",
+      "title": "Investigate the flaky upload test",
+      "status": "To Do",
+      "type": null,
+      "priority": null,
+      "assignees": [],
+      "reporter": null,
+      "labels": [],
+      "milestone": null,
+      "parentTaskId": null,
+      "ordinal": 4000,
+      "createdAt": "2024-01-05T09:00:00Z",
+      "updatedAt": null
+    }
+  ]
+}
