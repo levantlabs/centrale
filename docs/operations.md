@@ -23,8 +23,12 @@ actually work if `bwrap` is installed (Linux only; see "Troubleshooting"
 below if it's `[WARN]`ed), whether `projects.json` parses (a `[PASS]` with
 first-run guidance if there's no `projects.json` at all — see "Quickstart"
 in the [README](../README.md#quickstart)), for each configured project, whether its `path` exists and has a
-`backlog/config.yml`, and — when a Centrale is already serving the
-configured `port` — whether that process is behind the checkout it runs
+`backlog/config.yml`, plus whether both `CLAUDE.md` and `AGENTS.md` have the
+current Centrale guide pointer. A missing/stale pointer gets a warning and
+one `curl` command for [project setup](api.md#post-apisetup-project); run it
+with Centrale serving to opt into the repository write and scoped commit.
+The check does not install pointers. Finally, when a Centrale is serving the
+configured `port`, it reports whether that process is behind the checkout it runs
 from (see [Restarting after a change](#restarting-after-a-change): a
 `[WARN]` naming the commit it loaded and the one now at `HEAD`, or a
 `[PASS]` that it is running its checkout's current code; nothing at all
@@ -230,6 +234,13 @@ With a plain-path `worktreeRoot` set explicitly instead, the worktree path
 is the same shared directory for every project, e.g.
 `git worktree remove ~/code/.centrale-worktrees/my-app-task-2`.
 
+The **delivery log** — every message sent to an agent through
+`POST /api/deliver` — is one append-only file Centrale never rotates:
+`~/.local/state/centrale/deliveries.jsonl` (under `$XDG_STATE_HOME` if set,
+or wherever `CENTRALE_DELIVERY_LOG` points). Truncate or delete it whenever
+you like; that loses the history and nothing else. See
+[`GET /api/deliveries`](api.md#get-apideliveriesprojectnametasktaskidlimitn).
+
 ## Troubleshooting
 
 Run `python3 server.py --check` first (see "Running it" above) — it catches
@@ -277,6 +288,18 @@ most of the causes below in one pass.
   `backlog` CLI itself will fail there). `python3 server.py --check` names
   exactly which project and which of the two it is; every other configured
   project keeps working regardless.
+- **`backlog task edit` fails with `EACCES: permission denied`** on a task
+  whose card says "task file locked" — expected, not a bug. The task is
+  spawned, and its agent is the only writer of its task file until the
+  branch is merged, discarded, abandoned or cleaned up; the main
+  checkout's copy is read-only so an edit there cannot conflict with the
+  agent's at merge time. Send a ruling through `POST /api/rule` instead —
+  see "Ruling on a spawned task" in
+  [docs/agents.md](agents.md#ruling-on-a-spawned-task). A locked file
+  with no `task/<id>` branch behind it (the branch was deleted outside
+  Centrale) is unlocked at the next startup or `--check`, which reports
+  it; `chmod u+w` it by hand in the meantime, or turn the lock off with
+  `lockSpawnedTaskFiles: false`.
 - **Spawning is disabled / every Spawn button is grayed out** — `tmux`
   isn't on `PATH`. See "Without tmux" in [docs/agents.md](agents.md#without-tmux); everything except spawning
   still works.
@@ -362,13 +385,11 @@ temp file for every test that could otherwise touch it, so nothing ever
 reads or writes the real `~/.cache/centrale/browsers.json`; the boot
 sweep's pid-alive/cmdline-still-matches decision is exercised entirely
 through `server.process_cmdline`/`server.kill_process` as mocked
-boundaries, never a real `/proc` read or signal. Agent lifecycle events
-(`server.ensure_hooks_settings_file`) are covered the same way, redirected
-to a throwaway temp dir via `server.hooks_settings_path` rather than ever
-touching the real `~/.cache/centrale/hooks-settings.json`; spawn/resume
-tests that exercise the claude/codex argv injection mock
-`server.ensure_hooks_settings_file` itself so no cache-dir I/O happens at
-all. `server.probe_codex_hook_trust` (the `--help`-output feature
+boundaries, never a real `/proc` read or signal. Agent lifecycle events need
+no such redirect: claude's hooks settings travel inline in the spawn argv
+(`--settings '<json>'`, built by `server.hooks_settings_payload`) and
+nothing is written to disk, so the claude/codex argv injection tests
+assert on the argv alone. `server.probe_codex_hook_trust` (the `--help`-output feature
 detection gating the whole codex hooks path) never launches a real codex
 either: its own tests mock `server._run`, and every spawn/resume test
 that reaches the codex branch mocks `server.probe_codex_hook_trust`

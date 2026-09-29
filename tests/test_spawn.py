@@ -19,10 +19,14 @@ FIXTURES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture
 
 
 def make_config(worktree_root, projects):
+    # task-172: these fixtures model repos that are not on disk, so there
+    # is no task file to lock -- the lock is off here and tested against
+    # real files in SpawnTaskFileLockTests.
     return {
         "port": 0,
         "worktreeRoot": worktree_root,
         "projects": projects,
+        "lockSpawnedTaskFiles": False,
     }
 
 
@@ -155,9 +159,23 @@ class SpawnHelperTests(unittest.TestCase):
             "--plain`) and treat them as constraints. When you are done, commit "
             "all your work on this branch, including the backlog task updates. "
             "Do NOT merge this branch into the default branch or delete it -- "
-            "the dashboard's gated merge handles integration."
+            "the dashboard's gated merge handles integration. "
+            "A message from an orchestrating session (Centrale delivers one as "
+            "`[ruling from <sender>] <text>`) is a ruling on this task: first "
+            "record it on your task as a comment authored by the sender "
+            "(`backlog task edit TASK-2 --comment \"<text>\" --comment-author "
+            "<sender>`), then act on it."
         )
         self.assertEqual(spawn.prompt_for("TASK-2"), expected)
+
+    def test_prompt_routes_rulings_through_the_agent(self):
+        # task-172: while a task is spawned the agent is its task file's
+        # only writer, so an orchestrator's ruling is recorded BY the
+        # agent, as a comment authored by whoever sent it.
+        prompt = spawn.prompt_for("TASK-2")
+        self.assertIn("[ruling from <sender>]", prompt)
+        self.assertIn("--comment-author <sender>", prompt)
+        self.assertIn(server.ruling_message("orch", "x").split("]")[0].replace("orch", "<sender>"), prompt)
 
     def test_prompt_consults_standing_decisions_before_designing(self):
         # Task-69: decision records are the durable "why" layer; the
@@ -267,7 +285,7 @@ class InjectAgentHooksTests(unittest.TestCase):
     worktree's `.git` FILE means codex resolves its project config layer
     through to the MAIN repo root, so that file was never actually
     discovered in the environment centrale spawns into. The fix passes
-    the same four hook definitions as inline -c config overrides on the
+    the lifecycle hook definitions as inline -c config overrides on the
     argv itself instead (server.codex_hooks_overrides -- pure, no
     filesystem or subprocess calls), so _inject_agent_hooks needs
     nothing worktree-specific any more. The codex cases here still mock
@@ -284,25 +302,43 @@ class InjectAgentHooksTests(unittest.TestCase):
         # how to hook -- e.g. a fully custom wrapper script.
         self.assertEqual(spawn._inject_agent_hooks(["my-wrapper-script"]), [])
 
-    def test_claude_gets_settings_flag_pointing_at_the_generated_file(self):
-        with mock.patch.object(server, "ensure_hooks_settings_file", return_value="/cache/hooks-settings.json"):
-            extra = spawn._inject_agent_hooks(["claude"])
-        self.assertEqual(extra, ["--settings", "/cache/hooks-settings.json"])
+    def test_claude_gets_the_hooks_settings_as_inline_json(self):
+        extra = spawn._inject_agent_hooks(["claude"])
+        self.assertEqual(extra[0], "--settings")
+        self.assertEqual(json.loads(extra[1]), server.hooks_settings_payload())
 
     def test_claude_family_binary_with_a_different_agent_name_still_matches(self):
         # Dispatch is on os.path.basename(cmd[0]), not the config's agent
         # name -- "claude-sonnet": ["claude", "--model", "sonnet"] still
         # counts, same basename check resume() uses for "claude family".
-        with mock.patch.object(server, "ensure_hooks_settings_file", return_value="/cache/hooks-settings.json"):
-            extra = spawn._inject_agent_hooks(["claude", "--model", "sonnet"])
-        self.assertEqual(extra, ["--settings", "/cache/hooks-settings.json"])
+        extra = spawn._inject_agent_hooks(["claude", "--model", "sonnet"])
+        self.assertEqual(extra, spawn._inject_agent_hooks(["claude"]))
 
-    def test_claude_settings_generation_failure_degrades_to_no_injection(self):
-        # Best-effort: a read-only cache dir must never block the spawn
-        # itself, just its agentState reporting.
-        with mock.patch.object(server, "ensure_hooks_settings_file", side_effect=OSError("read-only")):
-            extra = spawn._inject_agent_hooks(["claude"])
-        self.assertEqual(extra, [])
+    def test_claude_injection_writes_no_file(self):
+        # task-173: a shared, rewritable settings file let the last
+        # Centrale copy to spawn repoint every running agent's hooks.
+        # The settings now travel in argv, so nothing touches disk.
+        with mock.patch("builtins.open") as fake_open, \
+             mock.patch("os.replace") as fake_replace, \
+             mock.patch("tempfile.mkstemp") as fake_mkstemp:
+            spawn._inject_agent_hooks(["claude"])
+        fake_open.assert_not_called()
+        fake_replace.assert_not_called()
+        fake_mkstemp.assert_not_called()
+
+    def test_two_centrale_copies_give_their_agents_independent_hooks(self):
+        # task-173: the incident -- a Centrale run from a worktree that
+        # was later deleted repointed the hooks of agents another copy
+        # had spawned. Each spawn's argv now names only its own copy's
+        # notify script, and a later spawn cannot change an earlier one's.
+        with mock.patch.object(server, "notify_script_path", return_value="/wt/deleted/centrale_notify.py"):
+            first = spawn._inject_agent_hooks(["claude"])
+        with mock.patch.object(server, "notify_script_path", return_value="/main/centrale_notify.py"):
+            second = spawn._inject_agent_hooks(["claude"])
+        self.assertIn("/wt/deleted/centrale_notify.py", first[1])
+        self.assertNotIn("/main/", first[1])
+        self.assertIn("/main/centrale_notify.py", second[1])
+        self.assertNotIn("/wt/deleted/", second[1])
 
     def test_codex_gets_notify_override_reporting_finished(self):
         with mock.patch.object(server, "probe_codex_hook_trust", return_value=True):
@@ -325,8 +361,8 @@ class InjectAgentHooksTests(unittest.TestCase):
             spawn._inject_agent_hooks(["/opt/codex-nightly/codex", "exec"])
         probe.assert_called_once_with("/opt/codex-nightly/codex")
 
-    def test_codex_gets_the_four_hook_overrides_and_trust_flag_when_probe_is_positive(self):
-        # task-44 AC #1: the four -c hooks.<Point>=... overrides (the
+    def test_codex_gets_the_hook_overrides_and_trust_flag_when_probe_is_positive(self):
+        # task-44 AC #1: the -c hooks.<Point>=... overrides (the
         # exact values server.codex_hooks_overrides() builds) follow the
         # notify override, and --dangerously-bypass-hook-trust follows
         # those, only once server.probe_codex_hook_trust(cmd[0]) says
@@ -374,8 +410,7 @@ class InjectAgentHooksTests(unittest.TestCase):
     def test_claude_and_custom_agents_are_byte_identical_to_before(self):
         # task-44 AC #3: only the codex path changed -- claude and a
         # custom/unrecognized agent must still behave exactly as before.
-        with mock.patch.object(server, "ensure_hooks_settings_file", return_value="/cache/hooks-settings.json"):
-            self.assertEqual(spawn._inject_agent_hooks(["claude"]), ["--settings", "/cache/hooks-settings.json"])
+        self.assertEqual(spawn._inject_agent_hooks(["claude"])[0], "--settings")
         self.assertEqual(spawn._inject_agent_hooks(["my-wrapper-script"]), [])
         self.assertEqual(spawn._inject_agent_hooks([]), [])
 
@@ -680,7 +715,6 @@ class SpawnAgentSelectionIntegrationTests(unittest.TestCase):
              mock.patch.object(server, "list_sessions", return_value=[]), \
              mock.patch.object(server, "run_backlog", return_value=task_view(assignees)), \
              mock.patch.object(server, "run_backlog_raw", return_value=backlog_raw_proc()), \
-             mock.patch.object(server, "ensure_hooks_settings_file", return_value="/fake/cache/centrale/hooks-settings.json"), \
              mock.patch.object(server, "probe_codex_hook_trust", return_value=False), \
              mock.patch("os.path.isdir", return_value=True), \
              mock.patch("os.makedirs"):
@@ -704,6 +738,9 @@ class SpawnAgentSelectionIntegrationTests(unittest.TestCase):
         )
 
     def test_unassigned_task_spawns_claude_argv_and_reports_agent(self):
+        # task-171: only with requireAgentAssignment off -- see
+        # SpawnAgentChoiceTests for the refusal it gets by default.
+        self.config["requireAgentAssignment"] = False
         result, run_tmux = self._run_spawn(self.config, [])
         self.assertEqual(result["agent"], "claude")
         tmux_args = new_session_argv(run_tmux)
@@ -931,6 +968,421 @@ class SpawnAgentSelectionIntegrationTests(unittest.TestCase):
         )
 
 
+class SpawnAgentChoiceTests(unittest.TestCase):
+    """task-171: spawn() refuses to guess the agent. An unresolvable
+    assignee is a 409 (requireAgentAssignment on, the default) or a
+    warned fallback (off); an explicit "agent" wins over the assignee
+    and an unknown one is a 400; and when the launched agent did not come
+    from the assignee, the claim's own backlog edit records it -- ahead
+    of, never instead of, whoever was assigned."""
+
+    def setUp(self):
+        self.config = make_config("/worktrees", [{"name": "my-app", "path": "/repos/my-app"}])
+        self.env_patch = mock.patch.dict(os.environ, {}, clear=False)
+        self.env_patch.start()
+        os.environ.pop("CENTRALE_SPAWN_CMD", None)
+        self.addCleanup(self.env_patch.stop)
+
+    def _spawn(self, assignees=None, agent=None, backlog_error=False):
+        fake_git = FakeGit(branch_exists=True, worktree_registered=True, wt_dir="/worktrees/my-app-task-2")
+        view = (
+            mock.patch.object(server, "run_backlog", side_effect=server.BacklogError("boom"))
+            if backlog_error else
+            mock.patch.object(server, "run_backlog", return_value=task_view(assignees or [], status="To Do"))
+        )
+        with mock.patch.object(server, "run_git", side_effect=fake_git), \
+             mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)) as run_tmux, \
+             mock.patch.object(server, "list_sessions", return_value=[]), \
+             view, \
+             mock.patch.object(server, "run_backlog_raw", return_value=backlog_raw_proc()) as run_backlog_raw, \
+             mock.patch.object(server, "probe_codex_hook_trust", return_value=False), \
+             mock.patch("os.path.isdir", return_value=True), \
+             mock.patch("os.makedirs"):
+            try:
+                result = spawn.spawn(self.config, "my-app", "TASK-2", agent=agent)
+            except spawn.SpawnError as exc:
+                result = exc
+        return result, run_tmux, run_backlog_raw, fake_git
+
+    def _assert_refused_without_side_effects(self, result, run_tmux, run_backlog_raw, fake_git, status):
+        self.assertIsInstance(result, spawn.SpawnError)
+        self.assertEqual(result.status, status)
+        run_backlog_raw.assert_not_called()
+        run_tmux.assert_not_called()
+        # Only read-only git (the external-checkout probe) may have run.
+        self.assertFalse([c for c in fake_git.calls if c[0] in ("add", "commit", "worktree") and c[:2] != ["worktree", "list"]])
+
+    def _claim_args(self, run_backlog_raw):
+        return run_backlog_raw.call_args_list[0].args[0]
+
+    def test_unassigned_task_is_refused_naming_task_absence_and_agents(self):
+        result, *rest = self._spawn([])
+        self._assert_refused_without_side_effects(result, *rest, status=409)
+        message = str(result)
+        self.assertIn("TASK-2 has no assignee", message)
+        self.assertIn("requireAgentAssignment", message)
+        self.assertIn("Configured agents: claude, codex", message)
+        self.assertIn('"agent"', message)
+
+    def test_person_or_typo_assignee_is_refused_naming_the_assignee(self):
+        for assignee in ("@dana", "@claude-opsu"):
+            with self.subTest(assignee=assignee):
+                result, *rest = self._spawn([assignee])
+                self._assert_refused_without_side_effects(result, *rest, status=409)
+                self.assertIn(f"assigned to {assignee}, which is not a configured agent", str(result))
+
+    def test_unreadable_task_is_refused_as_unreadable_not_as_unassigned(self):
+        result, *rest = self._spawn(backlog_error=True)
+        self._assert_refused_without_side_effects(result, *rest, status=409)
+        self.assertIn("could not read task TASK-2's assignee", str(result))
+
+    def test_unknown_requested_agent_is_a_400_before_anything(self):
+        for agent in ("gpt", "", 7):
+            with self.subTest(agent=agent):
+                result, *rest = self._spawn(["@claude"], agent=agent)
+                self._assert_refused_without_side_effects(result, *rest, status=400)
+                self.assertIn("unknown agent", str(result))
+
+    def test_requested_agent_on_unassigned_task_launches_and_is_recorded(self):
+        result, run_tmux, run_backlog_raw, _ = self._spawn([], agent="Codex")
+        self.assertEqual(result["agent"], "codex")
+        self.assertIn("codex", new_session_argv(run_tmux))
+        self.assertEqual(
+            self._claim_args(run_backlog_raw),
+            ["task", "edit", "TASK-2", "-s", "In Progress", "-a", "@codex"],
+        )
+        self.assertNotIn("warnings", result)
+
+    def test_requested_agent_on_a_person_keeps_the_person_behind_the_agent(self):
+        result, _, run_backlog_raw, _ = self._spawn(["@dana", "@codex"], agent="codex")
+        self.assertEqual(result["agent"], "codex")
+        self.assertEqual(
+            self._claim_args(run_backlog_raw),
+            ["task", "edit", "TASK-2", "-s", "In Progress", "-a", "@codex", "-a", "@dana"],
+        )
+
+    def test_requested_agent_overrides_a_resolvable_assignee_without_rewriting_it(self):
+        result, run_tmux, run_backlog_raw, _ = self._spawn(["@claude"], agent="codex")
+        self.assertEqual(result["agent"], "codex")
+        self.assertIn("CENTRALE_AGENT=codex", new_session_argv(run_tmux))
+        self.assertEqual(self._claim_args(run_backlog_raw), ["task", "edit", "TASK-2", "-s", "In Progress"])
+
+    def test_resolvable_assignee_is_left_alone(self):
+        result, _, run_backlog_raw, _ = self._spawn(["@codex"])
+        self.assertEqual(result["agent"], "codex")
+        self.assertEqual(self._claim_args(run_backlog_raw), ["task", "edit", "TASK-2", "-s", "In Progress"])
+
+    def test_setting_off_falls_back_with_a_warning_and_records_the_default(self):
+        self.config["requireAgentAssignment"] = False
+        self.config["defaultAgent"] = "codex"
+        result, _, run_backlog_raw, _ = self._spawn(["@dana"])
+        self.assertEqual(result["agent"], "codex")
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("assigned to @dana", result["warnings"][0])
+        self.assertIn("launched the default agent 'codex'", result["warnings"][0])
+        self.assertEqual(
+            self._claim_args(run_backlog_raw),
+            ["task", "edit", "TASK-2", "-s", "In Progress", "-a", "@codex", "-a", "@dana"],
+        )
+
+    def test_setting_off_with_an_unreadable_task_does_not_overwrite_assignees(self):
+        self.config["requireAgentAssignment"] = False
+        result, _, run_backlog_raw, _ = self._spawn(backlog_error=True)
+        self.assertEqual(result["agent"], "claude")
+        self.assertIn("did not record @claude", result["warnings"][0])
+        self.assertEqual(self._claim_args(run_backlog_raw), ["task", "edit", "TASK-2", "-s", "In Progress"])
+
+    def test_resume_of_an_unassigned_task_still_falls_back_silently(self):
+        # Out of scope by design: resume re-launches work already under
+        # way, so it keeps resolve_agent's fallback and never refuses.
+        fake_git = FakeGit(branch_exists=True, worktree_registered=True, wt_dir="/worktrees/my-app-task-2")
+        with mock.patch.object(server, "run_git", side_effect=fake_git), \
+             mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)), \
+             mock.patch.object(server, "list_sessions", return_value=[]), \
+             mock.patch.object(server, "run_backlog", return_value=task_view([])), \
+             mock.patch("os.path.isdir", return_value=True), \
+             mock.patch("os.makedirs"):
+            result = spawn.resume(self.config, "my-app", "TASK-2")
+        self.assertEqual(result["agent"], "claude")
+
+
+class SpawnAgentsSummaryTests(unittest.TestCase):
+    def test_summary_lists_agents_in_config_order_with_default_and_setting(self):
+        config = {
+            "agents": server.normalize_agents_map({"codex": ["codex"], "Claude-Opus": ["claude"]}),
+            "defaultAgent": "nope",
+            "requireAgentAssignment": False,
+        }
+        self.assertEqual(
+            spawn.spawn_agents_summary(config),
+            {"names": ["codex", "Claude-Opus"], "defaultAgent": "codex", "required": False},
+        )
+
+    def test_summary_defaults_to_required(self):
+        self.assertTrue(spawn.spawn_agents_summary({})["required"])
+
+
+def _write_task(repo, name, content="---\nid: X\n---\n"):
+    tasks = os.path.join(repo, "backlog", "tasks")
+    os.makedirs(tasks, exist_ok=True)
+    path = os.path.join(tasks, name)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+    os.chmod(path, 0o644)
+    return path
+
+
+def _writable(path):
+    return bool(os.stat(path).st_mode & 0o222)
+
+
+class TaskFileLockHelperTests(unittest.TestCase):
+    """task-172's lock helpers, against real files with realistic, spaced
+    Backlog.md filenames."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = tmp.name
+        self.path = _write_task(self.repo, "task-17 - Fix-the-thing.md")
+        # Near misses the lookup must not take for task-17.
+        _write_task(self.repo, "task-172 - Another-one.md")
+        _write_task(self.repo, "task-17.1 - A-subtask.md")
+
+    def test_task_file_path_matches_the_exact_id_only(self):
+        self.assertEqual(spawn.task_file_path(self.repo, "TASK-17"), self.path)
+        self.assertTrue(spawn.task_file_path(self.repo, "TASK-17.1").endswith("task-17.1 - A-subtask.md"))
+        self.assertIsNone(spawn.task_file_path(self.repo, "TASK-9"))
+        self.assertIsNone(spawn.task_file_path("/no/such/repo", "TASK-17"))
+
+    def test_task_file_path_refuses_an_ambiguous_id(self):
+        _write_task(self.repo, "task-17 - A-duplicate.md")
+        self.assertIsNone(spawn.task_file_path(self.repo, "TASK-17"))
+
+    def test_lock_removes_every_write_bit_and_unlock_gives_the_owner_one_back(self):
+        os.chmod(self.path, 0o664)
+        self.assertIsNone(spawn.lock_task_file(self.repo, "TASK-17"))
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o444)
+        self.assertEqual(spawn.locked_task_files(self.repo), {"task-17": self.path})
+        self.assertEqual(spawn.unlock_task_file(self.repo, "TASK-17"),
+                         os.path.join("backlog", "tasks", "task-17 - Fix-the-thing.md"))
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o644)
+        self.assertEqual(spawn.locked_task_files(self.repo), {})
+
+    def test_unlocking_an_unlocked_or_missing_file_is_a_silent_no_op(self):
+        self.assertIsNone(spawn.unlock_task_file(self.repo, "TASK-17"))
+        self.assertIsNone(spawn.unlock_task_file(self.repo, "TASK-9"))
+        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o644)
+
+    def test_a_lock_that_cannot_be_taken_is_a_warning(self):
+        warning = spawn.lock_task_file(self.repo, "TASK-9")
+        self.assertIn("did not lock TASK-9's task file", warning)
+
+    def test_the_setting_is_on_unless_explicitly_false(self):
+        self.assertTrue(spawn.lock_spawned_task_files({}))
+        self.assertTrue(spawn.lock_spawned_task_files(None))
+        self.assertTrue(spawn.lock_spawned_task_files({"lockSpawnedTaskFiles": "no"}))
+        self.assertFalse(spawn.lock_spawned_task_files({"lockSpawnedTaskFiles": False}))
+
+    def test_release_stale_task_locks_keeps_locks_with_a_branch_behind_them(self):
+        other = spawn.task_file_path(self.repo, "TASK-172")
+        spawn.lock_task_file(self.repo, "TASK-17")
+        spawn.lock_task_file(self.repo, "TASK-172")
+        config = {"projects": [{"name": "my-app", "path": self.repo}]}
+
+        def fake_git(args, cwd=None):
+            self.assertEqual(args[:1], ["for-each-ref"])
+            return git_proc(args, 0, "task/task-172\n", "")
+
+        with mock.patch.object(server, "run_git", side_effect=fake_git):
+            found = spawn.release_stale_task_locks(config)
+        self.assertEqual(found, [{
+            "project": "my-app", "taskId": "TASK-17",
+            "path": os.path.join("backlog", "tasks", "task-17 - Fix-the-thing.md"),
+            "released": True,
+        }])
+        self.assertTrue(_writable(self.path))
+        self.assertFalse(_writable(other))
+
+    def test_release_stale_task_locks_touches_no_git_without_a_lock(self):
+        config = {"projects": [{"name": "my-app", "path": self.repo},
+                               {"name": "gone", "path": "/no/such/repo"}]}
+        with mock.patch.object(server, "run_git", side_effect=AssertionError("no git")):
+            self.assertEqual(spawn.release_stale_task_locks(config), [])
+
+    def test_stale_lock_messages_name_the_file_and_what_happened(self):
+        released, failed = server.stale_task_lock_messages([
+            {"project": "p", "taskId": "TASK-3", "path": "backlog/tasks/task-3 - A.md", "released": True},
+            {"project": "p", "taskId": "TASK-4", "path": "backlog/tasks/task-4 - B.md", "released": False,
+             "error": "EPERM"},
+        ])
+        self.assertIn("p: backlog/tasks/task-3 - A.md", released)
+        self.assertIn("no task/task-3 branch", released)
+        self.assertIn("unlocked it", released)
+        self.assertIn("EPERM", failed)
+        self.assertIn("chmod u+w", failed)
+
+
+class SpawnTaskFileLockTests(unittest.TestCase):
+    """spawn() locks the main checkout's copy after the claim commit
+    (task-172) -- real files, git/tmux/backlog faked."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = os.path.join(tmp.name, "my-app")
+        self.path = _write_task(self.repo, "task-2 - Fix-the-thing.md")
+        self.config = {
+            "port": 0,
+            "worktreeRoot": os.path.join(tmp.name, "worktrees"),
+            "projects": [{"name": "my-app", "path": self.repo}],
+        }
+        patcher = mock.patch.dict(os.environ, {"CENTRALE_SPAWN_CMD": "sleep 300"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _spawn(self, fake_git=None):
+        fake_git = fake_git or FakeGit(branch_exists=False, worktree_registered=False)
+        claims = []
+
+        def fake_backlog_raw(args, cwd=None):
+            # What the claim sees: it must be able to write the file.
+            claims.append((list(args), os.path.exists(self.path) and _writable(self.path)))
+            return backlog_raw_proc(args)
+
+        with mock.patch.object(server, "run_git", side_effect=fake_git), \
+             mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)), \
+             mock.patch.object(server, "list_sessions", return_value=[]), \
+             mock.patch.object(server, "run_backlog_raw", side_effect=fake_backlog_raw):
+            result = spawn.spawn(self.config, "my-app", "TASK-2")
+        return result, fake_git, claims
+
+    def test_spawn_locks_the_main_copy_after_the_claim(self):
+        result, _, claims = self._spawn()
+        self.assertNotIn("warnings", result)
+        self.assertEqual(claims, [(["task", "edit", "TASK-2", "-s", "In Progress"], True)])
+        self.assertFalse(_writable(self.path))
+
+    def test_a_respawn_unlocks_for_its_claim_and_locks_again(self):
+        spawn.lock_task_file(self.repo, "TASK-2")
+        result, _, claims = self._spawn()
+        self.assertNotIn("warnings", result)
+        self.assertEqual([writable for _, writable in claims], [True])
+        self.assertFalse(_writable(self.path))
+
+    def test_with_the_setting_off_spawn_is_exactly_as_before(self):
+        on_result, on_git, on_claims = self._spawn()
+        spawn.unlock_task_file(self.repo, "TASK-2")
+        self.config["lockSpawnedTaskFiles"] = False
+        off_result, off_git, off_claims = self._spawn()
+        self.assertTrue(_writable(self.path))
+        # Same response, same subprocess calls: the lock is filesystem
+        # state and nothing else.
+        self.assertEqual(off_result, on_result)
+        self.assertEqual(off_git.calls, on_git.calls)
+        self.assertEqual(off_claims, on_claims)
+
+    def test_a_task_file_that_cannot_be_found_is_a_warning_not_a_refusal(self):
+        os.remove(self.path)
+        result, _, _ = self._spawn()
+        self.assertEqual(result["session"], "centrale-my-app-task-2")
+        self.assertEqual(len(result["warnings"]), 1)
+        self.assertIn("did not lock TASK-2's task file", result["warnings"][0])
+
+
+class CommitRulingTests(unittest.TestCase):
+    """spawn.commit_ruling (POST /api/rule's no-agent case), with a real
+    worktree directory and task file and git/backlog faked -- the real
+    commit is in tests_integration/test_task_lock_integration.py."""
+
+    REL = os.path.join("backlog", "tasks", "task-2 - Fix-the-thing.md")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = os.path.join(tmp.name, "my-app")
+        os.makedirs(self.repo)
+        self.config = {
+            "worktreeRoot": os.path.join(tmp.name, "worktrees"),
+            "projects": [{"name": "my-app", "path": self.repo}],
+        }
+        self.project = self.config["projects"][0]
+        self.wt_dir = spawn.worktree_dir(self.config, "my-app", "TASK-2")
+        _write_task(self.wt_dir, "task-2 - Fix-the-thing.md")
+
+    def _run(self, branch_exists=True, checkout="centrale", dirty="", backlog_rc=0, commit_rc=0):
+        calls = []
+
+        def fake_git(args, cwd=None):
+            calls.append(("git", list(args), cwd))
+            if args[:1] == ["rev-parse"] and "--verify" in args:
+                return git_proc(args, 0 if branch_exists else 1)
+            if args[:2] == ["worktree", "list"]:
+                out = ""
+                if checkout == "centrale":
+                    out = f"worktree {self.wt_dir}\nHEAD abc\nbranch refs/heads/task/task-2\n\n"
+                elif checkout == "external":
+                    out = "worktree /elsewhere/wt\nHEAD abc\nbranch refs/heads/task/task-2\n\n"
+                return git_proc(args, 0, out)
+            if args[:1] == ["status"]:
+                return git_proc(args, 0, dirty)
+            if args[:1] == ["commit"]:
+                return git_proc(args, commit_rc, "", "" if commit_rc == 0 else "commit failed")
+            if args[:2] == ["rev-parse", "HEAD"]:
+                return git_proc(args, 0, "deadbeef\n")
+            if args[:1] == ["log"]:
+                return git_proc(args, 0, "1700000000\n")
+            return git_proc(args, 0)
+
+        def fake_backlog(args, cwd=None):
+            calls.append(("backlog", list(args), cwd))
+            return backlog_raw_proc(args, backlog_rc, "", "" if backlog_rc == 0 else "EACCES")
+
+        with mock.patch.object(server, "run_git", side_effect=fake_git), \
+             mock.patch.object(server, "run_backlog_raw", side_effect=fake_backlog):
+            result = spawn.commit_ruling(self.config, self.project, "TASK-2", " orchestrator ", "Keep the flag")
+        return result, calls
+
+    def test_writes_the_comment_through_the_cli_and_commits_only_that_file(self):
+        result, calls = self._run()
+        self.assertEqual(result, {"branch": "task/task-2", "worktree": self.wt_dir,
+                                  "path": self.REL, "commit": "deadbeef"})
+        writes = [(kind, args) for kind, args, cwd in calls
+                  if cwd == self.wt_dir and (kind == "backlog" or args[0] in ("add", "commit"))]
+        self.assertEqual(writes, [
+            ("backlog", ["task", "edit", "TASK-2", "--comment", "Keep the flag",
+                         "--comment-author", "orchestrator"]),
+            ("git", ["add", "--", self.REL]),
+            ("git", ["commit", "--only", "-m", "backlog: ruling on TASK-2 from orchestrator",
+                     "--", self.REL]),
+        ])
+        # Nothing ran in the main checkout except reads.
+        for kind, args, cwd in calls:
+            if cwd == self.repo:
+                self.assertIn(args[0], ("rev-parse", "worktree", "log"), args)
+
+    def test_refusals_touch_nothing(self):
+        cases = [
+            ({"branch_exists": False}, 409, "not spawned"),
+            ({"checkout": "none"}, 409, "parked"),
+            ({"checkout": "external"}, 409, "outside Centrale"),
+            ({"dirty": f' M "{self.REL}"\n'}, 409, "uncommitted edits"),
+        ]
+        for kwargs, status, phrase in cases:
+            with self.subTest(**kwargs):
+                with self.assertRaises(spawn.SpawnError) as ctx:
+                    self._run(**kwargs)
+                self.assertEqual(ctx.exception.status, status)
+                self.assertIn(phrase, str(ctx.exception))
+
+    def test_a_failed_write_or_commit_is_a_502(self):
+        for kwargs in ({"backlog_rc": 1}, {"commit_rc": 1}):
+            with self.subTest(**kwargs):
+                with self.assertRaises(spawn.SpawnError) as ctx:
+                    self._run(**kwargs)
+                self.assertEqual(ctx.exception.status, 502)
+
+
 class SpawnHappyPathTests(unittest.TestCase):
     def setUp(self):
         self.config = make_config(
@@ -1007,6 +1459,225 @@ class SpawnHappyPathTests(unittest.TestCase):
         tmux_args = new_session_argv(run_tmux)
         self.assertEqual(tmux_args[tmux_args.index("-s") + 1], "centrale-my-app-task-11_2")
         self.assertEqual(tmux_args[tmux_args.index("-c") + 1], "/worktrees/my-app-task-11.2")
+
+
+class ProjectSpawnLimitTests(unittest.TestCase):
+    """A project cap gates real launch paths, including concurrent requests."""
+
+    def setUp(self):
+        self.project = {"name": "my-app", "path": "/repos/my-app", "maxAgents": 1}
+        self.config = make_config("/worktrees", [self.project, {"name": "my-app-extra", "path": "/other"}])
+        for patch in (
+            mock.patch.dict(os.environ, {"CENTRALE_SPAWN_CMD": "sleep 300"}),
+            mock.patch.object(server, "run_git", side_effect=FakeGit()),
+            mock.patch.object(server, "run_backlog_raw", return_value=backlog_raw_proc()),
+            mock.patch("os.makedirs"),
+            mock.patch("os.path.isdir", return_value=False),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def test_spawn_and_resume_refuse_at_cap_before_any_side_effect(self):
+        names = ["centrale-my-app-task-1_2", "centrale-my-app-extra-task-3"]
+        for launch in (spawn.spawn, spawn.resume):
+            with self.subTest(launch=launch.__name__), \
+                 mock.patch.object(server, "list_sessions", return_value=[{"name": n} for n in names]), \
+                 mock.patch.object(server, "run_git") as git, \
+                 mock.patch.object(server, "run_backlog_raw") as backlog, \
+                 mock.patch.object(server, "run_tmux") as tmux:
+                with self.assertRaises(spawn.SpawnError) as caught:
+                    launch(self.config, "my-app", "TASK-2")
+                self.assertEqual(caught.exception.status, 409)
+                self.assertIn(names[0], str(caught.exception))
+                self.assertNotIn(names[1], str(caught.exception))
+                self.assertIn("maxAgents", str(caught.exception))
+                git.assert_not_called()
+                backlog.assert_not_called()
+                tmux.assert_not_called()
+
+    def test_next_request_recounts_and_unset_cap_preserves_spawning(self):
+        sessions = [{"name": "centrale-my-app-task-1"}]
+        with mock.patch.object(server, "list_sessions", side_effect=lambda: list(sessions)), \
+             mock.patch.object(server, "run_tmux", return_value=tmux_proc([])):
+            with self.assertRaises(spawn.SpawnError):
+                spawn.spawn(self.config, "my-app", "TASK-2")
+            sessions[:] = [{"name": "centrale-my-app-extra-task-1"}]
+            self.assertEqual(spawn.spawn(self.config, "my-app", "TASK-2")["session"], "centrale-my-app-task-2")
+            self.project.pop("maxAgents")
+            sessions[:] = [{"name": "centrale-my-app-task-1"}]
+            self.assertEqual(spawn.spawn(self.config, "my-app", "TASK-2")["session"], "centrale-my-app-task-2")
+
+    def test_concurrent_spawn_and_resume_cannot_both_take_the_last_slot(self):
+        sessions, outcomes = [], []
+        first_launch = threading.Event()
+        release_launch = threading.Event()
+        second_started = threading.Event()
+        second_survey = threading.Event()
+
+        def listing():
+            if threading.current_thread().name == "second-launch":
+                second_survey.set()
+            return list(sessions)
+
+        def tmux(args):
+            if args[0] == "new-session":
+                if not first_launch.is_set():
+                    first_launch.set()
+                    if not release_launch.wait(3):
+                        raise AssertionError("test did not release launch")
+                sessions.append({"name": args[args.index("-s") + 1]})
+            return tmux_proc(args)
+
+        def launch(fn, task):
+            if task == "TASK-3":
+                second_started.set()
+            try:
+                fn(self.config, "my-app", task)
+                outcomes.append(200)
+            except spawn.SpawnError as exc:
+                outcomes.append(exc.status)
+
+        with mock.patch.object(server, "list_sessions", side_effect=listing), \
+             mock.patch.object(server, "run_tmux", side_effect=tmux):
+            first = threading.Thread(target=launch, args=(spawn.spawn, "TASK-2"))
+            second = threading.Thread(target=launch, args=(spawn.resume, "TASK-3"), name="second-launch")
+            first.start()
+            try:
+                self.assertTrue(first_launch.wait(3))
+                second.start()
+                self.assertTrue(second_started.wait(3))
+                self.assertFalse(second_survey.wait(0.1), "second request surveyed before first launch finished")
+            finally:
+                release_launch.set()
+                first.join(3)
+                if second.ident is not None:
+                    second.join(3)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+        self.assertEqual(sorted(outcomes), [200, 409])
+        self.assertEqual(len(sessions), 1)
+
+
+class WorktreeLinksTests(unittest.TestCase):
+    """Real files, with git/tmux/backlog kept behind fake boundaries."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = os.path.join(tmp.name, "repo")
+        os.makedirs(os.path.join(self.repo, ".git", "info"))
+        self.project = {"name": "my-app", "path": self.repo, "worktreeLinks": [".venv", "assets/local data"]}
+        self.config = make_config(os.path.join(tmp.name, "trees"), [self.project])
+        self.wt = spawn.worktree_dir(self.config, "my-app", "TASK-2")
+        for rel in self.project["worktreeLinks"]:
+            os.makedirs(os.path.join(self.repo, rel))
+            with open(os.path.join(self.repo, rel, "keep.txt"), "w") as f:
+                f.write("main data")
+        self.exclude = os.path.join(self.repo, ".git", "info", "exclude")
+        self.registered = False
+        self.tracked = ""
+        self.ignore_ok = True
+        for patch in (
+            mock.patch.dict(os.environ, {"CENTRALE_SPAWN_CMD": "sleep 300"}),
+            mock.patch.object(server, "run_backlog_raw", return_value=backlog_raw_proc()),
+            mock.patch.object(server, "run_tmux", return_value=tmux_proc([])),
+            mock.patch.object(server, "list_sessions", return_value=[]),
+            mock.patch.object(server, "run_git", side_effect=self.git),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def git(self, args, cwd=None):
+        if args == ["rev-parse", "--git-path", "info/exclude"]:
+            return git_proc(args, stdout=self.exclude + "\n")
+        if args[0] == "ls-files":
+            return git_proc(args, stdout=self.tracked)
+        if args[0] == "check-ignore":
+            return git_proc(args, returncode=0 if self.ignore_ok else 1)
+        if args[:2] == ["worktree", "add"]:
+            os.makedirs(self.wt)
+            self.registered = True
+        return FakeGit(worktree_registered=self.registered, wt_dir=self.wt)(args, cwd)
+
+    def test_new_worktree_links_files_and_directories_and_excludes_links(self):
+        config_file = os.path.join(self.repo, "local.conf")
+        with open(config_file, "w") as f:
+            f.write("local configuration")
+        self.project["worktreeLinks"].append("local.conf")
+        result = spawn.spawn(self.config, "my-app", "TASK-2")
+        self.assertNotIn("warnings", result)
+        for rel in self.project["worktreeLinks"]:
+            self.assertTrue(os.path.islink(os.path.join(self.wt, rel)))
+            self.assertEqual(os.readlink(os.path.join(self.wt, rel)), os.path.join(self.repo, rel))
+        with open(self.exclude) as f:
+            self.assertEqual(f.read().splitlines(), ["/.venv", "/assets/local data", "/local.conf"])
+
+    def test_missing_source_warns_on_spawn_and_resume_without_failure(self):
+        self.project["worktreeLinks"] = ["missing"]
+        for launch in (spawn.spawn, spawn.resume):
+            with self.subTest(launch=launch.__name__):
+                result = launch(self.config, "my-app", "TASK-2")
+                self.assertIn("missing", " ".join(result.get("warnings", [])))
+                self.assertFalse(os.path.lexists(os.path.join(self.wt, "missing")))
+                shutil.rmtree(self.wt)
+                self.registered = False
+
+    def test_reused_worktree_is_unchanged_and_exclusions_are_idempotent(self):
+        spawn.spawn(self.config, "my-app", "TASK-2")
+        link = os.path.join(self.wt, ".venv")
+        self.assertTrue(os.path.islink(link))
+        os.unlink(link)
+        os.mkdir(link)
+        spawn.spawn(self.config, "my-app", "TASK-2")
+        self.assertFalse(os.path.islink(link))
+        shutil.rmtree(self.wt)
+        self.registered = False
+        spawn.spawn(self.config, "my-app", "TASK-2")
+        with open(self.exclude) as f:
+            self.assertEqual(f.read().splitlines().count("/.venv"), 1)
+
+    def test_exclusion_failure_never_leaves_a_committable_link(self):
+        os.mkdir(self.exclude)
+        result = spawn.spawn(self.config, "my-app", "TASK-2")
+        self.assertIn("exclude", " ".join(result.get("warnings", [])))
+        self.assertFalse(os.path.lexists(os.path.join(self.wt, ".venv")))
+
+    def test_unset_links_creates_no_link_or_link_exclusion(self):
+        self.project.pop("worktreeLinks")
+        result = spawn.spawn(self.config, "my-app", "TASK-2")
+        self.assertNotIn("warnings", result)
+        self.assertFalse(os.path.lexists(os.path.join(self.wt, ".venv")))
+        self.assertFalse(os.path.exists(self.exclude))
+
+    def test_checkout_content_and_symlinked_parents_are_never_overwritten(self):
+        def git_with_checkout_content(args, cwd=None):
+            result = self.git(args, cwd)
+            if args[:2] == ["worktree", "add"]:
+                with open(os.path.join(self.wt, ".venv"), "w") as f:
+                    f.write("checkout content")
+                os.symlink(os.path.join(self.repo, "assets"), os.path.join(self.wt, "assets"))
+            return result
+
+        with mock.patch.object(server, "run_git", side_effect=git_with_checkout_content):
+            result = spawn.spawn(self.config, "my-app", "TASK-2")
+        warnings = " ".join(result.get("warnings", []))
+        self.assertIn("destination already exists", warnings)
+        self.assertIn("destination parent is a symlink", warnings)
+        with open(os.path.join(self.wt, ".venv")) as f:
+            self.assertEqual(f.read(), "checkout content")
+        with open(os.path.join(self.repo, "assets", "local data", "keep.txt")) as f:
+            self.assertEqual(f.read(), "main data")
+        self.assertFalse(os.path.islink(os.path.join(self.repo, "assets", "local data")))
+
+    def test_tracked_paths_and_overridden_ignore_rules_are_not_linked(self):
+        for tracked, ignore_ok in ((".venv\0", True), ("", False)):
+            with self.subTest(tracked=tracked, ignore_ok=ignore_ok):
+                self.tracked, self.ignore_ok = tracked, ignore_ok
+                result = spawn.spawn(self.config, "my-app", "TASK-2")
+                self.assertTrue(result.get("warnings"))
+                self.assertFalse(os.path.lexists(os.path.join(self.wt, ".venv")))
+                shutil.rmtree(self.wt)
+                self.registered = False
 
 
 class SessionGeometryTests(unittest.TestCase):
@@ -1598,6 +2269,10 @@ class SpawnClaimAndCommitTests(unittest.TestCase):
         self.assertEqual(commit_call[1][0], "commit")
         self.assertIn("-m", commit_call[1])
         self.assertEqual(commit_call[1][commit_call[1].index("-m") + 1], "backlog: claim TASK-2 for spawn")
+        # task-169: the commit is scoped exactly like the add -- never the
+        # whole index.
+        self.assertEqual(commit_call[1][-2:], ["--", "backlog"])
+        self.assertIn("--only", commit_call[1])
 
     def test_nothing_to_commit_skips_add_and_commit_silently(self):
         result, calls = self._run(status_stdout="")  # nothing changed under backlog/
@@ -1636,6 +2311,76 @@ class SpawnClaimAndCommitTests(unittest.TestCase):
         claim_args = next(c[1] for c in calls if c[0] == "backlog_raw")
         self.assertNotIn("-a", claim_args)
         self.assertNotIn("--assignee", claim_args)
+
+
+
+class ClaimCommitScopeRealGitTests(unittest.TestCase):
+    """task-169, against real git rather than a recorded call list: the
+    claim commit may carry backlog/ and nothing else, whatever another
+    session has staged in the same checkout. The mocked tests above can
+    only assert which argv was sent; this proves what git actually did
+    with it, which is where the original bug lived."""
+
+    TASK_FILE = "backlog/tasks/task-2 - Wire the parser.md"
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="claim-scope-")
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.email", "t@example.invalid")
+        self._git("config", "user.name", "T")
+        self._write(self.TASK_FILE, "status: To Do\n")
+        self._write("README.md", "# demo\n")
+        self._git("add", "-A")
+        self._git("commit", "-qm", "init")
+
+    def _git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.repo, check=True,
+                              capture_output=True, text=True).stdout
+
+    def _write(self, rel, text):
+        path = os.path.join(self.repo, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _claim(self):
+        """Run the real _claim_and_commit, with only the backlog CLI faked:
+        it edits the task file the way `backlog task edit -s` would."""
+        def fake_backlog(args, cwd):
+            self._write(self.TASK_FILE, "status: In Progress\n")
+            return backlog_raw_proc(args, 0, "", "")
+        with mock.patch.object(server, "run_backlog_raw", side_effect=fake_backlog):
+            return spawn._claim_and_commit({"name": "demo", "path": self.repo}, "TASK-2")
+
+    def test_another_sessions_staged_work_is_left_staged_and_uncommitted(self):
+        # Another session's in-flight work, staged but not yet committed --
+        # the observed case: an evidence file, and an edit to a tracked file.
+        self._write("docs/evidence.md", "someone else's evidence\n")
+        self._write("README.md", "# demo\nedited by another session\n")
+        self._git("add", "docs/evidence.md", "README.md")
+
+        warnings = self._claim()
+
+        self.assertEqual(warnings, [])
+        # splitlines, not split: the task filename has spaces in it, as
+        # every real Backlog.md filename does.
+        committed = self._git("-c", "core.quotePath=false", "show", "--name-only",
+                              "--format=", "HEAD").splitlines()
+        self.assertEqual([c for c in committed if c], [self.TASK_FILE])
+        self.assertEqual(self._git("log", "-1", "--format=%s"), "backlog: claim TASK-2 for spawn\n")
+        # ...and the other session's work is exactly where it left it.
+        staged = sorted(self._git("diff", "--cached", "--name-only").splitlines())
+        self.assertEqual(staged, ["README.md", "docs/evidence.md"])
+
+    def test_a_clean_index_produces_the_same_claim_commit_as_before(self):
+        warnings = self._claim()
+
+        self.assertEqual(warnings, [])
+        self.assertEqual(self._git("show", "--name-only", "--format=", "HEAD").strip(),
+                         self.TASK_FILE)
+        self.assertEqual(self._git("show", f"HEAD:{self.TASK_FILE}"), "status: In Progress\n")
+        self.assertEqual(self._git("status", "--porcelain"), "")
 
 
 class ResumeCmdForAgentTests(unittest.TestCase):
@@ -1690,7 +2435,6 @@ class ResumeIntegrationTests(unittest.TestCase):
              mock.patch.object(server, "list_sessions", return_value=sessions or []), \
              mock.patch.object(server, "run_backlog", return_value=task_view(assignees, status=status)), \
              mock.patch.object(server, "run_backlog_raw") as run_backlog_raw, \
-             mock.patch.object(server, "ensure_hooks_settings_file", return_value="/fake/cache/centrale/hooks-settings.json"), \
              mock.patch.object(server, "probe_codex_hook_trust", return_value=False), \
              mock.patch("os.path.isdir", return_value=True), \
              mock.patch("os.makedirs"):
@@ -1732,7 +2476,7 @@ class ResumeIntegrationTests(unittest.TestCase):
         self.assertEqual(result["agent"], "claude-sonnet")
         tmux_args = new_session_argv(run_tmux)
         self.assertEqual(tmux_args[-4:-2], ["claude", "--continue"])
-        self.assertEqual(tmux_args[-2:], ["--settings", "/fake/cache/centrale/hooks-settings.json"])
+        self.assertEqual(tmux_args[-2:], spawn._inject_agent_hooks(["claude"]))
         self.assertIn(
             f"CENTRALE_EVENT_URL={spawn.event_url(config, 'my-app', 'TASK-2', agent_kind='claude')}",
             tmux_args,
@@ -2096,7 +2840,6 @@ class ReconcileResumeTests(ResumeIntegrationTests):
              mock.patch.object(server, "list_sessions", return_value=[]), \
              mock.patch.object(server, "run_backlog", return_value=task_view([])), \
              mock.patch.object(server, "run_backlog_raw"), \
-             mock.patch.object(server, "ensure_hooks_settings_file", return_value="/fake/hooks.json"), \
              mock.patch("os.path.isdir", return_value=True), \
              mock.patch("os.makedirs"):
             spawn.resume(config, "my-app", "TASK-2", reconcile=True)
@@ -2242,7 +2985,7 @@ class DoneStatusRefusalTests(unittest.TestCase):
             run_git=mock.patch.object(server, "run_git", side_effect=fake_git),
             run_tmux=mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)),
             list_sessions=mock.patch.object(server, "list_sessions", return_value=[]),
-            run_backlog=mock.patch.object(server, "run_backlog", return_value=task_view([], status=status)),
+            run_backlog=mock.patch.object(server, "run_backlog", return_value=task_view(["@claude"], status=status)),
             run_backlog_raw=mock.patch.object(server, "run_backlog_raw", return_value=backlog_raw_proc()),
             isdir=mock.patch("os.path.isdir", return_value=True),
             makedirs=mock.patch("os.makedirs"),
@@ -2634,7 +3377,16 @@ class SpawnHttpApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(body["session"], "centrale-my-app-task-2")
         self.assertEqual(body["attach"], "tmux attach -t centrale-my-app-task-2")
-        fake_spawn.assert_called_once_with(self.config, "my-app", "TASK-2")
+        fake_spawn.assert_called_once_with(self.config, "my-app", "TASK-2", agent=None)
+
+    def test_post_spawn_passes_the_agent_field_through(self):
+        # task-171: the explicit choice reaches spawn.spawn verbatim; its
+        # validation (unknown -> 400) is spawn's, see SpawnAgentChoiceTests.
+        payload = json.dumps({"project": "my-app", "taskId": "TASK-2", "agent": "codex"}).encode("utf-8")
+        with mock.patch("spawn.spawn", return_value={"session": "s", "attach": "a"}) as fake_spawn:
+            status, _ = self._post("/api/spawn", payload)
+        self.assertEqual(status, 200)
+        fake_spawn.assert_called_once_with(self.config, "my-app", "TASK-2", agent="codex")
 
     def test_post_spawn_surfaces_spawn_error_status(self):
         import spawn as spawn_module

@@ -592,9 +592,9 @@ def main(argv=None):
 
     os.makedirs(args.out, exist_ok=True)
     sandbox = tempfile.mkdtemp(prefix="centrale-screenshots-")
-    # Before importing server: hooks_settings_path() and browser.py's
-    # registry both resolve under XDG_CACHE_HOME, and neither may land in
-    # a real ~/.cache during a screenshot run.
+    # Before importing server: browser.py's registry resolves under
+    # XDG_CACHE_HOME, and it must not land in a real ~/.cache during a
+    # screenshot run.
     os.environ["XDG_CACHE_HOME"] = os.path.join(sandbox, "cache")
 
     sys.path.insert(0, REPO_ROOT)

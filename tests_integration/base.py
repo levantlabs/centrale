@@ -448,8 +448,12 @@ def assert_test_tmux_footprint_gone(socket_name=None):
         raise AssertionError(f"test tmux server still has sessions: {proc.stdout}")
     # tmux reports a torn-down/never-started server via a non-zero exit
     # and one of a few "no server" phrasings on stderr -- the same
-    # tolerance server.list_sessions() itself applies.
-    known_gone_phrases = ("no server running", "no such file or directory", "error connecting")
+    # tolerance server.list_sessions() itself applies. "server exited
+    # unexpectedly" is the query catching the server mid-exit, right after
+    # kill-server: gone all the same, and seen on a heavily loaded
+    # machine during a release gate (task-180).
+    known_gone_phrases = ("no server running", "no such file or directory", "error connecting",
+                          "server exited unexpectedly")
     if not any(p in combined for p in known_gone_phrases):
         raise AssertionError(f"unexpected tmux list-sessions output while asserting shutdown: {combined}")
     path = tmux_socket_path(socket_name)
@@ -671,7 +675,7 @@ def probe_spawn_cmd(sleep_seconds=300, marker="itest-probe"):
 # any test can reach it, which is what happened to the whole real-server
 # half of this tier between task-107 landing and task-119 finding it.
 APP_MODULES = ("server.py", "spawn.py", "browser.py", "harvest.py", "settings.py",
-               "centrale_notify.py", "version.py")
+               "centrale_notify.py", "version.py", "orchestrator.py")
 
 
 def deploy_app(dest_dir):

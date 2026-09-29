@@ -704,11 +704,26 @@
       btn.title = C.TMUX_UNAVAILABLE_TOOLTIP;
     } else if (live) {
       btn.title = "A session for this task is already live: " + live.name;
+    } else if (display.capReason) {
+      btn.title = display.capReason;
     } else if (display.confirming) {
       btn.title = display.confirmTitle || "";
+    } else if (display.agentTitle) {
+      btn.title = display.agentTitle;
     }
     btn.addEventListener("click", function () { C.handleSpawnClick(projectName, taskId); });
+    // task-171: the same picker the card offers, above the full-width
+    // button, with the reason spelled out rather than left to a tooltip.
+    if (!live && !display.noTmux && display.plan && display.plan.needsPick) {
+      var pickRow = C.h("div", { className: "spawn-agent-pick-row" });
+      pickRow.appendChild(C.renderSpawnAgentPicker(task, projectName, taskId, display.plan));
+      area.appendChild(pickRow);
+      area.appendChild(C.h("div", { className: "spawn-status-line spawn-agent-reason", text: display.agentTitle }));
+    }
     area.appendChild(btn);
+    if (display.capReason) {
+      area.appendChild(C.h("div", { className: "spawn-status-line", text: display.capReason }));
+    }
 
     if (live && (!state || state.status !== "success")) {
       var liveInfo = C.h("div", { className: "spawn-status-line success" });
@@ -759,7 +774,8 @@
   function renderDrawerRespawnAction(row, area, projectName, taskId, secondary) {
     var key = C.spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
-    var armed = C.armedFor(pending, "respawn");
+    var capReason = C.projectSpawnCapReason(projectName);
+    var armed = !capReason && C.armedFor(pending, "respawn");
     var state = C.spawnStates[key];
     var loading = state && state.status === "loading";
 
@@ -767,10 +783,11 @@
       className: "btn btn-sm" + (secondary ? " btn-quiet" : "") + (armed ? " confirming" : ""),
       text: loading ? "Spawning…" : (armed ? "Confirm re-spawn?" : "Re-spawn agent")
     });
-    btn.disabled = !C.isTmuxAvailable() || loading;
+    btn.disabled = !C.isTmuxAvailable() || loading || !!capReason;
     btn.title = !C.isTmuxAvailable()
       ? C.TMUX_UNAVAILABLE_TOOLTIP
-      : "Send an agent back into this task's existing worktree to fix a failed merge gate or continue unfinished work -- not a fresh start.";
+      : capReason ||
+        "Send an agent back into this task's existing worktree to fix a failed merge gate or continue unfinished work -- not a fresh start.";
     btn.addEventListener("click", function () { C.handleRespawnClick(projectName, taskId); });
     row.appendChild(btn);
 
@@ -793,7 +810,8 @@
   function renderDrawerResumeAction(row, area, projectName, taskId) {
     var key = C.spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
-    var armed = C.armedFor(pending, "resume");
+    var capReason = C.projectSpawnCapReason(projectName);
+    var armed = !capReason && C.armedFor(pending, "resume");
     var state = C.spawnStates[key];
     var loading = state && state.status === "loading";
 
@@ -801,10 +819,11 @@
       className: "btn btn-sm" + (armed ? " confirming" : ""),
       text: loading ? "Resuming…" : (armed ? "Confirm resume?" : "Resume agent")
     });
-    btn.disabled = !C.isTmuxAvailable() || loading;
+    btn.disabled = !C.isTmuxAvailable() || loading || !!capReason;
     btn.title = !C.isTmuxAvailable()
       ? C.TMUX_UNAVAILABLE_TOOLTIP
-      : "Continue this task's interrupted agent session in its existing worktree -- picks up the same conversation where it left off, uncommitted changes included.";
+      : capReason ||
+        "Continue this task's interrupted agent session in its existing worktree -- picks up the same conversation where it left off, uncommitted changes included.";
     btn.addEventListener("click", function () { C.handleResumeClick(projectName, taskId); });
     row.appendChild(btn);
 
@@ -938,6 +957,11 @@
       reconcileBtn.title = rDisplay.title || "";
       reconcileBtn.addEventListener("click", function () { C.handleReconcileClick(projectName, taskId); });
       row.appendChild(reconcileBtn);
+    }
+
+    var capReason = C.projectSpawnCapReason(projectName);
+    if (capReason) {
+      area.appendChild(C.h("div", { className: "spawn-status-line", text: capReason }));
     }
 
     // The condition renderDrawerSpawnArea used to answer before these

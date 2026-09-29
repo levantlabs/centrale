@@ -7,10 +7,22 @@ worked outside Centrale, lifecycle events, the multi-agent workflow, the
 Centrale manual; the [README](../README.md) is the front door and lists
 the other chapters.
 
+## Teaching agents in other projects
+
+Opt into **Set up Backlog.md and Centrale in this repo** when adding a project,
+or call [POST /api/setup-project](api.md#post-apisetup-project) for an existing
+one. Both install a small marked pointer in `CLAUDE.md` and `AGENTS.md` to
+[GET /api/agent-guide](api.md#get-apiagent-guide). The running server serves
+the operating instructions; projects do not keep a copied guide that goes
+stale. `--check` identifies missing/stale pointers and prints the repair
+command. Setup is opt-in, committed only to the files it changes, and a no-op
+when complete. See [configuration](configuration.md) for write/refusal details.
+
 ## Spawning an agent
 
-Clicking "Spawn agent" (or "Spawn (\<agent\>)" once the task has an
-assignee that resolves to a specific agent — see "Agent selection" below)
+Clicking "Spawn (\<agent\>)" — the button names the agent that will run;
+when the task's assignee names no configured agent it sits beside a picker
+of agents instead, see "Agent selection" below
 on a ready task (inline on its card, or in the task drawer) sends
 `POST /api/spawn` with that project and task ID — except when the button
 first has to arm an informed confirm instead (see "Spawn guards" below).
@@ -19,10 +31,14 @@ On the server side this (see `spawn.py`):
 1. Validates the project name and task ID, rejects the request with a 409
    if a tmux session for that project+task is already running, and
    refuses with a 409 naming the status if the task is already `Done` —
-   before any claim, worktree, or session is touched.
+   before any claim, worktree, or session is touched. The agent is chosen
+   here too (see "Agent selection" below), so a spawn that has to refuse
+   to guess one is also refused before anything is touched.
 2. Claims the task and commits that claim, on the repository's current
    branch, *before* the worktree is cut: runs `backlog task edit <id> -s
-   "In Progress"` (leaving the assignee untouched), then `git add backlog`
+   "In Progress"` (leaving the assignee untouched — unless the agent did
+   not come from it, in which case the same edit records it; see "Agent
+   selection"), then `git add backlog`
    and commits with message `backlog: claim <id> for spawn` — skipped
    silently if that leaves nothing under `backlog/` to commit. This
    happens even when `CENTRALE_SPAWN_CMD` is set (only the launched
@@ -46,8 +62,9 @@ On the server side this (see `spawn.py`):
    this step also idempotently adds that worktree directory to the
    project's `.git/info/exclude` the first time, so it never shows up in
    `git status` there.
-4. Resolves which agent to run (see "Agent selection" below), unless
-   `CENTRALE_SPAWN_CMD` is set, in which case that always wins.
+4. Launches the agent chosen in step 1 (see "Agent selection" below), unless
+   `CENTRALE_SPAWN_CMD` is set, in which case that always wins and no agent
+   is chosen, refused or recorded.
 5. Starts a detached tmux session named `centrale-<project>-<taskid-lower>`,
    running the resolved agent command with a standard workflow prompt, with
    its working directory set to the worktree, a `CENTRALE_EVENT_URL`
@@ -58,7 +75,8 @@ On the server side this (see `spawn.py`):
    events".
 6. Responds with `{"session": "<name>", "attach": "tmux attach -t <name>",
    "agent": "<agent>"}`, plus a `"warnings"` array of human-readable
-   strings if step 2 hit a problem. The UI shows each warning as a
+   strings if claiming, task-file locking or worktree linking hit a problem,
+   or the default agent was fallen back to. The UI shows each warning as a
    dismissible toast alongside the normal spawn success message.
 
 For example, spawning on project `my-app`, task `TASK-2`, produces worktree
@@ -66,6 +84,24 @@ For example, spawning on project `my-app`, task `TASK-2`, produces worktree
 `centrale-my-app-task-2`.
 
 ### Spawn guards
+
+The optional per-project `maxAgents` setting is a server gate for spawn,
+re-spawn and resume. It counts this project's live tmux sessions on every
+request and refuses at the cap with 409 naming them, before any claim or
+worktree creation. The board and drawer keep the launch controls visible,
+disabled with that reason. A session still counts when its agent is idle or
+finished; end it after review to free the slot. Omitted or `null` means no
+cap. Configure it in Settings alongside the project's `checkCommand`.
+
+That same Settings section edits `worktreeLinks`, one repo-relative path per
+line (for example `.venv`). New worktrees get symlinks to those paths in the
+main checkout; existing worktrees are reused unchanged. Shared contents are
+writable through the links. Centrale adds each path to `.git/info/exclude`
+and verifies it is ignored before creating the link, so ordinary staging
+does not commit it. Missing sources and unsafe destinations produce warnings
+and skip that link. Discard, abandon, cleanup and harvest remove links with
+the worktree and preserve their targets. See the validation rules and JSON
+example in [Configuration](configuration.md#setup--configuration).
 
 Two frontend-only guards (decided in `static/spawn.js`, worded in
 `static/tasks.js`, rendered on the card by `static/board.js` — no extra
@@ -105,18 +141,40 @@ reaches the server:
 
 ### Agent selection
 
-Which CLI gets spawned is driven by the task's first assignee (`assignees[0]`
-from `backlog task view <id> --json`, `@` stripped, matched
-case-insensitively against the `agents` map in `projects.json`):
+Centrale does not guess which agent to launch (task-171). The spawned
+agent's `cmd` runs with its `promptSuffix` (if any) appended to the standard
+workflow prompt (or to your `spawnPrompt` override, if you set one), and
+the agent is, in order:
 
-- An assignee that matches a key in `agents` (e.g. `@codex` when `agents`
-  has a `codex` key) spawns that agent's `cmd`, with its `promptSuffix` (if
-  any) appended to the standard workflow prompt (or to your `spawnPrompt`
-  override, if you set one).
-- No assignee, or an assignee that matches nothing in `agents`, spawns
-  `defaultAgent`'s `cmd`/`promptSuffix`.
-- If the `backlog task view` call itself fails, Centrale falls back to
-  `defaultAgent` rather than failing the spawn.
+- The one **picked** in the spawn control (`POST /api/spawn`'s `agent`
+  field) — an explicit choice wins over the assignee.
+- Otherwise the task's **first assignee** (`assignees[0]` from `backlog task
+  view <id> --json`, `@` stripped, matched case-insensitively against the
+  `agents` map in `projects.json`) — e.g. `@codex` when `agents` has a
+  `codex` key.
+- Otherwise — no assignee, a person, a typo like `@claude-opsu`, or a
+  `backlog task view` that failed — nothing, and the spawn is refused with
+  a 409 naming the task, its assignee and the configured agents, while
+  `requireAgentAssignment` is on (the default). With it off,
+  `defaultAgent` runs instead and the response carries a warning saying so.
+
+The spawn button names the agent before the click — "Spawn (codex)", or
+"Spawn (claude · default)" for a fallback. When the assignee names no
+agent, the card and the drawer put a picker of the configured agents
+beside it; with `requireAgentAssignment` on the button reads "Pick an agent
+to spawn" and stays disabled until one is picked.
+
+When the agent that ran did not come from the task's first assignee, the
+claim (step 2 above) records it: the agent becomes the first assignee, and
+anyone already assigned — a person, or an unrecognised name — stays on the
+task behind it, never dropped. First, because the first assignee is what
+resolves an agent: Re-spawn and Resume then launch the same one. A task
+whose first assignee already names an agent is left alone, even when a
+pick overrides it for one launch.
+
+Resume is the exception: it relaunches work already under way, so it still
+falls back to `defaultAgent` silently rather than refusing a task whose
+assignee names no agent.
 
 For example, with this `agents` config:
 
@@ -136,10 +194,9 @@ subagent for any layout changes."` — i.e. the object form's `cmd` picks the
 CLI and its flags, and `promptSuffix` steers what it's asked to do, both
 purely through config.
 
-The spawn button's label reflects the task's raw assignee before spawning
-(e.g. "Spawn (codex)"); the actual resolution above happens server-side at
-spawn time and the confirmed agent name comes back in the response and is
-shown next to the spawned session.
+The server resolves the agent again at spawn time, and the agent it
+actually launched comes back in the response and is shown next to the
+spawned session.
 
 The prompt given to the agent is, by default:
 
@@ -151,7 +208,10 @@ The prompt given to the agent is, by default:
 > constraints. When you are done, commit all your work on this branch,
 > including the backlog task updates. Do NOT merge this branch into the
 > default branch or delete it — the dashboard's gated merge handles
-> integration.
+> integration. A message from an orchestrating session (Centrale delivers
+> one as `[ruling from <sender>] <text>`) is a ruling on this task: first
+> record it on your task as a comment authored by the sender (`backlog task
+> edit \<ID> --comment "<text>" --comment-author <sender>`), then act on it.
 
 The standing-decisions sentence points the agent at Backlog.md's decision
 records — the durable "why" layer behind a repo's constraints, which an
@@ -165,6 +225,11 @@ agent merging its own branch directly bypasses every merge gate ([docs/merging.m
 enforces in the prompt every agent gets, not something left to per-repo or
 per-user config (see "Merge ownership" in [docs/merging.md](merging.md#merging-finished-branches) for what happens if an agent
 does it anyway).
+
+The ruling sentence is the other half of the task-file lock (see
+[Ruling on a spawned task](#ruling-on-a-spawned-task) below): while a task
+is spawned its agent is the only writer of its task file, so a ruling
+reaches the file through the agent rather than around it.
 
 The whole template is replaceable with the top-level `spawnPrompt` key in
 `projects.json` (see "Setup / configuration" in [docs/configuration.md](configuration.md#setup--configuration) for the rules — it must
@@ -566,26 +631,52 @@ matching task in `GET /api/board` and row in `GET /api/sessions`.
 `agentState` is `"unknown"` until an event arrives. Claude events retain
 their `working`/`waiting`/`finished` meanings; a codex `finished` event
 is exposed as `"idle"`, because codex uses the same turn-end signal when it
-is genuinely done and when it has asked a plain chat question.
+is genuinely done and when it has asked a plain chat question. An idle
+event has also been observed during ongoing work: read the current screen
+before acting on it.
+
+Codex `PermissionRequest` fires before automatic approval review as well as
+before human input. Centrale keeps the badge working for 30 seconds, then
+checks for a dialog on that worker's pane before publishing one waiting
+event and the waiting badge together. Activity or turn-end cancels the
+candidate; repeated waiting hooks do not extend its deadline or duplicate
+the event. A still-working pane is checked again every 30 seconds until a
+hook clears the candidate or a dialog appears. This corroboration matters
+for an already-approved slow tool and for workers with older hooks that
+leave waiting stale. A failed capture means unknown and retries; a vanished
+session means unknown and stops checking. The dialog check uses the same
+rendered-menu/footer signatures as message delivery, so a new CLI dialog
+format may need an updated signature. Claude events are unchanged.
 
 For the two built-in agent families, Centrale wires this up automatically,
 with no config required:
 
-- **claude**: spawn/resume appends `--settings <generated file>` to the
-  launched command, pointing at a small Claude Code hooks settings file
-  Centrale generates under its cache dir (`~/.cache/centrale/hooks-
-  settings.json`, or `$XDG_CACHE_HOME/centrale/...` — never the user's own
-  `~/.claude` config or the target repo). That file maps
+- **claude**: spawn/resume appends `--settings '<json>'` to the launched
+  command: the hooks settings passed **inline as JSON**, never a file
+  (built by `server.hooks_settings_payload()`, and never written to the
+  user's own `~/.claude` config or the target repo). The settings map
   `UserPromptSubmit`/`PreToolUse` to `working`, `Notification` to
   `waiting`, and `Stop` to `finished`, each running `centrale_notify.py`
-  (shipped at this repo's root) with the corresponding state. The file
-  itself is agent-generic — task identity travels through
-  `CENTRALE_EVENT_URL` in the session's own environment, not anything
-  encoded in the settings file — so it's generated once and reused across
-  every claude-family spawn/resume.
+  (shipped at the root of the Centrale copy that did the spawn) with the
+  corresponding state. Task identity travels through `CENTRALE_EVENT_URL`
+  in the session's own environment. Being inline, each agent's hooks are
+  fixed at launch: an earlier version (task-37) wrote one shared
+  `~/.cache/centrale/hooks-settings.json` and rewrote it on every spawn,
+  so a Centrale run from a task worktree repointed every running agent's
+  hooks at that worktree, and once it was deleted every tool call on the
+  machine was blocked (a missing hook script exits 2, which blocks the
+  tool call) — task-173. They also set two
+  spawn-only settings: `skillOverrides: {"auto-mode-setup": "off"}`, so
+  a spawned agent never stops on the "Teach auto mode about your
+  environment?" offer, and `crossSessionInbound: "accept"`, so messages
+  from your other sessions on this machine (an orchestrator's
+  `SendMessage` ruling, say) are delivered rather than held for an
+  approval nobody is watching for. Because `--settings` takes
+  precedence, these override your user settings for spawned agents
+  only; your own sessions are unaffected.
 - **codex**: on a codex with the hooks engine (>= 0.150.0), spawn/resume
-  passes the same four hook definitions claude's settings file uses —
-  `UserPromptSubmit`/`PreToolUse` to `working`, `PermissionRequest` to
+  passes five hook definitions —
+  `UserPromptSubmit`/`PreToolUse`/`PostToolUse` to `working`, `PermissionRequest` to
   `waiting`, `Stop` to `finished`, each running `centrale_notify.py` with
   the corresponding state — as **inline `-c` config overrides on the codex
   argv itself**, one per hook point:
@@ -593,12 +684,15 @@ with no config required:
   -c hooks.UserPromptSubmit=[{hooks=[{type="command",command="python3 <abs>/centrale_notify.py working"}]}]
   -c hooks.PreToolUse=[{hooks=[{type="command",command="python3 <abs>/centrale_notify.py working"}]}]
   -c hooks.PermissionRequest=[{hooks=[{type="command",command="python3 <abs>/centrale_notify.py waiting"}]}]
+  -c hooks.PostToolUse=[{hooks=[{type="command",command="python3 <abs>/centrale_notify.py working"}]}]
   -c hooks.Stop=[{hooks=[{type="command",command="python3 <abs>/centrale_notify.py finished"}]}]
   ```
   (`server.codex_hooks_overrides()` builds these; the value on each is a
   TOML inline array-of-inline-tables matching codex's hooks.json schema
-  one level deep — full claude-parity fidelity, not just a single
-  `finished` event.)
+  one level deep.) `PostToolUse` clears the permission candidate when a
+  tool returns, even if no next tool starts. These overrides are fixed at
+  launch; existing workers get the extra hook on their next spawn/resume.
+  The delayed dialog check also protects workers with the older hooks.
 
   The raw `finished` event is not presented as a confident finished badge
   for codex. Codex's `PermissionRequest` is only a tool-approval signal; a
@@ -608,8 +702,8 @@ with no config required:
   tooltip explaining the trade-off. Claude remains unchanged because its
   `Notification` hook distinguishes waiting from finished. A future
   codex-side awaiting-user-input event is the real way to recover that
-  distinction; Centrale deliberately does not sniff message content or guess
-  from timing.
+  distinction; Centrale does not infer completion from message content or
+  timing. The permission-dialog check above only corroborates a wait hook.
 
   **This replaced an earlier approach (task-42) that instead wrote a
   generated `<worktree>/.codex/hooks.json` file, git-excluded from that
@@ -641,7 +735,7 @@ with no config required:
   feature-detects nothing. Instead, Centrale probes the binary directly:
   once per distinct binary path (cached in memory), it runs `<codex
   binary> --help` and checks whether the output advertises
-  `--dangerously-bypass-hook-trust`. Only on a positive probe are the four
+  `--dangerously-bypass-hook-trust`. Only on a positive probe are the
   overrides and the trust flag appended at all; on a negative probe, or a
   failed probe, neither is — this matters because an older codex doesn't
   recognize `--dangerously-bypass-hook-trust` (and may not recognize the
@@ -721,6 +815,69 @@ are empty again after every server restart. Every task then reads back
 `agentState: "unknown"` and `agentKind: "unknown"` until an event arrives;
 the next built-in event restores both from that session's URL.
 
+## Ruling on a spawned task
+
+While a task is spawned, its task file has exactly one writer: the agent,
+on its branch. Anything that edits the main checkout's copy at the same
+time — an orchestrator's kick-off review, a status nudge, a note — is two
+writers on two branches of one file, and it surfaces as a conflict on
+that task file when the branch is merged (measured across real projects,
+it was the file that conflicted most). A ruling written to main is also
+one the agent never sees: its copy is on the branch.
+
+**The lock.** Right after the claim commit, spawn makes the main
+checkout's copy of that one task file read-only (`chmod a-w`). The
+`backlog` CLI then refuses every write to it — notes, status, comments,
+and a title change that would rename it — with a bare `EACCES: permission
+denied`, and leaves the file untouched; `git status` shows nothing, since
+git does not track the write bit. The card shows **task file locked** while
+it holds.
+
+- It stays through **End session** and **Resume**: the branch is still
+  unmerged, and an edit on main before the merge recreates the conflict.
+- A **merge** releases it by itself: git replaces the file rather than
+  writing into it, and the replacement is writable (the merge also
+  unlocks it explicitly, for a merge that did not touch it).
+- **Discard**, **Abandon worktree** and **Clean up** (after an
+  out-of-band merge) unlock it explicitly; their responses name the file
+  as `taskFileUnlocked`.
+- A respawn unlocks it for its own claim and locks it again.
+- A lock is plain filesystem state, so it survives a restart with no
+  bookkeeping — and could outlive its reason if a branch is deleted
+  outside Centrale. At startup, and in `python3 server.py --check`, a
+  read-only task file with no `task/<id>` branch behind it is unlocked
+  and reported.
+- `lockSpawnedTaskFiles: false` in `projects.json` (or the Settings
+  toggle) turns it off; spawn then behaves exactly as it did before.
+
+It is not security — an editor can force-write, and anyone can `chmod
+u+w` it back. It is a guard rail against the CLI and the tools built on it,
+which is what was writing those mid-flight commits.
+
+**What to do instead: `POST /api/rule`.** An orchestrator with a ruling
+on a spawned task sends it there (`{"project", "taskId", "sender",
+"text"}` — see [docs/api.md](api.md#post-apirule)). One call, whichever
+case the task is in:
+
+- **A live agent**: the ruling is delivered to it as `[ruling from
+  <sender>] <text>` through `POST /api/deliver`'s confirmed delivery, and
+  the answer is that delivery's confirmation. The spawn prompt tells the
+  agent to record it on its task as a comment authored by the sender, then
+  act on it; the agent stays the only writer, so there is no race. The
+  delivery log is the record of what was sent even if the agent fails to
+  write it down. A busy Codex worker can accept it under “Messages to be
+  submitted after next tool call” with a `↳` row. That queue is confirmed
+  delivery, not evidence the ruling has been acted on. If confirmation
+  returns `no-echo`, inspect the screen before retrying: the text may have
+  arrived even though Centrale could not confirm it.
+- **No live agent** (ended, branch not yet merged): nobody to message and
+  nobody to race with, so Centrale writes the ruling as a comment into the
+  worktree's copy through the CLI and commits it on the task branch,
+  scoped to that one file.
+
+A task that is not spawned has no lock and needs neither: edit it
+directly.
+
 ## Multi-agent workflow
 
 For how the pieces below fit together internally, see
@@ -743,6 +900,57 @@ guessing game. Keep the loop disciplined:
    attempt" above; for anything else, follow "Cleanup" in
    [docs/operations.md](operations.md#cleanup): kill its tmux session,
    remove its worktree, and delete the task branch.
+
+### Waiting for orchestrator events (optional)
+
+A Claude Code session coordinating a project can ask Centrale to wait for
+the next thing that needs attention. This is opt-in: an agent that never
+calls the endpoint sees no change. Centrale sends nothing into the master's
+terminal, and never chooses or spawns the next dependent task itself.
+
+Give the coordinating Claude session this loop:
+
+1. Run **one** waiting call for the project using the Bash tool with
+   `run_in_background: true` (not a shell `&`, and not a shell loop).
+   Claude's background-command completion notification wakes the session
+   when curl exits. On the first call omit `after`:
+
+   ```bash
+   curl --fail-with-body --silent --show-error --max-time 70 --get \
+     'http://127.0.0.1:7420/api/orchestrator-wait' \
+     --data-urlencode 'project=my-app' --data-urlencode 'timeout=60'
+   ```
+
+2. Read the returned line, for example
+   `73549c8fd3094359aeb1345345bc1bb6:1 TASK-2 finished (ready to review)`.
+   The first token is the cursor. Review a finished task; answer a waiting
+   task; read the current screen for a Codex worker's `idle (turn ended, may need input)` event
+   to determine whether it needs input or review; inspect the named gate
+   on a blocked merge; or choose the next task
+   after a merge. Re-read current state before acting: a hook's finished
+   signal is not a passed merge gate. Use the existing API for each action.
+3. Once the event is handled, call again in the background with
+   `--data-urlencode 'after=73549c8fd3094359aeb1345345bc1bb6:1'` added.
+   Events arriving while you work remain queued. A `nothing yet` line
+   simply means call again with the same cursor. Keep the latest handled
+   cursor in the coordinating conversation; replaying one is safe for
+   delivery, but retrying an action still requires checking whether it ran.
+
+Each call returns one line and exits. Keeping curl hidden in an infinite
+shell loop would prevent the completion notification the master relies on.
+On a transport failure, retry the last handled cursor. On HTTP 409 the
+server has restarted, the project changed, or the cursor is ahead of its
+stream: reconcile from current board/session/branch state, then omit
+`after` to start again. History exists only for the running server process.
+The [API reference](api.md#get-apiorchestrator-waitprojectnameaftercursortimeoutseconds)
+details the five event kinds, timeouts and cursor rules. Unchanged blocked,
+already-merged and error harvest lines are suppressed per project/task so
+auto-harvest does not wake the master for the same outcome every cycle.
+Only a real merge always produces a notification.
+
+This loop is for a **Claude Code master**. A Codex master has no equivalent
+wake-on-background-command workflow here; supporting one is outside this
+feature. Codex workers' ambiguous `idle` hooks are not relabelled finished.
 
 ## `CENTRALE_SPAWN_CMD`
 

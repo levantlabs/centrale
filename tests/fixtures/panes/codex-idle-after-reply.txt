@@ -1,0 +1,30 @@
+╭───────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.157.1)                            │
+│                                                       │
+│ model:     GPT-6-Astra xhigh   /model to change       │
+│ directory: ~/…/.centrale-worktrees/my-app-task-9      │
+╰───────────────────────────────────────────────────────╯
+
+
+› centrale probe 1702: reply with only the word pong
+
+
+• pong
+
+  2:54 PM
+
+
+› centrale probe 1702 long: this is a deliberately long message that should wrap across several
+  lines of a one hundred column pane so that the echo check can be measured against real word
+  wrapping; reply with only the word pong
+
+
+• pong
+
+  2:55 PM
+                                                Tip: Use /hooks to view and manage lifecycle hooks.
+
+› Ask Codex to do anything
+
+  GPT-6-Astra xhigh · ~/src/.centrale-worktrees/my-app-task-9 · Reply pong
+  ← for agents · ? for shortcuts                                          ⚠ 2 warnings · f2 to view

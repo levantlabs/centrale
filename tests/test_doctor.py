@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -11,6 +12,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server  # noqa: E402
+import settings  # noqa: E402
 
 
 def _which_side_effect(available):
@@ -44,6 +46,27 @@ class DoctorCheckTests(unittest.TestCase):
             with open(os.path.join(path, "backlog", "config.yml"), "w") as f:
                 f.write("statuses: [To Do, Done]\n")
         return path
+
+    def test_missing_and_stale_pointers_report_one_executable_repair_command(self):
+        repos = [self._make_project_dir(name, with_backlog_config=(name != "neither"))
+                 for name in ("missing", "stale", "complete", "neither")]
+        config = {"port": 17654, "projects": [dict(name=os.path.basename(p), path=p) for p in repos]}
+        for repo, port in ((repos[1], 7420), (repos[2], 17654)):
+            for name in settings.INSTRUCTION_FILES:
+                with open(os.path.join(repo, name), "wb") as f:
+                    f.write(settings.agent_pointer({"port": port}))
+        path = self._write_projects_json(config)
+        with mock.patch.object(server, "which", return_value=None), \
+             mock.patch.object(server, "probe_running_server", return_value=None):
+            lines, _ = server.run_doctor_check(config_path=path)
+        commands = [line.split(": curl ", 1)[1] for line in lines if ": curl " in line]
+        self.assertEqual(len(commands), 3)
+        projects = []
+        for command in commands:
+            argv = shlex.split("curl " + command)
+            self.assertIn("http://127.0.0.1:17654/api/setup-project", argv)
+            projects.append(json.loads(argv[argv.index("-d") + 1])["project"])
+        self.assertEqual(projects, ["missing", "stale", "neither"])
 
     def test_all_green_when_everything_present_and_configured(self):
         repo = self._make_project_dir("my-app")

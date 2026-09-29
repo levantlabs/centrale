@@ -17,17 +17,19 @@ layout behind it.
 |---|---|
 | `server.py` | Backend: config loading, board aggregation, subprocess boundaries, HTTP server + routing |
 | `spawn.py` | Worktree + tmux spawn engine behind `POST /api/spawn` |
+| `orchestrator.py` | Optional condition-backed notification history for `GET /api/orchestrator-wait`, fed by existing hook transitions and harvest attempt results (task-174). No task decisions or subprocesses |
 | `harvest.py` | Gated merge engine behind `POST /api/harvest` (and the live `GET /api/harvest-progress` record) |
-| `settings.py` | Settings read/write behind `/api/settings` — a whitelisted subset of `projects.json`, including (task-78) the whole `agents` map for the modal's Agents editor |
+| `settings.py` | Settings read/write behind `/api/settings` — a whitelisted subset of `projects.json`, including (task-78) the whole `agents` map for the modal's Agents editor. Also the opt-in Backlog/pointer setup shared by add-project and `/api/setup-project` (task-175), with commits scoped to changed files |
 | `browser.py` | Per-project `backlog browser` launcher behind `POST /api/browser` |
 | `version.py` | `__version__`, and nothing else — the one place the version number is written down (task-107). Imports nothing and does nothing at import, so `scripts/release.sh` can read it out of a bare staged snapshot to derive the release tag; `server.py` imports it for what `--check` and the sidebar footer report; `code_drift()` there compares that boot-time version with `HEAD` on every board request and reports `codeDrift` (task-128), which `--check` relays from a running server through the `probe_running_server` boundary. See [Versioning](operations.md#versioning) |
-| `centrale_notify.py` | The agent-lifecycle hook helper behind the session dots (task-37). Injected transiently onto a spawned session -- into a generated Claude Code hooks settings file, or codex's `notify` override -- never written into the user's home config or the target repo. Run with one of `working`, `waiting`, `finished`, it POSTs that state to `$CENTRALE_EVENT_URL` (`spawn.event_url`) for `POST /api/agent-event`. Every failure -- bad argv, unset URL, network error, timeout -- is swallowed silently, because a hook must never break or hang the agent it is attached to |
+| `centrale_notify.py` | The agent-lifecycle hook helper behind the session dots (task-37). Injected transiently onto a spawned session -- as inline Claude Code `--settings` JSON, or codex's `-c` overrides -- never written into the user's home config or the target repo. Run with one of `working`, `waiting`, `finished`, it POSTs that state to `$CENTRALE_EVENT_URL` (`spawn.event_url`) for `POST /api/agent-event`. Every failure -- bad argv, unset URL, network error, timeout -- is swallowed silently, because a hook must never break or hang the agent it is attached to |
 | `static/index.html` | The frontend HTML document shell (single page, no framework/build step) |
 | `static/*.js` | The frontend JS, one file per concern, each loaded by its own plain `<script src>` at the end of index.html's body in a fixed order (task-83 extracted it from index.html, task-89 split it up) — see [The frontend files](#the-frontend-files) |
 | `static/styles.css` | All the frontend CSS, loaded by a plain `<link>` from index.html (task-82) |
 | `static/favicon.svg` | The tab icon, declared by a `<link rel="icon">` in index.html and also served at `/favicon.ico` (task-90) |
+| `static/agent-guide.md` | Agent operating guide, loaded with the server code at startup and served as plain text at `/api/agent-guide`, with examples using the bound port. Projects receive only its URL in marked instruction blocks (task-175) |
 | `projects.json` | User config: port, worktree root, projects, agents map, browser ports |
-| `tests/` | The default `unittest` suite, one module per concern -- `test_server.py` (config loading, board aggregation, sessions, the agent-event store and hook injection, the HTTP routes and their request gate, and the source-shape contracts over `static/`); `test_spawn.py` (worktree/branch resolution, agent selection, the claim commit, resume and reconcile, the spawn/resume validation refusals); `test_harvest.py` (each merge gate, branch evaluation, the harvest lock and progress record, auto-harvest, `/api/harvest`); `test_settings.py` (the whitelisted read/write of `projects.json`, the Agents editor, `/api/settings`); `test_browser.py` (per-project `backlog browser` launch, reuse, relaunch, the listener-pid registry and its register-time reconciliation, and the board-version comparison); `test_frontend_behaviour.py` (what the frontend DOES, driven under `node`); `test_source_contract.py` (the source-text tier's own machinery, the source-text ceiling, and the three censuses over this chapter -- that every module here is named in this table (task-131), that every top-level `*.py` module has a row of its own in it (task-150), and that [The frontend files](#the-frontend-files) lists the `static/*.js` files in load order (task-141)); `test_doctor.py` (the `--check` doctor's pass/warn/fail verdicts and its CLI wiring); `test_version.py` (the one version constant, how the server resolves it, and the tag `scripts/release.sh` derives from it); `test_centrale_notify.py` (the `centrale_notify.py` hook helper's argv gating and its POST to `/api/agent-event`); `test_scan_release.py` (`scripts/scan_release.py`'s secret and identity scan, including a clean run over this repository); `test_release_snapshot.py` (what `git archive HEAD` ships: source in, `backlog/` out, no generated content); `test_docs_operations.py` (docs/operations.md's hand-kept tool and allowlist enumerations, pinned to release.sh, `tests_integration/` and the scan -- task-145); `test_docs_references.py` (the one rule over every document at once: a path under `tests/` or `tests_integration/` named in the public prose or a top-level module has to resolve to a file, after version.py cited a test that never existed -- task-163); `test_screenshots_script.py` (the one property `scripts/screenshots.py` may not lose: its faked CLI boundaries refuse any directory outside the throwaway sandbox, and no command-line option can aim it at a real board -- hermetic, and Playwright-free like everything else here -- task-153); `test_integration_base.py` (the unit-tier test OF `tests_integration/base.py`: its pure `parse_created_task_id` helper, `require_tools`' skip-or-fail switch on `CENTRALE_REQUIRE_INTEGRATION`, and the per-run tmux socket name and its path -- all decided before any subprocess runs, so it runs no integration test and launches nothing) -- plus recorded JSON fixtures in `fixtures/` and two shared helpers: `source_contract.py` (lazy, self-describing slices of `static/`) and `js_harness.py` (the DOM shim the frontend is driven over under node). Every `test_*.py` here must be named in this row: `test_source_contract.py` fails the suite otherwise |
+| `tests/` | The default `unittest` suite, one module per concern -- `test_server.py` (config loading, board aggregation, sessions, the agent-event store and hook injection, the HTTP routes and their request gate, and the source-shape contracts over `static/`); `test_spawn.py` (worktree/branch resolution, agent selection, the claim commit, resume and reconcile, the spawn/resume validation refusals); `test_orchestrator.py` (the waiting API: live HTTP wake-up, cursor replay, project isolation, timeout, hook deduplication and harvest notifications); `test_harvest.py` (each merge gate, branch evaluation, the harvest lock and progress record, auto-harvest, `/api/harvest`); `test_settings.py` (the whitelisted read/write of `projects.json`, the Agents editor, `/api/settings`); `test_browser.py` (per-project `backlog browser` launch, reuse, relaunch, the listener-pid registry and its register-time reconciliation, and the board-version comparison); `test_frontend_behaviour.py` (what the frontend DOES, driven under `node`); `test_source_contract.py` (the source-text tier's own machinery, the source-text ceiling, and the three censuses over this chapter -- that every module here is named in this table (task-131), that every top-level `*.py` module has a row of its own in it (task-150), and that [The frontend files](#the-frontend-files) lists the `static/*.js` files in load order (task-141)); `test_doctor.py` (the `--check` doctor's pass/warn/fail verdicts and its CLI wiring); `test_version.py` (the one version constant, how the server resolves it, and the tag `scripts/release.sh` derives from it); `test_centrale_notify.py` (the `centrale_notify.py` hook helper's argv gating and its POST to `/api/agent-event`); `test_delivery.py` (`POST /api/deliver`'s deliver-and-confirm -- the dialog refusal, the echo match and its baseline, each failure outcome -- and the delivery log behind `GET /api/deliveries`, over real claude and codex pane captures in `fixtures/panes/`); `test_scan_release.py` (`scripts/scan_release.py`'s secret and identity scan, including a clean run over this repository); `test_release_snapshot.py` (what `git archive HEAD` ships: source in, `backlog/` out, no generated content); `test_docs_operations.py` (docs/operations.md's hand-kept tool and allowlist enumerations, pinned to release.sh, `tests_integration/` and the scan -- task-145); `test_docs_references.py` (the one rule over every document at once: a path under `tests/` or `tests_integration/` named in the public prose or a top-level module has to resolve to a file, after version.py cited a test that never existed -- task-163); `test_screenshots_script.py` (the one property `scripts/screenshots.py` may not lose: its faked CLI boundaries refuse any directory outside the throwaway sandbox, and no command-line option can aim it at a real board -- hermetic, and Playwright-free like everything else here -- task-153); `test_integration_base.py` (the unit-tier test OF `tests_integration/base.py`: its pure `parse_created_task_id` helper, `require_tools`' skip-or-fail switch on `CENTRALE_REQUIRE_INTEGRATION`, and the per-run tmux socket name and its path -- all decided before any subprocess runs, so it runs no integration test and launches nothing) -- plus recorded JSON fixtures and pane captures in `fixtures/` and two shared helpers: `source_contract.py` (lazy, self-describing slices of `static/`) and `js_harness.py` (the DOM shim the frontend is driven over under node). Every `test_*.py` here must be named in this row: `test_source_contract.py` fails the suite otherwise |
 | `tests_integration/` | The opt-in second tier: real `git`/`tmux`/`backlog` processes in sandboxes, never collected by `discover tests`. Its module list lives in [tests_integration/README.md](../tests_integration/README.md) ("What's covered, and where") and nowhere else, so it has one place to drift from; see [Testing](#testing) |
 | `scripts/` | The tooling that is run by hand or by a release rather than by the server: `release.sh` (builds and publishes the curated public snapshot, and runs the release gate over it), `scan_release.py` (the secret/identity scan that gate runs first -- also runnable with no arguments over this repo), `harvest.sh` (a standalone report on, and optional cleanup of, merged Centrale worktrees), and `screenshots.py` (regenerates docs/img's four images from the synthetic world committed beside it in `screenshots_fixture.json` -- run by a maintainer after a UI change, by nothing else, and it cannot be aimed at a real board; task-153). One row for the directory: see [Releasing](operations.md#releasing) for what a release runs, in order |
 
@@ -61,7 +63,14 @@ Everything shared lives here:
   paste) + `send-keys Enter`, into that same exact-match session; refuses
   with 403 unless the mode is
   `"interact"`, and with 409 unless this process captured that pane within
-  the last 10s), `POST /api/spawn`, `POST /api/browser`. Errors are JSON `{"error": ...}`;
+  the last 10s), `POST /api/deliver` (task-170.2: the same paste path for
+  a program messaging an agent, bracketed by its own captures -- a dialog
+  on the pane refuses before the paste, and success needs a new echo line
+  afterwards; every attempt is appended to the JSON-lines delivery log
+  that `GET /api/deliveries` reads), `POST /api/rule` (task-172: a ruling
+  on a spawned task -- delivered through that same path to a live agent,
+  or committed on the task branch by `spawn.commit_ruling` when none is
+  live), `POST /api/spawn`, `POST /api/browser`. Errors are JSON `{"error": ...}`;
   tracebacks never leak. `_refuse_untrusted_request()` runs at the top of
   **both** `do_GET` and `do_POST`, before any routing, so no endpoint can
   forget it and a refused request reaches no `git`/`tmux`/`backlog`/
@@ -91,10 +100,15 @@ Everything shared lives here:
   `/api/resume`, `/api/cleanup-branch`, `/api/discard-attempt`,
   `/api/abandon-worktree` and `harvest.harvest_branch`. It is per task rather
   than global so a slow merge of one task never stalls a discard of another;
-  the only cross-task lock is harvest's own `_harvest_lock`, and the order is
+  harvest's cross-task lock is `_harvest_lock`, and the order is
   fixed — `harvest_branch` takes `_harvest_lock` *then* the per-task lock, and
   nothing holding the per-task lock ever asks for `_harvest_lock`, so there is
-  no cycle. Read-only routes take neither. The destructive throwaway routes
+  no cycle. Spawn and resume also take a per-project launch lock inside
+  the task lock, covering the fresh tmux count through session creation
+  (task-177); a launch never asks for another task lock. This prevents two
+  tasks from both taking the last `maxAgents` slot and serializes writes to
+  the project's link exclusions. Read-only routes take none of these locks.
+  The destructive throwaway routes
   additionally require the state their confirm described
   (`expectedBranchTip`, `expectedDirtyPaths`, straight from `GET
   /api/discard-preview`) and refuse with 409 if a fresh survey under the lock
@@ -125,6 +139,16 @@ reading a branch Centrale must not check out: a throwaway detached worktree
 under the `TMPDIR`-overridable temporary directory, always removed
 (registration and directory) on every path, used by both harvest's gate 2
 and `GET /api/task` for a parked branch.
+
+The task-file lock (task-172) lives here too, as plain filesystem state
+with nothing recording it: `lock_task_file`/`unlock_task_file` flip the
+write bits of `backlog/tasks/<id> - *.md` in a checkout
+(`task_file_path` finds it by Backlog.md's filename convention),
+`locked_task_files` reads them back for the board's `taskFileLocked`, and
+`release_stale_task_locks` unlocks any with no `task/<id>` branch behind it
+(run by `main()` and `--check`). `commit_ruling` is `POST /api/rule`'s
+no-agent case: a `backlog task edit --comment` in the Centrale worktree,
+committed with `git commit --only` scoped to that one file.
 
 ### harvest.py
 
@@ -166,6 +190,53 @@ reads it, so the Merge button can say "Running tests" instead of just
 One record suffices because the merge lock already serializes every attempt;
 a `finally` clears it on every outcome, and an evaluate-only `GET
 /api/harvest` passes no callback, so it publishes nothing.
+
+### orchestrator.py
+
+`GET /api/orchestrator-wait` sleeps on a `threading.Condition` until a
+project has a notification after the supplied cursor, or the timeout expires.
+`record_agent_event()` publishes transitions to public `finished`/`waiting`/
+`idle` under its badge lock; codex's `idle` notification explicitly says its
+turn ended and may need input. A Codex permission hook first arms a
+30-second daemon timer while the badge stays working. Activity, turn-end,
+clear and reset cancel it; duplicate hooks keep the original deadline.
+At expiry, a capture through `run_tmux`, outside the badge lock, must show
+a dialog before the callback sets waiting and publishes one notification
+together. This guards against automatically approved long tools and old
+hooks whose waiting signal is stale. Without a dialog it checks again in
+30 seconds; capture errors expose unknown and retry, except a gone session
+ends the candidate. Timer identity is rechecked under the badge lock after
+capture, so a cancelled callback cannot resurrect a wait for a new request
+or session. New Codex spawns also receive `PostToolUse → working` to clear
+permission candidates promptly. Claude's immediate events are unchanged.
+`harvest._record_event()` passes the same
+attempt summary it appends to `recent_events()`, including the first failed
+gate. The notification stream suppresses an unchanged line per project/task
+by comparing with that task's last published harvest line, including blocked,
+already-merged and error outcomes. Changed lines still publish; only a real
+merge always publishes even if identical. This comparison and publication
+share the condition lock, and hook events never reset the harvest comparison.
+The UI attempt log still records every attempt. Evaluate-only requests
+publish nothing. Both producers append and notify under the condition lock,
+so publication cannot fall between checking for an event and falling asleep.
+Waiting releases that lock and holds no hook, harvest or lifecycle lock.
+
+The project stream retains every compact line for this server process's
+lifetime, including events before the first subscriber; unlike the UI's
+50-entry harvest deque it never evicts unread events. This costs memory
+proportional to notification count. Consumption is a caller-owned cursor,
+not deletion: retrying a cursor replays the same answer and independent
+callers cannot steal each other's events. A random per-project stream id
+and increasing position reject old-process, other-project and future
+cursors with 409. Restart drops notification history, just as it drops the
+existing hook and harvest stores; callers reconcile from the board before
+starting again. This is past-event delivery, never an input to task status,
+merge gates or lifecycle derivation. An outstanding HTTP request owns the
+condition wait. Codex permission confirmation uses at most one scheduled
+timer per pending task, with no new external resource or persistent store;
+the timer factory is injectable so unit tests never wait or call real tmux.
+See the [API contract](api.md#get-apiorchestrator-waitprojectnameaftercursortimeoutseconds)
+and the [optional orchestration loop](agents.md#waiting-for-orchestrator-events-optional).
 
 ### browser.py
 
@@ -408,18 +479,30 @@ happen.
 
 1. **Validate** — project name and task id checked, tmux capability
    confirmed, and a 409 returned if a `centrale-<project>-<taskid>` session
-   already exists.
+   already exists, or if the project's optional `maxAgents` cap is reached.
+   The cap counts only that project's live tmux sessions, never lifecycle
+   badges or stored counters, and names them in the refusal.
 2. **Claim** — `_claim_and_commit()` sets the task to "In Progress" via
    `backlog task edit` in the main repo, then…
 3. **Commit** — commits any resulting `backlog/` change on the repo's current
    branch, so the worktree cut next already contains the claim (avoiding a
    divergent copy of the task file when the agent claims it again). Both
    steps are best-effort: failures become `warnings` in the response, never a
-   blocked spawn.
+   blocked spawn. Then (task-172, `lockSpawnedTaskFiles`, default on) the
+   main checkout's copy of the task file is made read-only, so the agent on
+   its branch is that file's only writer until a merge, discard, abandon or
+   cleanup releases it — see `spawn.lock_task_file` and "Ruling on a
+   spawned task" in [docs/agents.md](agents.md#ruling-on-a-spawned-task).
 4. **Worktree** — `_ensure_worktree()` creates
    `<worktreeRoot>/<project>-<taskid>` on branch `task/<taskid>` off the
    repo's current branch, or reuses an existing worktree/branch so a
-   re-spawn after a killed session works.
+   re-spawn after a killed session works. For a new worktree,
+   `_link_worktree_paths()` adds the project's `worktreeLinks` exclusions
+   to the common git `info/exclude`, verifies the destinations are untracked
+   and ignored, then symlinks them to the configured main checkout. Missing
+   sources or unsafe destinations become warnings, with no link created.
+   Reused worktrees are left as-is. Worktree removal uses git's existing
+   removal path, which unlinks symlinks without following their targets.
 5. **tmux** — `tmux new-session -d -s centrale-<project>-<taskid> -c
    <worktree> -x 220 -y 200` launches the resolved agent command (with
    `CENTRALE_AGENT=<name>` and a per-task `CENTRALE_EVENT_URL` in its

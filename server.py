@@ -21,12 +21,12 @@ import socket
 import string
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
 import uuid
 
+import orchestrator
 import version  # the one place the version number is written down
 
 # ---------------------------------------------------------------------------
@@ -35,6 +35,10 @@ import version  # the one place the version number is written down
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
+# Load with the code so a checkout update cannot give an old process a
+# newer operating contract. Restart after Python/guide changes (task-175).
+with open(os.path.join(STATIC_DIR, "agent-guide.md"), "rb") as _guide_file:
+    AGENT_GUIDE = _guide_file.read()
 DEFAULT_CONFIG_PATH = os.path.join(BASE_DIR, "projects.json")
 
 DEFAULT_STATUSES = ["To Do", "In Progress", "Done"]
@@ -78,7 +82,6 @@ DEFAULT_AGENT_NAME = "claude"
 # from a turn that ended waiting for a chat reply (task-62).
 AGENT_STATES = ("working", "waiting", "finished")
 AGENT_KINDS = ("claude", "codex")
-HOOKS_SETTINGS_FILENAME = "hooks-settings.json"
 
 
 class BacklogError(Exception):
@@ -96,6 +99,42 @@ class ConfigError(Exception):
 # ---------------------------------------------------------------------------
 # Config loading
 # ---------------------------------------------------------------------------
+
+def normalize_project_max_agents(raw, source="maxAgents"):
+    """An optional positive per-project spawn cap (task-177)."""
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
+        raise ConfigError(f"projects.json: {source} must be a positive whole number or null")
+    return raw
+
+
+def normalize_project_worktree_links(raw, source="worktreeLinks"):
+    """Literal, disjoint repo-relative link paths, safe to copy into a worktree.
+
+    Canonical components avoid traversal and make a parent/child collision
+    apparent before any filesystem change. Glob tokens are forbidden because
+    each exclusion must name exactly one path (task-177).
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"projects.json: {source} must be an array of repo-relative paths or null")
+    links = []
+    for path in raw:
+        if (not isinstance(path, str) or not path or path.strip() != path or
+                any(c in path for c in "\\*?[]!#") or
+                any(ord(c) < 32 or ord(c) == 127 for c in path)):
+            raise ConfigError(f"projects.json: {source} contains an invalid literal path: {path!r}")
+        parts = path.split("/")
+        if (path.startswith("/") or re.match(r"^[A-Za-z]:", path) or
+                any(part in ("", ".", "..", ".git") for part in parts)):
+            raise ConfigError(f"projects.json: {source} must contain canonical repo-relative paths: {path!r}")
+        if any(path == prior or path.startswith(prior + "/") or prior.startswith(path + "/") for prior in links):
+            raise ConfigError(f"projects.json: {source} contains overlapping paths: {path!r}")
+        links.append(path)
+    return links
+
 
 def normalize_agents_map(raw_map, source="agents"):
     """Normalize a projects.json `agents` map to a single canonical shape:
@@ -437,8 +476,9 @@ def load_config(path=None):
     additionally sets the returned config's "zeroConfig" flag, used by
     main()'s startup line and run_doctor_check()'s --check guidance.
 
-    Raises ConfigError if the `agents` map, the `harvest` key, or the
-    `spawnPrompt` template is present but malformed (see
+    Raises ConfigError if the `agents` map, the `harvest` key, the
+    `spawnPrompt` template, or project `maxAgents`/`worktreeLinks` are
+    present but malformed (see
     normalize_agents_map / normalize_harvest_config / normalize_spawn_prompt) --
     that's a config the user needs to fix, so it's surfaced loudly rather
     than silently degraded. This only ever happens for a file that DOES
@@ -482,6 +522,13 @@ def load_config(path=None):
     if not isinstance(default_agent, str) or not default_agent:
         default_agent = DEFAULT_AGENT_NAME
 
+    # task-171: anything but an explicit false keeps the refusal on --
+    # spawning the wrong model silently is the failure this guards, so a
+    # malformed value must not quietly turn the guard off.
+    require_agent_assignment = raw.get("requireAgentAssignment") is not False
+    # task-172: same rule -- only an explicit false turns the lock off.
+    lock_spawned_task_files = raw.get("lockSpawnedTaskFiles") is not False
+
     harvest_config = normalize_harvest_config(raw.get("harvest"))
     session_preview_config = normalize_session_preview_config(raw.get("sessionPreview"))
     refresh_interval_seconds = normalize_refresh_interval(raw.get("refreshIntervalSeconds"))
@@ -506,6 +553,8 @@ def load_config(path=None):
             check_command = None
         check_timeout_seconds = _normalize_check_timeout(entry.get("checkTimeoutSeconds"))
         project_worktree_root = _normalize_project_worktree_root(entry.get("worktreeRoot"))
+        max_agents = normalize_project_max_agents(entry.get("maxAgents"), f"projects.{name}.maxAgents")
+        worktree_links = normalize_project_worktree_links(entry.get("worktreeLinks"), f"projects.{name}.worktreeLinks")
         projects.append({
             "name": name,
             "path": os.path.expanduser(proj_path or ""),
@@ -513,6 +562,8 @@ def load_config(path=None):
             "checkCommand": check_command,
             "checkTimeoutSeconds": check_timeout_seconds,
             "worktreeRoot": project_worktree_root,
+            "maxAgents": max_agents,
+            "worktreeLinks": worktree_links,
         })
 
     return {
@@ -521,6 +572,8 @@ def load_config(path=None):
         "projects": projects,
         "agents": agents,
         "defaultAgent": default_agent,
+        "requireAgentAssignment": require_agent_assignment,
+        "lockSpawnedTaskFiles": lock_spawned_task_files,
         "browserPortBase": browser_port_base,
         "harvest": harvest_config,
         "sessionPreview": session_preview_config,
@@ -1187,6 +1240,69 @@ def kill_process(pid, sig=signal.SIGTERM):
         return False
 
 
+_DELETED_CWD_SUFFIX = " (deleted)"
+
+
+def _pids_with_cwd_under(directory):
+    """Every live pid on this host whose /proc/<pid>/cwd names a path
+    under `directory`, found by walking /proc directly rather than
+    asking any one process about itself -- a dev server or vitest
+    worker pool an agent started keeps that cwd for as long as it runs,
+    long after the shell that launched it (and the tmux session, and
+    even the worktree directory itself) is gone. This is how
+    end-session and cleanup-branch find those orphans: matched by
+    resolved path, never by scanning cmdlines for a substring -- a
+    plain `grep`-style match on argv is the self-match trap, since it
+    would also catch the very search doing the matching.
+
+    /proc/<pid>/cwd keeps naming the original path with a trailing
+    " (deleted)" once the directory itself has been unlinked (verified
+    empirically against a real removed directory) -- stripped before
+    comparing, so a process orphaned by `git worktree remove` is still
+    found even after the worktree directory is gone.
+
+    Returns a sorted list of ints; empty (never raises) on a platform
+    without /proc, the same degrade-gracefully contract
+    process_cmdline uses for macOS/BSD -- there is no portable per-pid
+    cwd lookup the way `ps` substitutes for cmdline elsewhere in this
+    file."""
+    if not os.path.isdir("/proc"):
+        return []
+    target = os.path.realpath(directory)
+    prefix = target.rstrip(os.sep) + os.sep
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return []
+    pids = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{entry}/cwd")
+        except OSError:
+            continue
+        if cwd.endswith(_DELETED_CWD_SUFFIX):
+            cwd = cwd[: -len(_DELETED_CWD_SUFFIX)]
+        if cwd == target or cwd.startswith(prefix):
+            pids.append(int(entry))
+    return sorted(pids)
+
+
+def kill_pids_with_cwd_under(directory, sig=signal.SIGTERM):
+    """Finds every pid with a cwd under `directory` (_pids_with_cwd_under)
+    and best-effort signals each one (kill_process); returns the sorted
+    list of pids it found (whether or not the signal was actually
+    delivered to all of them -- a pid that exits between the scan and
+    the kill is not an error, see kill_process). The one place both
+    end-session and cleanup-branch act on this, so the two can never
+    drift on how a worktree's leftover processes are identified."""
+    pids = _pids_with_cwd_under(directory)
+    for pid in pids:
+        kill_process(pid, sig)
+    return pids
+
+
 # ---------------------------------------------------------------------------
 # Agent lifecycle events (task-37): hook/notify injection + in-memory
 # state, keyed by (project, taskId) -- never by tmux session name, so it
@@ -1204,19 +1320,6 @@ def notify_script_path():
     return os.path.join(BASE_DIR, "centrale_notify.py")
 
 
-def hooks_settings_path():
-    """~/.cache/centrale/hooks-settings.json, or
-    $XDG_CACHE_HOME/centrale/... if that's set -- the same XDG-aware
-    lookup browser.py's registry_path() uses for browsers.json, so the
-    generated Claude Code hooks settings file (see
-    ensure_hooks_settings_file) lives under the centrale cache dir too,
-    never the user's ~/.claude config or the target repo. A function,
-    not a module-level constant, so tests can monkeypatch it to a
-    throwaway path without ever touching a real one."""
-    cache_home = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
-    return os.path.join(cache_home, "centrale", HOOKS_SETTINGS_FILENAME)
-
-
 def _hooks_settings_hook(state):
     command = shlex.join(["python3", notify_script_path(), state])
     return {"hooks": [{"type": "command", "command": command}]}
@@ -1229,14 +1332,31 @@ def hooks_settings_payload():
     CENTRALE_EVENT_URL in the session's own environment (see
     spawn.event_url), not anything encoded here, so this one generated
     file is shared across every spawn/resume rather than written fresh
-    per task."""
+    per task.
+
+    Also carries two spawn-only settings (task-170.1), both scoped to
+    this --settings layer so the user's own ~/.claude config is never
+    touched:
+    - skillOverrides auto-mode-setup "off": turns off /auto-mode-setup
+      and its "Teach auto mode about your environment?" end-of-turn
+      offer, which parked spawned agents for hours with nobody to press
+      Escape. A spawned agent is never the one to answer it, and the
+      owner ruled it should not opt in.
+    - crossSessionInbound "accept": messages from the owner's other
+      sessions on this machine (orchestrator rulings via SendMessage)
+      are delivered, not held for an approval nobody is watching for
+      (task-355, task-252.1). The owner's ruling, with the alternatives
+      and consequences, is recorded on task-170.1. An inbound message
+      still cannot approve a permission prompt or change config."""
     return {
         "hooks": {
             "UserPromptSubmit": [_hooks_settings_hook("working")],
             "PreToolUse": [_hooks_settings_hook("working")],
             "Notification": [_hooks_settings_hook("waiting")],
             "Stop": [_hooks_settings_hook("finished")],
-        }
+        },
+        "skillOverrides": {"auto-mode-setup": "off"},
+        "crossSessionInbound": "accept",
     }
 
 
@@ -1250,9 +1370,9 @@ def hooks_settings_payload():
 # live -- is to pass the same four hook definitions as inline -c config
 # overrides on the codex argv itself instead, which never touch the
 # filesystem at all, so there is no config layer left for codex to
-# resolve wrong. PermissionRequest is codex's waiting-state equivalent
-# of claude's Notification point; codex's hooks engine has no direct
-# "Notification".
+# resolve wrong. PermissionRequest is codex's permission-review signal;
+# unlike Claude's Notification it also fires before automatic approval,
+# so its public waiting state needs confirmation below (task-176).
 def _codex_hooks_override(point, state):
     """One -c override argv pair, e.g. ["-c",
     'hooks.UserPromptSubmit=[{hooks=[{type="command",command="python3
@@ -1272,11 +1392,12 @@ def _codex_hooks_override(point, state):
 
 
 def codex_hooks_overrides():
-    """The four -c inline config overrides that give codex full
+    """The -c inline config overrides that give codex
     UserPromptSubmit/PreToolUse -> working, PermissionRequest -> waiting,
     Stop -> finished lifecycle fidelity (task-44), in place of a
-    hooks.json file. Flat argv list (four ["-c", "hooks.<Point>=..."]
-    pairs, 8 elements total) meant to be spliced directly into a codex
+    hooks.json file. PostToolUse restores working after permission review
+    even if no next tool starts (task-176). Flat ["-c", "hooks.<Point>=..."]
+    pairs meant to be spliced directly into a codex
     spawn's argv -- see spawn._inject_codex_hooks for the gating (only
     once server.probe_codex_hook_trust says this binary supports
     --dangerously-bypass-hook-trust) and the full linked-worktree
@@ -1286,37 +1407,11 @@ def codex_hooks_overrides():
         ("UserPromptSubmit", "working"),
         ("PreToolUse", "working"),
         ("PermissionRequest", "waiting"),
+        ("PostToolUse", "working"),
         ("Stop", "finished"),
     ):
         overrides += _codex_hooks_override(point, state)
     return overrides
-
-
-def ensure_hooks_settings_file():
-    """Idempotently (re)writes the generated hooks settings file (see
-    hooks_settings_path/hooks_settings_payload) and returns its path.
-    Atomic write (temp file + os.replace), the same style as settings.py's
-    projects.json rewrite -- regenerated on every claude-family spawn/
-    resume (see spawn._inject_agent_hooks), which is cheap and also
-    self-healing if the cache dir was ever cleared or the file hand-
-    edited. Raises OSError if the cache dir can't be created or written;
-    callers treat that as best-effort and never let it block a spawn."""
-    path = hooks_settings_path()
-    directory = os.path.dirname(path)
-    os.makedirs(directory, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".hooks-settings-", suffix=".json.tmp", dir=directory)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(hooks_settings_payload(), f, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-    return path
 
 
 # In-memory agent-event store: ephemeral runtime cache, consistent with
@@ -1328,10 +1423,77 @@ def ensure_hooks_settings_file():
 # name -- see _parse_session_project_and_task) always agree.
 _agent_events = {}
 _agent_events_lock = threading.Lock()
+# PermissionRequest precedes automatic review, not just human approval.
+# Six real codex 0.157.1 approvals took 2.816–3.761s including tool return;
+# 30s leaves headroom. PostToolUse clears the wait even without a next tool.
+# These are ephemeral timers, never task state (task-176).
+CODEX_WAIT_SECONDS = 30.0
+_agent_wait_timer = threading.Timer  # injectable time boundary
+_pending_codex_waits = {}
 
 
 def _agent_event_key(project, task_id):
     return (project, str(task_id).upper())
+
+
+def _set_agent_event_locked(key, state, kind):
+    """Update badge and notification atomically; caller holds the badge lock."""
+    previous = _agent_events.get(key) or {}
+    _agent_events[key] = {
+        "state": state, "agentKind": kind, "lastEventAt": time.time(),
+    }
+    public_state = "idle" if kind == "codex" and state == "finished" else state
+    previous_state = previous.get("state")
+    if previous.get("agentKind") == "codex" and previous_state == "finished":
+        previous_state = "idle"
+    if public_state != previous_state:
+        message = {
+            "finished": "finished (ready to review)",
+            "waiting": "waiting for input",
+            "idle": "idle (turn ended, may need input)",
+        }.get(public_state)
+        if message:
+            orchestrator.publish(*key, message)
+
+
+def _cancel_codex_wait_locked(key):
+    timer = _pending_codex_waits.pop(key, None)
+    if timer is not None:
+        timer.cancel()
+
+
+def _schedule_codex_wait_locked(key):
+    """Corroborate a still-pending hook without holding a lock over tmux."""
+    def confirm_wait():
+        with _agent_events_lock:
+            if _pending_codex_waits.get(key) is not timer:
+                return
+        # A PermissionRequest can outlive approval while its tool runs, or
+        # forever with older hooks. Age alone cannot establish human input.
+        # Reuse the delivery path's dialog evidence, only after a wait hook
+        # has persisted; never derive lifecycle from arbitrary pane activity.
+        import spawn
+        state, retry = "working", True
+        try:
+            lines = capture_session_pane(spawn.session_name(*key), DELIVERY_CAPTURE_LINES)
+            if detect_pane_dialog(lines) is not None:
+                state, retry = "waiting", False
+        except PaneCaptureError as exc:
+            state, retry = "unknown", exc.status != 404
+        with _agent_events_lock:
+            # cancel() cannot stop an already-running callback/capture.
+            # Identity excludes a new request or session at the same key.
+            if _pending_codex_waits.get(key) is not timer:
+                return
+            _pending_codex_waits.pop(key)
+            _set_agent_event_locked(key, state, "codex")
+            if retry:
+                _schedule_codex_wait_locked(key)
+
+    timer = _agent_wait_timer(CODEX_WAIT_SECONDS, confirm_wait)
+    timer.daemon = True
+    _pending_codex_waits[key] = timer
+    timer.start()
 
 
 def record_agent_event(project, task_id, state, agent_kind=None):
@@ -1353,11 +1515,19 @@ def record_agent_event(project, task_id, state, agent_kind=None):
     with _agent_events_lock:
         key = _agent_event_key(project, task_id)
         previous = _agent_events.get(key) or {}
-        _agent_events[key] = {
-            "state": state,
-            "agentKind": agent_kind or previous.get("agentKind"),
-            "lastEventAt": time.time(),
-        }
+        kind = agent_kind or previous.get("agentKind")
+        if kind == "codex" and state == "waiting":
+            if key in _pending_codex_waits or (
+                previous.get("agentKind") == "codex" and previous.get("state") == "waiting"
+            ):
+                # Duplicate hooks neither extend the deadline nor republish.
+                previous["lastEventAt"] = time.time()
+                return
+            _set_agent_event_locked(key, "working", kind)
+            _schedule_codex_wait_locked(key)
+            return
+        _cancel_codex_wait_locked(key)
+        _set_agent_event_locked(key, state, kind)
 
 
 def get_agent_lifecycle(project, task_id):
@@ -1397,13 +1567,17 @@ def clear_agent_event(project, task_id):
     session, so events emitted by the new process can only arrive after the
     old entry is gone and are never cleared out from under it."""
     with _agent_events_lock:
-        _agent_events.pop(_agent_event_key(project, task_id), None)
+        key = _agent_event_key(project, task_id)
+        _cancel_codex_wait_locked(key)
+        _agent_events.pop(key, None)
 
 
 def _reset_agent_events():
     """Test helper: clear the in-memory agent-event store (mirrors
     _reset_board_cache)."""
     with _agent_events_lock:
+        for key in list(_pending_codex_waits):
+            _cancel_codex_wait_locked(key)
         _agent_events.clear()
 
 
@@ -1860,6 +2034,7 @@ def _load_project_board(config, project):
     result = {
         "name": name,
         "path": path,
+        "maxAgents": project.get("maxAgents"),
         "error": None,
         "statuses": list(DEFAULT_STATUSES),
         "tasks": [],
@@ -1916,6 +2091,11 @@ def _load_project_board(config, project):
     # user discarded it themselves, which is what the spawn confirm then
     # names instead.
     discard_times = latest_discard_times(path)
+
+    # task-172: which task files are locked (read-only in this checkout
+    # while their task is spawned -- see spawn.py). Read from the files'
+    # own modes on every load: one listdir, one stat per task file.
+    locked_files = spawn.locked_task_files(path)
 
     # task-91: milestone ids are assigned per repo and sequentially, so
     # every repo has an "m-0" and the id alone says nothing about which
@@ -1977,6 +2157,7 @@ def _load_project_board(config, project):
         # a task that has never had one (and for a repo whose tag
         # listing failed -- see latest_discard_times).
         merged["lastDiscardedAt"] = discard_times.get(task_id)
+        merged["taskFileLocked"] = str(task_id or "").lower() in locked_files
         merged_tasks.append(merged)
         status = merged.get("status")
         if status and status not in observed_statuses:
@@ -2119,12 +2300,14 @@ def _parse_session_project_and_task(name, config):
     return None, None
 
 
-def live_sessions_for_project(project_name, config):
+def live_sessions_for_project(project_name, config, sessions=None):
     """The names of the live `centrale-*` tmux sessions that belong to
     `project_name`, resolved through the same reverse mapping
     everything else uses (_parse_session_project_and_task, so a project
     name that is a prefix of another one still resolves to the right
-    owner). Empty when tmux has no server running at all.
+    owner). Empty when tmux has no server running at all. A caller that
+    already surveyed tmux can pass that same session list (spawn uses
+    one survey for both duplicate and project-cap checks).
 
     Public because settings.py's remove-project guard (task-167) asks
     exactly this question -- "is an agent of ours still running in this
@@ -2132,7 +2315,7 @@ def live_sessions_for_project(project_name, config):
     function rather than reaching for the private mapping.
     """
     owned = []
-    for session in list_sessions():
+    for session in list_sessions() if sessions is None else sessions:
         name = session.get("name", "")
         project, _ = _parse_session_project_and_task(name, config)
         if project is not None and project.get("name") == project_name:
@@ -2277,7 +2460,14 @@ def validate_session_input(body):
         if not isinstance(key, str) or key not in SESSION_INPUT_KEYS:
             raise SessionInputError(f"key must be one of {list(SESSION_INPUT_KEYS)!r}")
         return "key", key
-    text = body.get("text")
+    return "text", _validate_input_text(body.get("text"))
+
+
+def _validate_input_text(text):
+    """The one set of text rules for everything Centrale pastes into a
+    session: the drawer's reply (validate_session_input) and a delivered
+    message (validate_delivery_body, task-170.2) alike. Returns the text
+    unchanged or raises SessionInputError(400)."""
     if not isinstance(text, str):
         raise SessionInputError("text must be a string")
     if not text.strip():
@@ -2290,7 +2480,7 @@ def validate_session_input(body):
         raise SessionInputError(
             "text must be a single line with no control characters (multi-line input is not supported)"
         )
-    return "text", text
+    return text
 
 
 def _new_paste_buffer_name():
@@ -2393,6 +2583,318 @@ def send_session_input(name, kind, value):
     if proc.returncode != 0:
         fail(enter, proc)
     return [load, paste, enter]
+
+
+# ---------------------------------------------------------------------------
+# Deliver-and-confirm (task-170.2)
+# ---------------------------------------------------------------------------
+#
+# POST /api/deliver is the one supported way for a PROGRAM -- an
+# orchestrating session, a script -- to message a spawned agent. It sends
+# through send_session_input's bracketed-paste path (never a second paste
+# path) and then proves the text landed: a capture afterwards must show a
+# NEW prompt-echo line for it. "Sent" was a hope; the echo is the fact.
+#
+# Every attempt is appended to a delivery log Centrale owns (JSON lines,
+# never a task file): the record of what was said to an agent, whether or
+# not the agent writes anything down. It is an event record, not state --
+# nothing on the board is derived from it (see MANIFESTO.md, "Derive, do
+# not remember").
+
+# How long to keep re-capturing for the echo after the Enter went in, and
+# how often. Measured against claude 2.1.283 and codex 0.157.1: both echo
+# the submitted line within one second, idle or busy.
+DELIVERY_ECHO_TIMEOUT_SECONDS = 5.0
+DELIVERY_ECHO_POLL_SECONDS = 0.25
+# Lines captured (scrollback included) for the dialog check and for
+# counting echoes before and after the send.
+DELIVERY_CAPTURE_LINES = MAX_SESSION_PANE_LINES
+# A dialog is the active thing at the BOTTOM of the pane; only the last
+# this-many non-blank lines are searched, so an agent's earlier prose that
+# happens to mention "Enter" and "Esc" cannot read as a dialog.
+DELIVERY_DIALOG_REGION_LINES = 12
+# A wrapped echo keeps only its first line on one pane row; that row must
+# carry at least this much of the message (all of it, if shorter).
+DELIVERY_ECHO_MIN_PREFIX_CHARS = 20
+MAX_DELIVERY_SENDER_CHARS = 100
+DEFAULT_DELIVERY_LOG_LIMIT = 100
+MAX_DELIVERY_LOG_LIMIT = 1000
+DELIVERY_LOG_ENV = "CENTRALE_DELIVERY_LOG"
+
+# HTTP status per failed outcome; "delivered" is 200.
+DELIVERY_OUTCOME_STATUS = {
+    "no-session": 404,
+    "dialog": 409,
+    "no-echo": 504,
+    "tmux-error": 500,
+}
+
+# Dialog signatures, from real captures (tests/fixtures/panes): claude's
+# "Enter to confirm · Esc to cancel", codex's "enter continue · esc back"
+# and "Press enter to confirm or esc to cancel" -- a key-hint footer that
+# names Enter and then Esc. Or a cursor on a numbered menu (claude's
+# permission prompts, codex's approvals): "❯ 1. Yes" with a sibling "2. ..."
+# next to it. Neither appears on an idle or working claude/codex pane.
+_DIALOG_FOOTER_RE = re.compile(r"^(?:press\s+)?enter\b.{0,40}\besc\b", re.IGNORECASE)
+_MENU_CURSOR_RE = re.compile(r"^[❯›>]\s*\d+\.\s+\S")
+_MENU_ITEM_RE = re.compile(r"^\d+\.\s+\S")
+# The glyph claude (❯) and codex (›) put before a submitted prompt.
+_ECHO_MARKER_RE = re.compile(r"^[❯›>]\s*")
+# Codex 0.157.1's mid-turn queue (real pane in tests/fixtures/panes).
+# Scope arrows to the queue region; prose can contain arrows too (task-176).
+_CODEX_QUEUE_HEADING = "• Messages to be submitted after next tool call"
+_QUEUED_ECHO_MARKER_RE = re.compile(r"^↳\s+")
+
+
+def delivery_log_path():
+    """$CENTRALE_DELIVERY_LOG if set, else
+    $XDG_STATE_HOME/centrale/deliveries.jsonl (~/.local/state/... when
+    XDG_STATE_HOME is unset). STATE, not cache: a cache may be deleted at
+    will, and this is the record of what agents were told. A function so
+    tests can point it at a throwaway path."""
+    override = os.environ.get(DELIVERY_LOG_ENV)
+    if override:
+        return override
+    state_home = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
+    return os.path.join(state_home, "centrale", "deliveries.jsonl")
+
+
+_delivery_log_lock = threading.Lock()
+
+
+def append_delivery_log(entry):
+    """Append one attempt as a JSON line. Returns None, or the error text
+    when the log could not be written (the caller reports it rather than
+    pretending the attempt was recorded)."""
+    path = delivery_log_path()
+    line = json.dumps(entry, ensure_ascii=False) + "\n"
+    try:
+        with _delivery_log_lock:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line)
+    except OSError as exc:
+        return f"could not write the delivery log {path}: {exc}"
+    return None
+
+
+def read_delivery_log(project=None, task=None, limit=DEFAULT_DELIVERY_LOG_LIMIT):
+    """The last `limit` attempts, oldest first, optionally narrowed to one
+    project and/or task (task ids compare case-insensitively). A missing
+    log is an empty one. Returns (entries, skipped) where `skipped` counts
+    lines that were not a JSON object -- surfaced, never silently lost."""
+    try:
+        with open(delivery_log_path(), encoding="utf-8") as f:
+            raw_lines = f.readlines()
+    except FileNotFoundError:
+        return [], 0
+    entries, skipped = [], 0
+    for raw in raw_lines:
+        if not raw.strip():
+            continue
+        try:
+            entry = json.loads(raw)
+        except json.JSONDecodeError:
+            skipped += 1
+            continue
+        if not isinstance(entry, dict):
+            skipped += 1
+            continue
+        if project is not None and entry.get("project") != project:
+            continue
+        if task is not None and str(entry.get("task", "")).lower() != task.lower():
+            continue
+        entries.append(entry)
+    return entries[-limit:], skipped
+
+
+def detect_pane_dialog(lines):
+    """The line that shows a dialog is occupying the pane, or None.
+
+    A heuristic over the rendered text, pinned against real claude and
+    codex captures -- see the note on _DIALOG_FOOTER_RE. Only the bottom
+    DELIVERY_DIALOG_REGION_LINES non-blank lines count."""
+    region = [line.strip() for line in lines if line.strip()][-DELIVERY_DIALOG_REGION_LINES:]
+    for line in reversed(region):
+        if _DIALOG_FOOTER_RE.match(line):
+            return line
+    for i, line in enumerate(region):
+        if _MENU_CURSOR_RE.match(line):
+            neighbours = region[max(0, i - 3):i] + region[i + 1:i + 4]
+            if any(_MENU_ITEM_RE.match(n) for n in neighbours):
+                return line
+    return None
+
+
+def _collapse_whitespace(text):
+    return " ".join(text.split())
+
+
+def echo_lines(lines, text):
+    """The pane lines that echo `text` as a prompt or a Codex queue item: a prompt
+    glyph (❯ claude, › codex, > generic), then either the whole message or
+    -- when the TUI wrapped it -- a leading run of it at least
+    DELIVERY_ECHO_MIN_PREFIX_CHARS long. Whitespace is collapsed on both
+    sides. Queued arrows count only within Codex's queue region. Requiring
+    a recognized marker is what keeps an agent's own reply that
+    happens to quote the message ("● ok") from counting as its echo."""
+    want = _collapse_whitespace(text)
+    need = min(len(want), DELIVERY_ECHO_MIN_PREFIX_CHARS)
+    found = []
+    in_codex_queue = False
+    for line in lines:
+        collapsed = _collapse_whitespace(line)
+        if collapsed.startswith(_CODEX_QUEUE_HEADING):
+            in_codex_queue = True
+            continue
+        if not collapsed or not line.startswith(" "):
+            in_codex_queue = False
+        marker = _ECHO_MARKER_RE.match(collapsed)
+        if marker is None and in_codex_queue:
+            marker = _QUEUED_ECHO_MARKER_RE.match(collapsed)
+        if not marker:
+            continue
+        rest = collapsed[marker.end():]
+        if rest and len(rest) >= need and want.startswith(rest):
+            found.append(collapsed)
+    return found
+
+
+def _utc_timestamp():
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Injectable so tests never really wait (the boundary rule, applied to time).
+_delivery_sleep = time.sleep
+_delivery_clock = time.monotonic
+
+# One delivery per session at a time: two concurrent ones would each count
+# the other's echo as their own.
+_delivery_session_locks = {}
+_delivery_session_locks_guard = threading.Lock()
+
+
+def _delivery_lock_for(name):
+    with _delivery_session_locks_guard:
+        return _delivery_session_locks.setdefault(name, threading.Lock())
+
+
+def deliver_message(name, text):
+    """Paste `text` into session `name` and confirm it arrived. Returns a
+    dict with "outcome" -- "delivered", "no-session", "dialog", "no-echo"
+    or "tmux-error" -- plus "echo"/"echoAt" when delivered, "dialog" (the
+    line that gave it away) for a dialog, and "reason" for every failure.
+
+    1. Capture. A dialog on the pane refuses the delivery before anything
+       is pasted: pasted text would land in the dialog, and the Enter
+       after it would confirm whatever option it has focused.
+    2. Count the echo lines already on the pane -- the baseline, so an
+       earlier identical message cannot pass for this one.
+    3. send_session_input: the same bracketed paste + Enter the drawer
+       uses.
+    4. Re-capture every DELIVERY_ECHO_POLL_SECONDS until more echo lines
+       than the baseline appear, or DELIVERY_ECHO_TIMEOUT_SECONDS pass.
+
+    What the echo proves: the text reached the pane as a prompt or queued
+    message. It
+    cannot tell a submitted prompt from one still sitting in the composer
+    (both render behind the same glyph), and it says nothing about whether
+    the agent has acted on it yet."""
+    with _delivery_lock_for(name):
+        try:
+            before = capture_session_pane(name, DELIVERY_CAPTURE_LINES)
+        except PaneCaptureError as exc:
+            if exc.status == 404:
+                return {"outcome": "no-session", "reason": f"no live session {name}"}
+            return {"outcome": "tmux-error", "reason": str(exc)}
+
+        dialog = detect_pane_dialog(before)
+        if dialog is not None:
+            return {
+                "outcome": "dialog",
+                "dialog": dialog,
+                "reason": f"a dialog is occupying the pane ({dialog!r}); nothing was sent",
+            }
+
+        baseline = len(echo_lines(before, text))
+        try:
+            send_session_input(name, "text", text)
+        except SessionInputError as exc:
+            if exc.status == 404:
+                return {"outcome": "no-session", "reason": f"no live session {name}"}
+            return {"outcome": "tmux-error", "reason": str(exc)}
+
+        deadline = _delivery_clock() + DELIVERY_ECHO_TIMEOUT_SECONDS
+        last = before
+        while True:
+            _delivery_sleep(DELIVERY_ECHO_POLL_SECONDS)
+            try:
+                after = capture_session_pane(name, DELIVERY_CAPTURE_LINES)
+            except PaneCaptureError as exc:
+                if exc.status == 404:
+                    return {
+                        "outcome": "no-session",
+                        "reason": f"session {name} ended after the text was sent, before its echo was seen",
+                    }
+                return {"outcome": "tmux-error", "reason": f"text was sent but the echo check failed: {exc}"}
+            echoes = echo_lines(after, text)
+            if len(echoes) > baseline:
+                return {"outcome": "delivered", "echo": echoes[-1], "echoAt": _utc_timestamp()}
+            last = after
+            if _delivery_clock() >= deadline:
+                break
+
+        dialog = detect_pane_dialog(last)
+        if dialog is not None:
+            return {
+                "outcome": "dialog",
+                "dialog": dialog,
+                "reason": (
+                    f"the text was sent, but a dialog is on the pane ({dialog!r}) "
+                    "and the echo never appeared"
+                ),
+            }
+        return {
+            "outcome": "no-echo",
+            "reason": (
+                f"the text was sent, but no echo of it appeared on the pane within "
+                f"{DELIVERY_ECHO_TIMEOUT_SECONDS:g}s"
+            ),
+        }
+
+
+def ruling_message(sender, text):
+    """What POST /api/rule delivers to a live agent: the text, prefixed
+    with who ruled -- the spawn prompt names this exact shape, so the
+    agent can record the ruling as a comment authored by the sender."""
+    return f"[ruling from {sender.strip()}] {text}"
+
+
+def validate_delivery_body(body):
+    """Reduce a POST /api/deliver body to (sender, text), or raise
+    SessionInputError(400). Text follows the reply rules exactly
+    (_validate_input_text). Sender names who is speaking -- it goes in the
+    log, and is how a ruling gets attributed -- so it is required: one
+    line, 1..MAX_DELIVERY_SENDER_CHARS, no control characters."""
+    if not isinstance(body, dict):
+        raise SessionInputError("request body must be a JSON object")
+    allowed_fields = {"text", "sender", "project", "taskId", "task"}
+    unknown_fields = sorted((f for f in body if f not in allowed_fields), key=str)
+    if unknown_fields:
+        label = "field" if len(unknown_fields) == 1 else "fields"
+        raise SessionInputError(
+            f"unknown request body {label}: " + ", ".join(repr(f) for f in unknown_fields)
+        )
+    sender = body.get("sender")
+    if not isinstance(sender, str) or not sender.strip():
+        raise SessionInputError("sender is required: a short name for who is sending")
+    if len(sender) > MAX_DELIVERY_SENDER_CHARS:
+        raise SessionInputError(f"sender must be at most {MAX_DELIVERY_SENDER_CHARS} characters")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in sender):
+        raise SessionInputError("sender must be a single line with no control characters")
+    if "text" not in body:
+        raise SessionInputError("text is required")
+    return sender, _validate_input_text(body.get("text"))
 
 
 _GIT_QUOTE_SIMPLE_ESCAPES = {
@@ -2900,6 +3402,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # is to notice the checkout moving under a process that cannot.
         response["codeDrift"] = code_drift(self.config)
         response["harvestMode"] = (self.config.get("harvest") or {}).get("mode", "click")
+        # task-171: what the spawn control needs to show which agent will
+        # run (and offer a picker when none resolves) without a new call.
+        import spawn  # local import: avoids a circular import at module load
+
+        response["spawnAgents"] = spawn.spawn_agents_summary(self.config)
         response["sessionPreviewMode"] = session_preview_mode(self.config)
         response["refreshIntervalSeconds"] = self.config.get(
             "refreshIntervalSeconds", DEFAULT_REFRESH_INTERVAL_SECONDS
@@ -3055,14 +3562,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_sessions()
             elif path == "/api/session-pane":
                 self._handle_session_pane(query)
+            elif path == "/api/deliveries":
+                self._handle_deliveries(query)
             elif path == "/api/harvest":
                 self._handle_harvest_get(query)
+            elif path == "/api/orchestrator-wait":
+                self._handle_orchestrator_wait(urllib.parse.parse_qs(parsed.query, keep_blank_values=True))
             elif path == "/api/harvest-progress":
                 self._handle_harvest_progress_get()
             elif path == "/api/discard-preview":
                 self._handle_discard_preview(query)
             elif path == "/api/settings":
                 self._handle_settings_get()
+            elif path == "/api/agent-guide":
+                self._handle_agent_guide()
             else:
                 self._send_error_json(404, "not found")
         except Exception:  # pragma: no cover - defensive, never leak tracebacks
@@ -3088,6 +3601,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         events = harvest.recent_events(project_name)
         self._send_json(200, {"branches": branches, "events": events})
 
+    def _handle_orchestrator_wait(self, query):
+        project = (query.get("project") or [None])[0]
+        if not project:
+            self._send_error_json(400, "missing required query param: project")
+            return
+        if not any(p.get("name") == project for p in self.config.get("projects", [])):
+            self._send_error_json(404, f"unknown project: {project}")
+            return
+        try:
+            line = orchestrator.wait(
+                project, after=(query.get("after") or [None])[0],
+                timeout=(query.get("timeout") or [orchestrator.DEFAULT_TIMEOUT])[0],
+            )
+        except orchestrator.WaitError as exc:
+            self._send_error_json(exc.status, str(exc))
+            return
+        body = line.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # A disconnected client may replay its cursor; delivery does
+            # not consume an event. The timeout bounds abandoned requests.
+            pass
+
     def _handle_harvest_progress_get(self):
         """task-96: what the one in-flight harvest is doing right now,
         or null when nothing is being harvested.
@@ -3108,6 +3650,37 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self._send_json(200, settings.current_settings(self.config))
 
+    def _handle_agent_guide(self):
+        origin = f"http://127.0.0.1:{self.server.server_address[1]}".encode()
+        data = AGENT_GUIDE.replace(b"{{CENTRALE_URL}}", origin)
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _handle_setup_project(self):
+        import settings
+        try:
+            body = self._read_json_body()
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+            self._send_error_json(400, "malformed request body")
+            return
+        if not isinstance(body, dict) or not isinstance(body.get("project"), str) or not body["project"]:
+            self._send_error_json(400, "project must name a configured project")
+            return
+        project = next((p for p in self.config.get("projects", []) if p["name"] == body["project"]), None)
+        if project is None:
+            self._send_error_json(404, f"unknown project: {body['project']}")
+            return
+        try:
+            result = settings.setup_project(self.config, project, self.server.server_address[1])
+        except settings.SettingsError as exc:
+            self._send_error_json(exc.status, str(exc))
+            return
+        self._send_json(200, result)
+
     def _handle_settings_post(self):
         import settings  # local import: avoids a circular import at module load
 
@@ -3118,7 +3691,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
-            result = settings.apply_settings(self.config, body)
+            result = settings.apply_settings(self.config, body, port=self.server.server_address[1])
         except settings.ValidationError as exc:
             self._send_json(400, {"error": str(exc), "fields": exc.fields})
             return
@@ -3158,6 +3731,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         project = body.get("project")
         task_id = body.get("taskId", body.get("task_id"))
+        # task-171: an explicit agent choice, validated by spawn.spawn
+        # (unknown -> 400); absent means "the task's assignee".
+        agent = body.get("agent")
 
         # task-121: creating this task's worktree is a lifecycle
         # operation like any other, so it waits for one already running
@@ -3166,7 +3742,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # unaffected.
         try:
             with task_lifecycle_lock(project, task_id):
-                result = spawn.spawn(self.config, project, task_id)
+                result = spawn.spawn(self.config, project, task_id, agent=agent)
         except spawn.SpawnError as exc:
             self._send_error_json(exc.status, str(exc))
             return
@@ -3293,7 +3869,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         forces exact-name matching, since tmux -t otherwise prefix-matches
         and could kill an unrelated session (see AGENTS.md on the
         injectable run_tmux boundary and why this is the one place in
-        end-session that touches tmux)."""
+        end-session that touches tmux).
+
+        Killing the tmux session does not reliably kill everything it
+        started: a vite dev server or a vitest worker pool the agent
+        launched survives its parent pane, keeps running with the
+        worktree as its cwd, and leaks for as long as the machine is up
+        (task-201 -- 53 such orphans, some days old, OOM-killed two full
+        suites). So once the session itself is gone, this also sweeps
+        and kills every remaining pid whose cwd is under this task's
+        worktree (kill_pids_with_cwd_under) and reports which ones it
+        killed -- never anything outside that directory, and never the
+        owner's own `vite --port 5173` (a different cwd entirely)."""
         import spawn  # local import: avoids a circular import at module load
 
         try:
@@ -3336,7 +3923,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_error_json(500, f"tmux kill-session failed: {stderr}")
             return
 
-        self._send_json(200, {"ok": True, "session": name})
+        wt_dir = spawn.worktree_dir(self.config, project_name, task_id)
+        killed_orphans = kill_pids_with_cwd_under(wt_dir)
+
+        self._send_json(200, {"ok": True, "session": name, "killedOrphans": killed_orphans})
 
     def _handle_session_input(self):
         """POST /api/session-input (task-61): type a single-line reply, or
@@ -3438,6 +4028,212 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "captureAgeSeconds": round(age, 1),
         })
 
+    def _handle_deliver(self):
+        """POST /api/deliver (task-170.2): deliver one line of text to a
+        project/task's live agent and confirm it arrived -- see
+        deliver_message. Body: {"project", "taskId", "sender", "text"}.
+
+        Unlike /api/session-input there is no fresh-capture gate (the
+        endpoint does its own capture, before and after) and no
+        sessionPreview.mode switch (that setting governs the drawer's pane
+        and reply row; this is the orchestration channel).
+
+        400/404 for a request that is not an attempt at all (bad identity
+        or body) -- nothing logged. Every attempt past that is appended to
+        the delivery log, whatever its outcome, and answered with
+        DELIVERY_OUTCOME_STATUS's status."""
+        try:
+            body = self._read_json_body()
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_error_json(400, f"invalid request body: {exc}")
+            return
+        project_name = body.get("project")
+        task_id = body.get("taskId", body.get("task"))
+        if not project_name:
+            self._send_error_json(400, "missing required param: project")
+            return
+        if not any(p.get("name") == project_name for p in self.config.get("projects", [])):
+            self._send_error_json(404, f"unknown project: {project_name}")
+            return
+        if not isinstance(task_id, str) or not TASK_ID_RE.match(task_id):
+            self._send_error_json(400, "invalid or missing task id")
+            return
+        try:
+            sender, text = validate_delivery_body(body)
+        except SessionInputError as exc:
+            self._send_error_json(exc.status, str(exc))
+            return
+
+        status, payload = self._deliver_and_log(project_name, task_id, sender, text)
+        self._send_json(status, payload)
+
+    def _deliver_and_log(self, project_name, task_id, sender, text):
+        """One delivery attempt, appended to the delivery log: (HTTP
+        status, response payload). POST /api/deliver's body, shared with
+        POST /api/rule's live-agent case."""
+        import spawn  # local import: avoids a circular import at module load
+
+        attempted_at = _utc_timestamp()
+        name = spawn.session_name(project_name, task_id)
+        owner, owner_task = _parse_session_project_and_task(name, self.config)
+        if owner is None or owner.get("name") != project_name or owner_task != task_id.lower():
+            # Same ownership rule as /api/session-input: never target a
+            # session that can't be attributed back to this board task.
+            result = {
+                "outcome": "no-session",
+                "reason": f"session {name} does not resolve to a known board task",
+            }
+        else:
+            result = deliver_message(name, text)
+
+        entry = {
+            "id": uuid.uuid4().hex,
+            "time": attempted_at,
+            "project": project_name,
+            "task": task_id,
+            "sender": sender,
+            "text": text,
+            "session": name,
+            "outcome": result["outcome"],
+            "echo": result.get("echo"),
+            "echoAt": result.get("echoAt"),
+            "dialog": result.get("dialog"),
+            "reason": result.get("reason"),
+        }
+        log_error = append_delivery_log(entry)
+
+        payload = dict(entry)
+        payload["ok"] = entry["outcome"] == "delivered"
+        payload["logged"] = log_error is None
+        if log_error is not None:
+            payload["logError"] = log_error
+        if not payload["ok"]:
+            payload["error"] = entry["reason"]
+        return DELIVERY_OUTCOME_STATUS.get(entry["outcome"], 200), payload
+
+    def _handle_rule(self):
+        """POST /api/rule (task-172): rule on a spawned task, whichever
+        case it is in. Body: {"project", "taskId", "sender", "text"} --
+        /api/deliver's body and rules.
+
+        While a task is spawned its task file has one writer, the agent
+        (the main checkout's copy is locked -- see spawn.py), so a ruling
+        reaches the file through the agent:
+
+        - A live session: the ruling is delivered to it as
+          "[ruling from <sender>] <text>" through /api/deliver's own
+          deliver-and-log path, and the answer is that delivery's
+          (status and body), plus "mode": "delivered". The spawn prompt
+          tells the agent to record such a message as a comment authored
+          by the sender, then act on it.
+        - No live session (or it ended before the echo): nobody to
+          message and nobody to race with, so the comment is written into
+          the Centrale worktree's copy through the CLI and committed on
+          the task branch, scoped to that one file -- "mode": "committed".
+          Refused with 409 when there is no such worktree to write into
+          (no branch, a parked one, or one checked out outside Centrale)
+          or its copy of the task file already has uncommitted edits."""
+        import spawn  # local import: avoids a circular import at module load
+
+        try:
+            body = self._read_json_body()
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            self._send_error_json(400, f"invalid request body: {exc}")
+            return
+        if not isinstance(body, dict):
+            self._send_error_json(400, "request body must be a JSON object")
+            return
+        project_name = body.get("project")
+        task_id = body.get("taskId", body.get("task"))
+        if not project_name:
+            self._send_error_json(400, "missing required param: project")
+            return
+        project = next((p for p in self.config.get("projects", []) if p.get("name") == project_name), None)
+        if project is None:
+            self._send_error_json(404, f"unknown project: {project_name}")
+            return
+        if not isinstance(task_id, str) or not TASK_ID_RE.match(task_id):
+            self._send_error_json(400, "invalid or missing task id")
+            return
+        try:
+            sender, text = validate_delivery_body(body)
+            message = _validate_input_text(ruling_message(sender, text))
+        except SessionInputError as exc:
+            self._send_error_json(exc.status, str(exc))
+            return
+
+        name = spawn.session_name(project_name, task_id)
+        live = self._session_is_live(name)
+        if live is None:
+            return
+        if live:
+            status, payload = self._deliver_and_log(project_name, task_id, sender, message)
+            if payload["outcome"] != "no-session":
+                payload["mode"] = "delivered"
+                self._send_json(status, payload)
+                return
+            # The session ended before the echo: nobody left to race with.
+
+        with task_lifecycle_lock(project_name, task_id):
+            # Re-checked under the lock, which spawn/resume also hold
+            # while they start a session.
+            live = self._session_is_live(name)
+            if live is None:
+                return
+            if live:
+                self._send_error_json(
+                    409, f"a session for {task_id} started while the ruling was being written; send it again"
+                )
+                return
+            try:
+                result = spawn.commit_ruling(self.config, project, task_id, sender, text)
+            except spawn.SpawnError as exc:
+                self._send_error_json(exc.status, str(exc))
+                return
+        result["mode"] = "committed"
+        self._send_json(200, result)
+
+    def _session_is_live(self, name):
+        """True/False, or None after answering 502 itself: a session list
+        that cannot be read must not read as "no agent" and send the
+        ruling around a live one."""
+        try:
+            return any(s.get("name") == name for s in list_sessions())
+        except BacklogError as exc:
+            self._send_error_json(502, f"failed to check existing sessions: {exc}")
+            return None
+
+    def _handle_deliveries(self, query):
+        """GET /api/deliveries[?project=&task=&limit=] (task-170.2): the
+        delivery log, oldest first, the last `limit` matching attempts."""
+        project_name = (query.get("project") or [None])[0]
+        task_id = (query.get("task") or [None])[0]
+        raw_limit = (query.get("limit") or [None])[0]
+        if task_id is not None and not TASK_ID_RE.match(task_id):
+            self._send_error_json(400, "invalid task id")
+            return
+        limit = DEFAULT_DELIVERY_LOG_LIMIT
+        if raw_limit is not None:
+            try:
+                limit = int(raw_limit)
+            except ValueError:
+                limit = 0
+            if not 1 <= limit <= MAX_DELIVERY_LOG_LIMIT:
+                self._send_error_json(
+                    400, f"limit must be an integer from 1 to {MAX_DELIVERY_LOG_LIMIT}"
+                )
+                return
+        try:
+            entries, skipped = read_delivery_log(project_name, task_id, limit)
+        except OSError as exc:
+            self._send_error_json(500, f"could not read the delivery log: {exc}")
+            return
+        self._send_json(200, {
+            "log": delivery_log_path(),
+            "deliveries": entries,
+            "skippedLines": skipped,
+        })
+
     def _handle_cleanup_branch(self):
         """POST /api/cleanup-branch (task-43): removes a task/<id>
         branch's worktree and deletes the branch itself once it's fully
@@ -3479,7 +4275,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with git's own stderr rather than silently forced through).
         main is never touched by any of this. Missing worktree but a
         still-present branch skips removal and just deletes the branch;
-        neither present is a 404 -- there's nothing here to clean up."""
+        neither present is a 404 -- there's nothing here to clean up.
+
+        task-201: removing the worktree directory does not stop a vite
+        dev server or vitest worker pool the agent left running with
+        that directory as its cwd -- it survives the removal outright
+        (a deleted-but-still-open cwd) and leaks for as long as the
+        machine is up. So a still-existing worktree is checked for live
+        pids under it (kill_pids_with_cwd_under's own finder) before
+        anything is touched: present and body.force is not true -> 409
+        naming the pids, so the leak is visible instead of silently
+        orphaned again; present and body.force is true -> killed here,
+        then removal proceeds normally."""
         try:
             body = self._read_json_body()
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
@@ -3487,6 +4294,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         project_name = body.get("project")
         task_id = body.get("taskId", body.get("task"))
+        force = body.get("force") is True
 
         if not project_name:
             self._send_error_json(400, "missing required param: project")
@@ -3512,9 +4320,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # discard, an abandon, a merge or a re-spawn of the same task
         # waits rather than interleaving its git operations with these.
         with task_lifecycle_lock(project_name, task_id):
-            self._cleanup_branch_locked(project, project_name, task_id, repo_path)
+            self._cleanup_branch_locked(project, project_name, task_id, repo_path, force)
 
-    def _cleanup_branch_locked(self, project, project_name, task_id, repo_path):
+    def _cleanup_branch_locked(self, project, project_name, task_id, repo_path, force=False):
         """The body of /api/cleanup-branch, under this task's lifecycle
         lock (task-121). Split out for the same reason the discard's is:
         the lock belongs on one visible line in the handler."""
@@ -3562,7 +4370,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
 
         discarded_paths = []
+        killed_orphans = []
         if wt_exists:
+            orphan_pids = _pids_with_cwd_under(wt_dir)
+            if orphan_pids and not force:
+                pids_str = ", ".join(str(pid) for pid in orphan_pids)
+                self._send_error_json(
+                    409,
+                    f"processes still running with cwd under the worktree (pids: {pids_str}) "
+                    "-- pass force to kill them and remove anyway",
+                )
+                return
+            if orphan_pids:
+                for pid in orphan_pids:
+                    kill_process(pid)
+                killed_orphans = orphan_pids
+
             status_proc = run_git(["status", "--porcelain"], cwd=wt_dir)
             if status_proc.returncode != 0:
                 stderr = (status_proc.stderr or status_proc.stdout or "unknown error").strip()
@@ -3588,6 +4411,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "branch": branch,
             "worktreeRemoved": wt_exists,
             "discardedPaths": discarded_paths,
+            "killedOrphans": killed_orphans,
+            # task-172: nothing is spawned on this task any more.
+            "taskFileUnlocked": spawn.unlock_task_file(repo_path, task_id),
         })
 
     # ------------------------------------------------------------------
@@ -4032,6 +4858,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             branch_deleted = True
 
+        # task-172: the attempt is gone, and so is the reason for the lock.
+        unlocked = spawn.unlock_task_file(repo_path, task_id)
+
         self._send_json(200, {
             "ok": True,
             "branch": branch,
@@ -4045,6 +4874,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "recoveryCommand": (
                 recovery_command(branch, survey["branchTip"]) if survey["branchTip"] else None
             ),
+            "taskFileUnlocked": unlocked,
         })
 
     def _handle_abandon_worktree(self):
@@ -4117,6 +4947,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_error_json(500, error)
             return
 
+        # task-172: no worktree means no agent can write the branch's copy
+        # any more, so the main checkout's copy is writable again -- the
+        # parked branch is merged later exactly as it is.
+        unlocked = spawn.unlock_task_file(project["path"], task_id)
+
         self._send_json(200, {
             "ok": True,
             "branch": branch,
@@ -4126,6 +4961,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             "commitCount": survey["commitCount"],
             "worktreeRemoved": True,
             "discardedPaths": survey["dirtyPaths"],
+            "taskFileUnlocked": unlocked,
         })
 
     def _handle_harvest_post(self):
@@ -4195,12 +5031,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_harvest_post()
             elif path == "/api/settings":
                 self._handle_settings_post()
+            elif path == "/api/setup-project":
+                self._handle_setup_project()
             elif path == "/api/agent-event":
                 self._handle_agent_event(urllib.parse.parse_qs(parsed.query))
             elif path == "/api/end-session":
                 self._handle_end_session()
             elif path == "/api/session-input":
                 self._handle_session_input()
+            elif path == "/api/rule":
+                self._handle_rule()
+            elif path == "/api/deliver":
+                self._handle_deliver()
             elif path == "/api/cleanup-branch":
                 self._handle_cleanup_branch()
             elif path == "/api/discard-attempt":
@@ -4296,6 +5138,25 @@ def backlog_version(proc):
     if proc.returncode != 0:
         return None
     return _version_token((proc.stdout or "") + " " + (proc.stderr or ""))
+
+
+def stale_task_lock_messages(found):
+    """One line per stale task-file lock spawn.release_stale_task_locks
+    found, for --check and the startup log."""
+    messages = []
+    for entry in found:
+        where = f"{entry['project']}: {entry['path']}"
+        if entry.get("released"):
+            messages.append(
+                f"{where} was read-only with no task/{entry['taskId'].lower()} branch behind it "
+                "(a stale task-file lock) -- unlocked it"
+            )
+        else:
+            messages.append(
+                f"{where} is read-only with no task/{entry['taskId'].lower()} branch behind it (a stale task-file lock), "
+                f"and unlocking it failed: {entry.get('error')} -- chmod u+w it"
+            )
+    return messages
 
 
 def run_doctor_check(config_path=None):
@@ -4448,11 +5309,29 @@ def run_doctor_check(config_path=None):
         if not os.path.isdir(proj_path):
             check("WARN", f"{name}: path does not exist: {proj_path} -- will show as an error banner on the board")
             continue
+        import settings
+        missing = settings.missing_agent_pointers(config, project)
+        if missing:
+            command = shlex.join([
+                "curl", "--fail-with-body", "--silent", "--show-error",
+                f"http://127.0.0.1:{config['port']}/api/setup-project",
+                "-H", "Content-Type: application/json", "-d", json.dumps({"project": name}),
+            ])
+            check("WARN", f"{name}: missing or stale Centrale pointer in {', '.join(missing)} -- "
+                  f"with Centrale running, set up Backlog.md and Centrale: {command}")
         config_yml = os.path.join(proj_path, "backlog", "config.yml")
         if not os.path.isfile(config_yml):
             check("WARN", f"{name}: {proj_path} has no backlog/config.yml -- run 'backlog init' there first")
             continue
         check("PASS", f"{name}: {proj_path} exists and has backlog/config.yml")
+
+    # task-172: a read-only task file with no task/<id> branch behind it
+    # is a lock that outlived its reason (a branch deleted outside
+    # Centrale). --check releases it, as startup does, and says so.
+    import spawn  # local import: avoids a circular import at module load
+
+    for message in stale_task_lock_messages(spawn.release_stale_task_locks(config)):
+        check("WARN", message)
 
     # task-128: the same comparison the board shows, for the terminal.
     # --check runs in a fresh process, so its own detect_version() IS the
@@ -4579,6 +5458,13 @@ def main():
             f"{'y' if len(sweep['stale']) == 1 else 'ies'}.",
             file=sys.stderr,
         )
+
+    import spawn  # local import: avoids a circular import at module load
+
+    # task-172: a task-file lock is plain filesystem state that survives
+    # a restart; one with no task branch behind it has outlived its reason.
+    for message in stale_task_lock_messages(spawn.release_stale_task_locks(config)):
+        print(f"Centrale: {message}", file=sys.stderr)
 
     import harvest  # local import: avoids a circular import at module load
 

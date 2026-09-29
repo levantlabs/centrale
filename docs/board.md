@@ -136,7 +136,12 @@ the group rather than from each one.
   drawer's Resume offer — an agent killed just *after* committing leaves a
   clean worktree, and only the drawer reads the branch-side status that
   gives it away (see "Resuming an interrupted agent" in
-  [docs/agents.md](agents.md#resuming-an-interrupted-agent)).
+  [docs/agents.md](agents.md#resuming-an-interrupted-agent)). A spawned
+  task's card also carries a muted, dashed "task file locked" badge while
+  the main checkout's copy of its task file is read-only; its tooltip says
+  why (`backlog task edit` there fails with `EACCES`) and what to do
+  instead (see "Ruling on a spawned task" in
+  [docs/agents.md](agents.md#ruling-on-a-spawned-task)).
 - Cards are sorted by priority (high, medium, low, then unset), then by
   ordinal.
 - **Filter controls**: the sidebar's text search box filters cards

@@ -16,12 +16,14 @@ run_git`) so tests can patch `server.run_git` / `server.run_tmux` /
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import re
 import shlex
 import shutil
 import tempfile
+import threading
 import time
 import urllib.parse
 
@@ -34,7 +36,10 @@ import server
 # is deliberate: `backlog decision list --plain` is the durable "why"
 # layer agents otherwise only find through lucky search-term overlap,
 # and on a repo with none it prints "No decisions found." and costs
-# nothing more than that one command.
+# nothing more than that one command. The ruling sentence (task-172):
+# while a task is spawned its task file has one writer, the agent, so a
+# ruling reaches the file through the agent rather than around it -- see
+# POST /api/rule.
 PROMPT_TEMPLATE = (
     "Work on backlog task {task_id}. Follow the Backlog.md workflow: run "
     "`backlog instructions overview` first, claim the task, implement it, "
@@ -44,7 +49,12 @@ PROMPT_TEMPLATE = (
     "--plain`) and treat them as constraints. When you are done, commit "
     "all your work on this branch, including the backlog task updates. "
     "Do NOT merge this branch into the default branch or delete it -- "
-    "the dashboard's gated merge handles integration."
+    "the dashboard's gated merge handles integration. "
+    "A message from an orchestrating session (Centrale delivers one as "
+    "`[ruling from <sender>] <text>`) is a ruling on this task: first "
+    "record it on your task as a comment authored by the sender "
+    "(`backlog task edit {task_id} --comment \"<text>\" --comment-author "
+    "<sender>`), then act on it."
 )
 
 
@@ -60,6 +70,24 @@ class SpawnError(Exception):
 
     def __str__(self):
         return self.message
+
+
+# Count and launch are one operation per project. Per-task lifecycle locks
+# alone let two different tasks both take the last slot (task-177). Routes
+# take their task lock first, then this lock; no launch takes another task
+# lock. The registry stores locks only, never remembered session counts.
+_launch_locks = {}
+_launch_locks_guard = threading.Lock()
+
+
+def _serialize_project_launch(fn):
+    @functools.wraps(fn)
+    def launch(config, project_name, task_id, *args, **kwargs):
+        with _launch_locks_guard:
+            lock = _launch_locks.setdefault(str(project_name), threading.Lock())
+        with lock:
+            return fn(config, project_name, task_id, *args, **kwargs)
+    return launch
 
 
 # task-113: the geometry every session Centrale creates is born with,
@@ -251,8 +279,8 @@ def event_url(config, project_name, task_id, agent_kind=None):
     session's own environment, regardless of agent type or the
     CENTRALE_SPAWN_CMD test override (task-37 AC #4): identity travels
     entirely in this query string, not in the agent-generic hooks
-    settings file _inject_agent_hooks points a claude-family agent at --
-    so the same one file works for every task, and a hook-less custom
+    settings _inject_agent_hooks passes a claude-family agent -- so the
+    same settings work for every task, and a hook-less custom
     agent that simply POSTs here on its own participates in agentState
     reporting with zero injection at all. Built-in agents also carry
     ``agentKind`` so the server can honestly derive codex turn-end as
@@ -270,7 +298,7 @@ def _inject_codex_hooks(codex_argv0):
     """The extra argv codex gets from _inject_agent_hooks: the -c notify
     override, always -- belt-and-suspenders for, and the ONLY thing that
     happens on, a codex without the hooks engine (see notify_argv below)
-    -- plus, only on a codex that actually supports it, the same four
+    -- plus, only on a codex that actually supports it, the lifecycle
     hook definitions as inline -c config overrides (see
     server.codex_hooks_overrides) and --dangerously-bypass-hook-trust so
     codex's per-source hook-trust prompt doesn't block a detached spawn:
@@ -325,16 +353,22 @@ def _inject_agent_hooks(cmd):
     lifecycle back to CENTRALE_EVENT_URL. Dispatched on
     os.path.basename(cmd[0]):
 
-    - "claude" gets ["--settings", <generated hooks settings file>] --
-      see server.ensure_hooks_settings_file. Covers any claude-family
+    - "claude" gets ["--settings", <the hooks settings as inline JSON>]
+      -- see server.hooks_settings_payload. Inline, never a file
+      (task-173): one shared, rewritable settings file let whichever
+      Centrale copy spawned last repoint EVERY running agent's hooks,
+      and a Centrale run from a since-deleted worktree blocked every
+      tool call machine-wide. Inline JSON is fixed per agent at launch,
+      exactly like codex's -c overrides below. Covers any claude-family
       entry whose underlying binary is literally "claude" (e.g.
       "claude-sonnet": ["claude", "--model", "sonnet"]), same basename
       check resume() already uses to decide "claude family".
-    - "codex" gets four inline -c hook overrides (see
+    - "codex" gets five inline -c hook overrides (see
       _inject_codex_hooks/server.codex_hooks_overrides) when
       server.probe_codex_hook_trust(cmd[0]) says this binary is
       >= 0.150.0 and supports --dangerously-bypass-hook-trust, reporting
-      working/waiting/finished exactly like claude does, plus the
+      working/waiting/finished (with PostToolUse clearing permission
+      review and server-side confirmation of waiting), plus the
       belt-and-suspenders -c notify override (task-37) that alone covers
       an older codex without the hooks engine -- see _inject_codex_hooks
       for the full breakdown, including task-44's linked-worktree finding.
@@ -343,20 +377,14 @@ def _inject_agent_hooks(cmd):
       custom agent that chooses to honor it.
 
     Shared by spawn() and resume() so both inject identically (AC #6).
-    Never raises: if the claude hooks settings file can't be generated
-    (e.g. a read-only cache dir), that claude-family spawn still starts,
-    just without agentState reporting, the same best-effort spirit as
-    every other degradation in this module.
+    Never raises, and touches no file: everything it returns is built
+    in memory.
     """
     if not cmd:
         return []
     basename = os.path.basename(cmd[0])
     if basename == "claude":
-        try:
-            settings_path = server.ensure_hooks_settings_file()
-        except OSError:
-            return []
-        return ["--settings", settings_path]
+        return ["--settings", json.dumps(server.hooks_settings_payload(), separators=(",", ":"))]
     if basename == "codex":
         return _inject_codex_hooks(cmd[0])
     return []
@@ -386,6 +414,10 @@ def resolve_agent(config, project, task_id, task=None):
     config['defaultAgent'] when there's no assignee, no match, or the
     backlog CLI call fails. Never raises.
 
+    task-171: resume()'s path only. spawn() goes through choose_agent,
+    which refuses rather than guesses; resume re-launches work that is
+    already under way, and must not start refusing it.
+
     `task` is the already-fetched task dict (see _fetch_task) when the
     caller has one on hand -- spawn()/resume() fetch it once for the
     pre-claim Done-status check and pass it through here so this doesn't
@@ -408,26 +440,154 @@ def resolve_agent(config, project, task_id, task=None):
     map through resume_cmd_for_agent rather than widening this
     already-tested 3-value return.
     """
-    agents = config.get("agents") or server.normalize_agents_map(server.DEFAULT_AGENTS)
-    agents_lc = {str(key).lower(): value for key, value in agents.items()}
+    agents_lc = _agents_lc(config)
+    default_agent = _default_agent_name(config, agents_lc)
 
+    if task is None:
+        task = _fetch_task(project, task_id)
+
+    assignee = _first_assignee(task)
+    agent_name = assignee.lower() if assignee and assignee.lower() in agents_lc else default_agent
+    entry = agents_lc[agent_name]
+    return agent_name, list(entry["cmd"]), entry.get("promptSuffix")
+
+
+def _agents_lc(config):
+    """config['agents'] keyed by lower-cased name (agent names match
+    case-insensitively), falling back to a normalized DEFAULT_AGENTS
+    when the map is missing or empty -- see resolve_agent."""
+    agents = config.get("agents") or server.normalize_agents_map(server.DEFAULT_AGENTS)
+    return {str(key).lower(): value for key, value in agents.items()}
+
+
+def _default_agent_name(config, agents_lc):
     default_agent = str(config.get("defaultAgent") or server.DEFAULT_AGENT_NAME).lower()
     if default_agent not in agents_lc:
         default_agent = (
             server.DEFAULT_AGENT_NAME if server.DEFAULT_AGENT_NAME in agents_lc else next(iter(agents_lc))
         )
+    return default_agent
 
-    if task is None:
-        task = _fetch_task(project, task_id)
 
-    assignee = None
+def _first_assignee(task):
+    """The task's first assignee with its leading '@' stripped, or None."""
     assignees = task.get("assignees") or []
-    if assignees:
-        assignee = str(assignees[0]).lstrip("@").strip().lower()
+    if not assignees:
+        return None
+    return str(assignees[0]).lstrip("@").strip() or None
 
-    agent_name = assignee if assignee in agents_lc else default_agent
+
+def require_agent_assignment(config):
+    """task-171: projects.json's requireAgentAssignment, default true (see
+    server.load_config) -- a config dict that never went through
+    load_config (a test's, say) gets the same default."""
+    return config.get("requireAgentAssignment", True) is not False
+
+
+def spawn_agents_summary(config):
+    """task-171: what the spawn control needs to name the agent it is
+    about to launch -- the configured agent names in projects.json order,
+    the effective default, and whether an unresolvable assignee is refused.
+    Carried on GET /api/board as "spawnAgents"."""
+    agents = config.get("agents") or server.normalize_agents_map(server.DEFAULT_AGENTS)
+    return {
+        "names": [str(name) for name in agents],
+        "defaultAgent": _default_agent_name(config, _agents_lc(config)),
+        "required": require_agent_assignment(config),
+    }
+
+
+def validate_requested_agent(config, requested):
+    """The lower-cased configured agent `requested` names, None when no
+    agent was requested, or SpawnError(400) for anything else -- run
+    before any side effect, since an explicit choice that names nothing
+    is a malformed request, not something to fall back from."""
+    if requested is None:
+        return None
+    agents_lc = _agents_lc(config)
+    if not isinstance(requested, str) or requested.lstrip("@").strip().lower() not in agents_lc:
+        raise SpawnError(
+            f"unknown agent: {requested!r} -- configured agents are {_agent_list(agents_lc)}",
+            status=400,
+        )
+    return requested.lstrip("@").strip().lower()
+
+
+def _agent_list(agents_lc):
+    return ", ".join(sorted(agents_lc))
+
+
+def choose_agent(config, task_id, task, requested=None):
+    """task-171: which agent spawn() launches, and whether the claim has
+    to record it. Unlike resolve_agent (still resume's path, which must
+    never start refusing a session already under way), this does not
+    guess:
+
+    1. an explicit `requested` agent (already validated -- see
+       validate_requested_agent) wins: a choice is not a guess;
+    2. else the task's first assignee, when it names a configured agent;
+    3. else, with requireAgentAssignment on (the default), SpawnError
+       409 naming the task, what its assignee was (or that it has none,
+       or that it could not be read) and the agents to choose from;
+    4. else defaultAgent, with a warning saying so.
+
+    `task` is the dict _check_not_done fetched; {} means `backlog task
+    view` failed, which is reported as such rather than as "no assignee".
+
+    Returns (agent_name, argv, prompt_suffix, source, warning), where
+    source is "request", "assignee" or "default" and warning is None
+    unless step 4 applied.
+    """
+    agents_lc = _agents_lc(config)
+    assignee = _first_assignee(task)
+
+    if requested is not None:
+        agent_name, source = requested, "request"
+    elif assignee and assignee.lower() in agents_lc:
+        agent_name, source = assignee.lower(), "assignee"
+    else:
+        if not task:
+            why = f"could not read task {task_id}'s assignee (backlog task view failed)"
+        elif assignee:
+            why = f"task {task_id} is assigned to @{assignee}, which is not a configured agent"
+        else:
+            why = f"task {task_id} has no assignee"
+        if require_agent_assignment(config):
+            raise SpawnError(
+                f"{why}, and requireAgentAssignment is on, so Centrale will not guess which agent "
+                f"to launch. Configured agents: {_agent_list(agents_lc)}. Retry with \"agent\" set "
+                f"to one of them, or assign the task to one first "
+                f"(backlog task edit {task_id} -a @<agent>). Nothing was claimed or created.",
+                status=409,
+            )
+        agent_name, source = _default_agent_name(config, agents_lc), "default"
+        warning = (
+            f"{why}; launched the default agent '{agent_name}' instead "
+            f"(requireAgentAssignment is off)"
+        )
+        entry = agents_lc[agent_name]
+        return agent_name, list(entry["cmd"]), entry.get("promptSuffix"), source, warning
+
     entry = agents_lc[agent_name]
-    return agent_name, list(entry["cmd"]), entry.get("promptSuffix")
+    return agent_name, list(entry["cmd"]), entry.get("promptSuffix"), source, None
+
+
+def assignees_recording(task, agent_name):
+    """task-171: the assignee list the claim writes when the launched
+    agent did not come from the task's own first assignee -- the agent
+    first, then every existing assignee (bar a duplicate of the agent).
+
+    Kept, never replaced: a person's name on a task is a statement
+    Centrale has no business erasing, and a typo'd agent name is
+    indistinguishable from a person's. Put FIRST, because the first
+    assignee is what resolves an agent: appended, the next Re-spawn would
+    refuse again and Resume would silently relaunch the default agent --
+    the very mismatch this records against."""
+    rest = [
+        str(a) for a in (task.get("assignees") or [])
+        if str(a).lstrip("@").strip().lower() != agent_name
+    ]
+    return [f"@{agent_name}", *rest]
 
 
 def _find_project(config, project_name):
@@ -629,9 +789,8 @@ def current_branch(cwd):
     return "HEAD"
 
 
-def _claim_and_commit(project, task_id):
-    """Best-effort: claim the task (status -> "In Progress", existing
-    assignee left alone) and commit any resulting change under backlog/
+def _claim_and_commit(project, task_id, assignees=None):
+    """Best-effort: claim the task (status -> "In Progress") and commit any resulting change under backlog/
     on the project's current branch, before the worktree is cut for it —
     so the worktree's base branch already contains the claim, instead of
     the `backlog` CLI creating a second, divergent copy of the task file
@@ -641,11 +800,19 @@ def _claim_and_commit(project, task_id):
     rather than blocking the spawn. Returns a list of such warnings
     (empty when everything succeeded, including the case where there was
     nothing under backlog/ to commit).
+
+    The assignee is left alone unless `assignees` is given (task-171:
+    the launched agent did not come from it -- see assignees_recording),
+    in which case the same edit replaces the list, so the recorded agent
+    rides in the one backlog/-scoped claim commit below.
     """
     warnings = []
     repo_path = project["path"]
 
-    claim_proc = server.run_backlog_raw(["task", "edit", task_id, "-s", "In Progress"], cwd=repo_path)
+    claim_args = ["task", "edit", task_id, "-s", "In Progress"]
+    for assignee in assignees or []:
+        claim_args += ["-a", assignee]
+    claim_proc = server.run_backlog_raw(claim_args, cwd=repo_path)
     if claim_proc.returncode != 0:
         stderr = (claim_proc.stderr or claim_proc.stdout or "unknown error").strip()
         warnings.append(f"failed to claim {task_id} before spawn: {stderr}")
@@ -664,12 +831,232 @@ def _claim_and_commit(project, task_id):
         warnings.append(f"failed to stage backlog changes before spawn: {stderr}")
         return warnings
 
-    commit_proc = server.run_git(["commit", "-m", f"backlog: claim {task_id} for spawn"], cwd=repo_path)
+    # task-169: scoped to backlog/ exactly as the add above is. A bare
+    # `git commit` commits the WHOLE index, so anything another session
+    # had staged in this checkout was swept into a commit that claims to
+    # be only this task's claim (observed in real use: one "claim" commit
+    # carried 126 files of another task's in-flight evidence). --only
+    # commits these paths and leaves every other staged path staged.
+    commit_proc = server.run_git(
+        ["commit", "--only", "-m", f"backlog: claim {task_id} for spawn", "--", "backlog"],
+        cwd=repo_path,
+    )
     if commit_proc.returncode != 0:
         stderr = (commit_proc.stderr or commit_proc.stdout or "unknown error").strip()
         warnings.append(f"failed to commit backlog claim for {task_id}: {stderr}")
 
     return warnings
+
+
+# ---------------------------------------------------------------------------
+# One writer per spawned task file (task-172)
+# ---------------------------------------------------------------------------
+#
+# While a task is spawned, its task file is edited on the task branch by
+# the agent; an edit to the main checkout's copy at the same time is the
+# conflict that surfaces when the branch is merged. So spawn makes the
+# main checkout's copy read-only (chmod a-w) right after the claim
+# commit. `backlog task edit` then refuses every write to it with EACCES
+# and leaves it untouched, and git status shows nothing -- git tracks
+# the executable bit, never the write bit.
+#
+# The lock is plain filesystem state: nothing records it, and it is read
+# back from the file's mode wherever it matters (the board's
+# taskFileLocked, the stale-lock sweep). A merge of the task branch
+# releases it by itself -- git replaces the file rather than writing into
+# it, and the replacement is writable -- and discard, abandon and
+# cleanup-branch release it explicitly. Not security: an editor can
+# force-write and anyone can chmod it back. It is a guard rail against
+# the CLI and the tools built on it.
+
+TASKS_SUBDIR = os.path.join("backlog", "tasks")
+_WRITE_BITS = 0o222
+
+
+def lock_spawned_task_files(config):
+    """projects.json's lockSpawnedTaskFiles, default true."""
+    return (config or {}).get("lockSpawnedTaskFiles", True) is not False
+
+
+def task_file_path(repo_path, task_id):
+    """The absolute path of `task_id`'s own file under <repo>/backlog/tasks
+    (`task-7 - Some-title.md`), or None when there is no such file or
+    more than one. The filename prefix is Backlog.md's naming convention,
+    the same one harvest._safe_task_path checks; nothing inside the file
+    is read."""
+    tasks_dir = os.path.join(repo_path, TASKS_SUBDIR)
+    prefix = f"{task_id.lower()} - "
+    try:
+        names = os.listdir(tasks_dir)
+    except OSError:
+        return None
+    matches = [n for n in names if n.lower().startswith(prefix) and n.endswith(".md")]
+    if len(matches) != 1:
+        return None
+    return os.path.join(tasks_dir, matches[0])
+
+
+def _is_write_locked(path):
+    return not (os.stat(path).st_mode & _WRITE_BITS)
+
+
+def lock_task_file(repo_path, task_id):
+    """Make the task file read-only. Returns None, or a warning string
+    when it could not be locked (never raises: a spawn goes ahead
+    without the lock, and says so)."""
+    path = task_file_path(repo_path, task_id)
+    if path is None:
+        return f"did not lock {task_id}'s task file: no single backlog/tasks/{task_id.lower()} - *.md in {repo_path}"
+    try:
+        os.chmod(path, os.stat(path).st_mode & ~_WRITE_BITS)
+    except OSError as exc:
+        return f"did not lock {task_id}'s task file {path}: {exc}"
+    return None
+
+
+def unlock_task_file(repo_path, task_id):
+    """Give a locked task file its owner's write bit back. Returns the
+    repo-relative path it unlocked, or None when there was nothing to
+    unlock (no file, or not locked). Never raises."""
+    path = task_file_path(repo_path, task_id)
+    if path is None:
+        return None
+    try:
+        if not _is_write_locked(path):
+            return None
+        os.chmod(path, os.stat(path).st_mode | 0o200)
+    except OSError:
+        return None
+    return os.path.relpath(path, repo_path)
+
+
+def locked_task_files(repo_path):
+    """{task-id-lowercase: absolute path} for every read-only task file
+    under <repo>/backlog/tasks. One listdir and one stat per file."""
+    tasks_dir = os.path.join(repo_path, TASKS_SUBDIR)
+    try:
+        names = os.listdir(tasks_dir)
+    except OSError:
+        return {}
+    locked = {}
+    for name in names:
+        if not name.endswith(".md") or " - " not in name:
+            continue
+        path = os.path.join(tasks_dir, name)
+        try:
+            if _is_write_locked(path):
+                locked[name.split(" - ", 1)[0].lower()] = path
+        except OSError:
+            continue
+    return locked
+
+
+def release_stale_task_locks(config):
+    """Unlock every read-only task file with no task/<id> branch behind
+    it -- a lock whose reason is gone, typically a branch deleted outside
+    Centrale. Run at startup and by --check. Returns one dict per file
+    found: {"project", "taskId", "path", "released": bool, "error"?}."""
+    import harvest  # local import: avoids a circular import at module load
+
+    found = []
+    for project in (config or {}).get("projects", []):
+        repo_path = project.get("path") or ""
+        locked = locked_task_files(repo_path) if os.path.isdir(repo_path) else {}
+        if not locked:
+            continue
+        branches = set(harvest.list_task_branches(repo_path))
+        for task_key, path in sorted(locked.items()):
+            if branch_name(task_key) in branches:
+                continue
+            entry = {
+                "project": project.get("name"),
+                "taskId": task_key.upper(),
+                "path": os.path.relpath(path, repo_path),
+                "released": False,
+            }
+            try:
+                os.chmod(path, os.stat(path).st_mode | 0o200)
+                entry["released"] = True
+            except OSError as exc:
+                entry["error"] = str(exc)
+            found.append(entry)
+    return found
+
+
+def commit_ruling(config, project, task_id, sender, text):
+    """POST /api/rule's no-agent case (task-172): write the ruling as a
+    comment authored by `sender` into the Centrale worktree's copy of the
+    task file, through the CLI, and commit it on the task branch scoped
+    to that one file (task-169: never the whole index). The caller holds
+    the task's lifecycle lock and has checked no session is live.
+
+    Returns {"branch", "worktree", "path", "commit"}. Raises SpawnError:
+    409 when there is no Centrale worktree to write into (no branch, a
+    parked branch, or one checked out outside Centrale) or the worktree's
+    copy of the task file already has uncommitted edits -- a commit
+    labelled as a ruling must carry only the ruling; 502 when the
+    backlog/git step fails."""
+    repo_path = project["path"]
+    branch = branch_name(task_id)
+    if not _branch_exists(repo_path, branch):
+        raise SpawnError(
+            f"{task_id} is not spawned: there is no {branch} branch, so its task file is not "
+            "locked -- edit it on the board directly",
+            status=409,
+        )
+    state = checkout_state(config, project, task_id)
+    wt_dir = worktree_dir(config, project["name"], task_id)
+    if state["kind"] == "external":
+        raise SpawnError(external_checkout_reason(branch, state["path"]), status=409)
+    if state["kind"] != "centrale" or not os.path.isdir(wt_dir):
+        raise SpawnError(
+            f"{branch} is checked out nowhere (a parked branch), so there is no worktree to "
+            f"write the ruling into; its task file is not locked in the main checkout -- "
+            f"resume the task, or edit it there",
+            status=409,
+        )
+
+    path = task_file_path(wt_dir, task_id)
+    if path is None:
+        raise SpawnError(f"no single task file for {task_id} in {wt_dir}", status=409)
+    rel = os.path.relpath(path, wt_dir)
+
+    status_proc = server.run_git(["status", "--porcelain", "--", rel], cwd=wt_dir)
+    if status_proc.returncode != 0:
+        stderr = (status_proc.stderr or status_proc.stdout or "unknown error").strip()
+        raise SpawnError(f"failed to check {rel} in {wt_dir}: {stderr}", status=502)
+    if (status_proc.stdout or "").strip():
+        raise SpawnError(
+            f"{rel} has uncommitted edits in {wt_dir}; a ruling commit must carry only the "
+            "ruling -- resume the task (the agent then receives the ruling), or commit them first",
+            status=409,
+        )
+
+    edit_proc = server.run_backlog_raw(
+        ["task", "edit", task_id, "--comment", text, "--comment-author", sender.strip()], cwd=wt_dir
+    )
+    if edit_proc.returncode != 0:
+        stderr = (edit_proc.stderr or edit_proc.stdout or "unknown error").strip()
+        raise SpawnError(f"failed to write the ruling on {task_id}: {stderr}", status=502)
+
+    add_proc = server.run_git(["add", "--", rel], cwd=wt_dir)
+    if add_proc.returncode != 0:
+        stderr = (add_proc.stderr or add_proc.stdout or "unknown error").strip()
+        raise SpawnError(f"the ruling was written but staging {rel} failed: {stderr}", status=502)
+    commit_proc = server.run_git(
+        ["commit", "--only", "-m", f"backlog: ruling on {task_id} from {sender.strip()}", "--", rel],
+        cwd=wt_dir,
+    )
+    if commit_proc.returncode != 0:
+        stderr = (commit_proc.stderr or commit_proc.stdout or "unknown error").strip()
+        raise SpawnError(f"the ruling was written but committing {rel} failed: {stderr}", status=502)
+    sha_proc = server.run_git(["rev-parse", "HEAD"], cwd=wt_dir)
+    return {
+        "branch": branch,
+        "worktree": wt_dir,
+        "path": rel,
+        "commit": (sha_proc.stdout or "").strip() if sha_proc.returncode == 0 else None,
+    }
 
 
 def _repo_relative_worktree_root(repo_path, worktree_root):
@@ -720,7 +1107,67 @@ def _ensure_worktree_root_excluded(repo_path, worktree_root):
         pass
 
 
-def _ensure_worktree(config, project, task_id):
+def _link_worktree_paths(project, wt_dir):
+    """Link configured main-checkout paths only after git ignores them.
+
+    Exclude entries have no trailing slash: the destination is a symlink,
+    even when the source is a directory. Never overwrite checkout content
+    or traverse a checkout's symlinked parent (task-177). Failures warn and
+    skip that link, so no failure can leave an unprotected link behind.
+    """
+    paths = project.get("worktreeLinks") or []
+    if not paths:
+        return []
+    repo_path = os.path.abspath(project["path"])
+    warnings = []
+    for relative in paths:
+        try:
+            source = os.path.join(repo_path, relative)
+            dest = os.path.join(wt_dir, relative)
+            if not os.path.exists(source):
+                raise OSError(f"source path is missing: {source}")
+            # An ignored path already in the index is still committable.
+            tracked = server.run_git(["ls-files", "-z", "--", f":(literal){relative}"], cwd=wt_dir)
+            if tracked.returncode != 0 or tracked.stdout:
+                raise OSError("destination is tracked or git could not verify it is untracked")
+            parent = wt_dir
+            for part in relative.split("/")[:-1]:
+                parent = os.path.join(parent, part)
+                if os.path.islink(parent):
+                    raise OSError(f"destination parent is a symlink: {parent}")
+            if os.path.lexists(dest):
+                raise OSError(f"destination already exists: {dest}")
+
+            # --git-path resolves the common info/exclude even when the
+            # configured checkout itself has a .git *file*.
+            proc = server.run_git(["rev-parse", "--git-path", "info/exclude"], cwd=repo_path)
+            if proc.returncode != 0 or not (proc.stdout or "").strip():
+                raise OSError("could not locate git info/exclude")
+            exclude = os.path.join(repo_path, proc.stdout.strip())
+            entry = "/" + relative
+            try:
+                with open(exclude, encoding="utf-8") as f:
+                    existing = f.read()
+            except FileNotFoundError:
+                existing = ""
+            if entry not in existing.splitlines():
+                os.makedirs(os.path.dirname(exclude), exist_ok=True)
+                with open(exclude, "a", encoding="utf-8") as f:
+                    if existing and not existing.endswith("\n"):
+                        f.write("\n")
+                    f.write(entry + "\n")
+            # A higher-precedence .gitignore can negate info/exclude.
+            ignored = server.run_git(["check-ignore", "--quiet", "--", relative], cwd=wt_dir)
+            if ignored.returncode != 0:
+                raise OSError("git info/exclude is overridden or could not be verified")
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            os.symlink(source, dest, target_is_directory=os.path.isdir(source))
+        except (OSError, server.BacklogError) as exc:
+            warnings.append(f"worktreeLinks {relative}: skipped link: {exc}")
+    return warnings
+
+
+def _ensure_worktree(config, project, task_id, warnings=None):
     """Create (or reuse) the git worktree for this project+task. Returns
     the worktree directory path. Raises SpawnError(status=500) on an
     unexpected git failure."""
@@ -753,6 +1200,9 @@ def _ensure_worktree(config, project, task_id):
         stderr = (proc.stderr or proc.stdout or "git worktree add failed").strip()
         raise SpawnError(f"git worktree add failed: {stderr}", status=500)
 
+    link_warnings = _link_worktree_paths(project, wt_dir)
+    if warnings is not None:
+        warnings.extend(link_warnings)
     return wt_dir
 
 
@@ -818,6 +1268,17 @@ def _validate_and_check_session(config, project_name, task_id):
 
     if name in {s.get("name") for s in existing}:
         raise SpawnError(f"session already exists: {name}", status=409)
+
+    cap = project.get("maxAgents")
+    if cap is not None:
+        live = server.live_sessions_for_project(project_name, config, sessions=existing)
+        if len(live) >= cap:
+            raise SpawnError(
+                f"Project {project_name} has {len(live)} live agent sessions "
+                f"(maxAgents: {cap}): {', '.join(sorted(live))}. "
+                "End a session before launching another agent.",
+                status=409,
+            )
 
     return project, name
 
@@ -890,7 +1351,8 @@ def hold_session_geometry(name):
     server.run_tmux(["resize-window", "-t", target, "-x", str(columns), "-y", str(rows)])
 
 
-def spawn(config, project_name, task_id):
+@_serialize_project_launch
+def spawn(config, project_name, task_id, agent=None):
     """Refuses a task whose status is Done with a 409 (see
     _check_not_done), before any side effect. Otherwise claims the task
     and commits that claim (see _claim_and_commit), creates/reuses a
@@ -905,13 +1367,21 @@ def spawn(config, project_name, task_id):
     and the Done-status check, when CENTRALE_SPAWN_CMD is set (see
     spawn_cmd).
 
+    task-171: the agent is chosen by choose_agent -- `agent` (the
+    request's explicit choice) first, then the task's first assignee --
+    and an unresolvable one is refused with a 409 before any side effect
+    unless requireAgentAssignment is off. When the launched agent did not
+    come from the assignee, the claim records it (assignees_recording).
+
     Returns {"session": <name>, "attach": "tmux attach -t <name>",
     "agent": <name>}, plus a "warnings" list of human-readable strings if
-    the claim/commit step hit a problem (it never blocks the spawn).
-    Raises SpawnError on any failure; never raises anything else and
-    never touches git/tmux until project + taskId are validated.
+    the claim/commit step hit a problem (it never blocks the spawn) or
+    the default agent was fallen back to. Raises SpawnError on any
+    failure; never raises anything else and never touches git/tmux until
+    project + taskId (and any requested agent) are validated.
     """
     project, name = _validate_and_check_session(config, project_name, task_id)
+    requested = validate_requested_agent(config, agent)
 
     # CENTRALE_SPAWN_CMD overrides everything, including assignee-driven
     # agent selection, so we never call out to `backlog task view` (and
@@ -929,23 +1399,54 @@ def spawn(config, project_name, task_id):
     # commits anything on the base branch.
     _check_not_checked_out_externally(config, project, task_id)
 
-    # Claim the task and commit that claim on the base branch *before*
-    # cutting the worktree, so the worktree's branch point already
-    # contains it (see _claim_and_commit) — this runs even under the
-    # CENTRALE_SPAWN_CMD override, which only replaces the launched
-    # command, not this workflow step.
-    warnings = _claim_and_commit(project, task_id)
-
-    wt_dir = _ensure_worktree(config, project, task_id)
-
+    # task-171: the agent is chosen before any side effect too, so a
+    # refusal leaves nothing claimed, committed or created.
+    choice_warning = None
+    recorded_assignees = None
     if spawn_cmd_override():
         cmd = spawn_cmd()
         agent_name = None
         agent_kind = None
         prompt_suffix = None
     else:
-        agent_name, cmd, prompt_suffix = resolve_agent(config, project, task_id, task=task)
+        agent_name, cmd, prompt_suffix, source, choice_warning = choose_agent(
+            config, task_id, task, requested=requested
+        )
         agent_kind = agent_kind_for_command(cmd)
+        # A task whose first assignee already resolves keeps it, even
+        # when an explicit choice overrides it for this launch. A task
+        # that could not be read has assignees nobody can see, and
+        # `-a` replaces the list -- so nothing is recorded, and it says so.
+        assignee = _first_assignee(task)
+        if source != "assignee" and not (assignee and assignee.lower() in _agents_lc(config)):
+            if task:
+                recorded_assignees = assignees_recording(task, agent_name)
+            else:
+                choice_warning = "; ".join(filter(None, [
+                    choice_warning,
+                    f"did not record @{agent_name} as {task_id}'s assignee: its current assignees "
+                    f"could not be read, and recording would overwrite them",
+                ]))
+
+    # Claim the task and commit that claim on the base branch *before*
+    # cutting the worktree, so the worktree's branch point already
+    # contains it (see _claim_and_commit) — this runs even under the
+    # CENTRALE_SPAWN_CMD override, which only replaces the launched
+    # command, not this workflow step.
+    #
+    # task-172: a respawn finds the file still locked from the first
+    # spawn, and the claim has to write it -- so it is unlocked for the
+    # claim and (with lockSpawnedTaskFiles on) locked again right after.
+    unlock_task_file(project["path"], task_id)
+    warnings = _claim_and_commit(project, task_id, assignees=recorded_assignees)
+    if lock_spawned_task_files(config):
+        lock_warning = lock_task_file(project["path"], task_id)
+        if lock_warning:
+            warnings.append(lock_warning)
+    if choice_warning:
+        warnings.insert(0, choice_warning)
+
+    wt_dir = _ensure_worktree(config, project, task_id, warnings=warnings)
 
     prompt = prompt_for(task_id, config)
     if prompt_suffix:
@@ -1065,6 +1566,7 @@ def reconcile_prompt_for(task_id, base_branch, check_command=None, resumed=False
     )
 
 
+@_serialize_project_launch
 def resume(config, project_name, task_id, reconcile=False):
     """Refuses a task whose status is Done with a 409 (see
     _check_not_done), same as spawn(), before the worktree is touched --
@@ -1142,7 +1644,8 @@ def resume(config, project_name, task_id, reconcile=False):
     # resume into and git would refuse the second checkout anyway.
     _check_not_checked_out_externally(config, project, task_id)
 
-    wt_dir = _ensure_worktree(config, project, task_id)
+    warnings = []
+    wt_dir = _ensure_worktree(config, project, task_id, warnings=warnings)
 
     # task-133: the reconcile prompt comes in two framings -- `resumed`
     # for a continued conversation (tiers 1 and 2 below), the plain one
@@ -1225,4 +1728,6 @@ def resume(config, project_name, task_id, reconcile=False):
     }
     if reconcile:
         result["reconcile"] = True
+    if warnings:
+        result["warnings"] = warnings
     return result

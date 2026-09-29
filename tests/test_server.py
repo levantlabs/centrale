@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import harvest  # noqa: E402
 import server  # noqa: E402
+import spawn  # noqa: E402
 import version  # noqa: E402
 
 # task-108: the frontend contract tests below assert on SOURCE TEXT, and
@@ -74,6 +75,48 @@ def make_config(projects):
 
 
 class ConfigLoadingTests(unittest.TestCase):
+    def test_project_spawn_settings_default_and_load(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fixture:
+            json.dump({"projects": [
+                {"name": "plain", "path": "/repos/plain"},
+                {"name": "configured", "path": "/repos/configured", "maxAgents": 4,
+                 "worktreeLinks": [".venv", "build/cache"]},
+            ]}, fixture)
+            path = fixture.name
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        plain, configured = server.load_config(path=path)["projects"]
+        self.assertIsNone(plain["maxAgents"])
+        self.assertEqual(plain["worktreeLinks"], [])
+        self.assertEqual(configured["maxAgents"], 4)
+        self.assertEqual(configured["worktreeLinks"], [".venv", "build/cache"])
+
+    def test_project_spawn_settings_reject_unsafe_values_on_load(self):
+        bad_settings = [
+            ("maxAgents", True), ("maxAgents", 0), ("maxAgents", -1),
+            ("maxAgents", 1.5), ("maxAgents", "4"),
+            ("worktreeLinks", "src"), ("worktreeLinks", ["/absolute"]),
+            ("worktreeLinks", ["C:/absolute"]),
+            ("worktreeLinks", ["../escape"]), ("worktreeLinks", ["a/../b"]),
+            ("worktreeLinks", [".git/config"]), ("worktreeLinks", ["a//b"]),
+            ("worktreeLinks", ["a\\b"]), ("worktreeLinks", ["a\nlink"]),
+            ("worktreeLinks", ["a\tlink"]),
+            ("worktreeLinks", ["a*link"]), ("worktreeLinks", ["!a"]),
+            ("worktreeLinks", ["#a"]), ("worktreeLinks", ["a "]),
+            ("worktreeLinks", ["a", "a/b"]),
+            ("worktreeLinks", ["a", "a"]),
+        ]
+        for key, value in bad_settings:
+            with self.subTest(key=key, value=value):
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fixture:
+                    json.dump({"projects": [{"name": "app", "path": "/repos/app", key: value}]}, fixture)
+                    path = fixture.name
+                try:
+                    with self.assertRaises(server.ConfigError) as ctx:
+                        server.load_config(path=path)
+                    self.assertIn(f"projects.app.{key}", str(ctx.exception))
+                finally:
+                    os.unlink(path)
+
     def test_defaults_when_file_missing(self):
         config = server.load_config(path="/nonexistent/projects.json")
         self.assertEqual(config["port"], 7420)
@@ -457,6 +500,38 @@ class ConfigLoadingTests(unittest.TestCase):
         finally:
             os.remove(tmp_path)
         self.assertEqual(config["harvest"], {"mode": "click"})
+
+    def test_load_config_require_agent_assignment_is_off_only_when_explicitly_false(self):
+        # task-171: a malformed value must not quietly turn the guard off.
+        tmp_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "fixtures", "_tmp_projects_require_agent.json"
+        )
+        cases = [({}, True), ({"requireAgentAssignment": "no"}, True), ({"requireAgentAssignment": False}, False)]
+        for extra, expected in cases:
+            with self.subTest(extra=extra):
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump({"projects": [], **extra}, f)
+                try:
+                    config = server.load_config(path=tmp_path)
+                finally:
+                    os.remove(tmp_path)
+                self.assertIs(config["requireAgentAssignment"], expected)
+
+    def test_load_config_lock_spawned_task_files_is_off_only_when_explicitly_false(self):
+        # task-172: the same rule as requireAgentAssignment.
+        tmp_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "fixtures", "_tmp_projects_lock_files.json"
+        )
+        cases = [({}, True), ({"lockSpawnedTaskFiles": 0}, True), ({"lockSpawnedTaskFiles": False}, False)]
+        for extra, expected in cases:
+            with self.subTest(extra=extra):
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump({"projects": [], **extra}, f)
+                try:
+                    config = server.load_config(path=tmp_path)
+                finally:
+                    os.remove(tmp_path)
+                self.assertIs(config["lockSpawnedTaskFiles"], expected)
 
     def test_load_config_reads_explicit_harvest_mode(self):
         tmp_path = os.path.join(
@@ -1174,6 +1249,29 @@ class BoardAggregationTests(unittest.TestCase):
         self.assertIsNone(by_id["TASK-1"]["lastDiscardedAt"])
         self.assertIsNone(by_id["TASK-4"]["lastDiscardedAt"])
 
+    def test_task_file_locked_is_read_from_the_task_files_modes(self):
+        # task-172: a read-only task file in the checkout is a locked
+        # one. Derived on every load from the files themselves -- a real
+        # directory here, with realistic spaced Backlog.md filenames.
+        with tempfile.TemporaryDirectory() as repo:
+            tasks_dir = os.path.join(repo, "backlog", "tasks")
+            os.makedirs(tasks_dir)
+            for name, mode in (("task-2 - Fix-the-thing.md", 0o444),
+                               ("task-3 - Another-thing.md", 0o644),
+                               ("task-22 - Near-miss.md", 0o444)):
+                path = os.path.join(tasks_dir, name)
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("x\n")
+                os.chmod(path, mode)
+            self.my_app_dir, saved = repo, self.my_app_dir
+            try:
+                by_id = self._board_with_tags("")
+            finally:
+                self.my_app_dir = saved
+        self.assertIs(by_id["TASK-2"]["taskFileLocked"], True)
+        self.assertIs(by_id["TASK-3"]["taskFileLocked"], False)
+        self.assertIs(by_id["TASK-1"]["taskFileLocked"], False)  # no file at all
+
     def test_last_discarded_at_is_none_on_every_task_when_the_repo_has_no_such_tags(self):
         by_id = self._board_with_tags("")
         self.assertTrue(len(by_id) > 0)
@@ -1776,6 +1874,23 @@ def git_proc(args, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(["git", *args], returncode, stdout, stderr)
 
 
+def _wait_until_cwd(pid, expected_dir, timeout=5):
+    """Polls /proc/<pid>/cwd until it resolves to `expected_dir` (real-
+    pathed) or raises -- a Popen(cwd=...) child's own chdir is not
+    guaranteed visible in /proc the instant the constructor returns, so
+    task-201's cwd-scan tests wait for it rather than racing it."""
+    expected = os.path.realpath(expected_dir)
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            if os.readlink(f"/proc/{pid}/cwd") == expected:
+                return
+        except OSError:
+            pass
+        time.sleep(0.02)
+    raise AssertionError(f"pid {pid} cwd never became {expected!r}")
+
+
 class RecoveryTagRoundTripTests(unittest.TestCase):
     """task-134: reading a discard back out of the tag a discard wrote.
 
@@ -2148,11 +2263,13 @@ class AgentEventStoreTests(unittest.TestCase):
         self.assertEqual(server.get_agent_state("my-app", "TASK-2"), "idle")
         self.assertEqual(server.get_agent_kind("my-app", "TASK-2"), "codex")
 
-    def test_codex_working_and_permission_waiting_are_unchanged(self):
-        for state in ("working", "waiting"):
-            with self.subTest(state=state):
-                server.record_agent_event("my-app", "TASK-2", state, agent_kind="codex")
-                self.assertEqual(server.get_agent_state("my-app", "TASK-2"), state)
+    def test_codex_permission_review_remains_working_until_confirmed(self):
+        # Never let a paused/slow unit run reach the real tmux boundary.
+        with mock.patch.object(server, "_agent_wait_timer"):
+            for state in ("working", "waiting"):
+                with self.subTest(state=state):
+                    server.record_agent_event("my-app", "TASK-2", state, agent_kind="codex")
+                    self.assertEqual(server.get_agent_state("my-app", "TASK-2"), "working")
 
     def test_claude_states_including_finished_are_unchanged(self):
         for state in server.AGENT_STATES:
@@ -2215,40 +2332,17 @@ class AgentEventStoreTests(unittest.TestCase):
         self.assertEqual(server.get_agent_state("my-app", "TASK-2"), "unknown")
 
 
-class HooksSettingsFileTests(unittest.TestCase):
-    """Hermetic tests for the generated Claude Code hooks settings file
-    (task-37): real file I/O against an isolated temp cache dir (never
-    the real ~/.cache/centrale), same pattern test_spawn.py's
-    GitExcludeIdempotenceTests uses for its own real-file-I/O case."""
-
-    def setUp(self):
-        import tempfile
-        self.tmp_dir = tempfile.mkdtemp(prefix="centrale-test-cache-")
-        self.addCleanup(self._cleanup)
-        self.settings_path = os.path.join(self.tmp_dir, "hooks-settings.json")
-        self.path_patch = mock.patch.object(server, "hooks_settings_path", return_value=self.settings_path)
-        self.path_patch.start()
-        self.addCleanup(self.path_patch.stop)
-
-    def _cleanup(self):
-        import shutil
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
+class HooksSettingsPayloadTests(unittest.TestCase):
+    """The Claude Code settings every claude-family spawn/resume gets
+    inline via --settings (task-37, inline since task-173)."""
 
     def test_notify_script_path_points_at_the_real_repo_root_helper(self):
         path = server.notify_script_path()
         self.assertEqual(os.path.basename(path), "centrale_notify.py")
         self.assertTrue(os.path.isfile(path), f"expected {path} to exist")
 
-    def test_creates_the_cache_dir_and_writes_the_file(self):
-        returned = server.ensure_hooks_settings_file()
-        self.assertEqual(returned, self.settings_path)
-        self.assertTrue(os.path.isfile(self.settings_path))
-
     def test_payload_maps_each_hook_point_to_the_right_state(self):
-        server.ensure_hooks_settings_file()
-        with open(self.settings_path, "r", encoding="utf-8") as f:
-            payload = json.load(f)
-
+        payload = server.hooks_settings_payload()
         notify = server.notify_script_path()
 
         def command_for(hook_name):
@@ -2259,15 +2353,16 @@ class HooksSettingsFileTests(unittest.TestCase):
         self.assertEqual(command_for("Notification"), f"python3 {notify} waiting")
         self.assertEqual(command_for("Stop"), f"python3 {notify} finished")
 
-    def test_second_call_overwrites_the_first_atomically(self):
-        server.ensure_hooks_settings_file()
-        first_mtime = os.stat(self.settings_path).st_mtime_ns
-        server.ensure_hooks_settings_file()
-        self.assertTrue(os.path.isfile(self.settings_path))
-        # Still exactly one file -- no stray .tmp left behind.
-        self.assertEqual(os.listdir(self.tmp_dir), ["hooks-settings.json"])
-        second_mtime = os.stat(self.settings_path).st_mtime_ns
-        self.assertGreaterEqual(second_mtime, first_mtime)
+    def test_payload_suppresses_auto_mode_setup_and_accepts_cross_session_messages(self):
+        # task-170.1: spawned agents never get the "Teach auto mode"
+        # offer, and the owner ruled orchestrator messages are delivered.
+        payload = server.hooks_settings_payload()
+        self.assertEqual(payload["skillOverrides"], {"auto-mode-setup": "off"})
+        self.assertEqual(payload["crossSessionInbound"], "accept")
+
+    def test_payload_is_json_serializable(self):
+        payload = server.hooks_settings_payload()
+        self.assertEqual(json.loads(json.dumps(payload)), payload)
 
 
 class CodexHooksOverridesTests(unittest.TestCase):
@@ -2275,18 +2370,18 @@ class CodexHooksOverridesTests(unittest.TestCase):
     codex's project config layer resolves through a linked worktree's
     `.git` FILE to the main repo root, so the hooks.json file task-42
     used to write into the worktree was never actually discovered in
-    the environment centrale spawns into -- these four -c inline config
+    the environment centrale spawns into -- these -c inline config
     overrides replace it. Pure/no I/O, so nothing here needs mocking;
     each value is verified to be real, parseable TOML (via the stdlib
     tomllib) carrying the exact schema codex's own hooks.json expects."""
 
-    def test_returns_four_dash_c_pairs_in_the_documented_order(self):
+    def test_returns_hook_overrides_including_tool_completion(self):
         overrides = server.codex_hooks_overrides()
-        self.assertEqual(len(overrides), 8)
+        self.assertEqual(len(overrides), 10)
         flags = overrides[0::2]
-        self.assertEqual(flags, ["-c"] * 4)
+        self.assertEqual(flags, ["-c"] * 5)
         points = [value.split("=", 1)[0] for value in overrides[1::2]]
-        self.assertEqual(points, ["hooks.UserPromptSubmit", "hooks.PreToolUse", "hooks.PermissionRequest", "hooks.Stop"])
+        self.assertEqual(points, ["hooks.UserPromptSubmit", "hooks.PreToolUse", "hooks.PermissionRequest", "hooks.PostToolUse", "hooks.Stop"])
 
     def test_each_override_value_is_valid_toml_matching_codexs_schema(self):
         import tomllib
@@ -2297,6 +2392,7 @@ class CodexHooksOverridesTests(unittest.TestCase):
             "UserPromptSubmit": "working",
             "PreToolUse": "working",
             "PermissionRequest": "waiting",
+            "PostToolUse": "working",
             "Stop": "finished",
         }
         for value in overrides[1::2]:
@@ -2335,7 +2431,7 @@ class ProbeCodexHookTrustTests(unittest.TestCase):
     """Hermetic tests for server.probe_codex_hook_trust (task-42, added on
     review): real feature-detection of codex's
     --dangerously-bypass-hook-trust flag via `<binary> --help`, gating
-    whether spawn.py's codex branch ever appends the four inline hooks
+    whether spawn.py's codex branch ever appends the inline hooks
     overrides and the trust flag at all (task-44) -- an older codex
     doesn't recognize the flag and would reject the whole argv at
     startup if it were appended blindly. server._run is mocked
@@ -2779,6 +2875,65 @@ class ProcessCmdlineTests(unittest.TestCase):
         self.assertIn("python", cmdline.lower())
 
 
+@unittest.skipUnless(sys.platform.startswith("linux"), "procfs is Linux-only")
+class PidsWithCwdUnderTests(unittest.TestCase):
+    """task-201: the /proc-cwd finder both /api/end-session and
+    /api/cleanup-branch use to find a worktree's orphaned processes.
+    Real child processes throughout -- this scans actual /proc entries,
+    so a mock would only prove the mock was consistent with itself."""
+
+    def _spawn_sleeping(self, cwd):
+        proc = subprocess.Popen(["sleep", "300"], cwd=cwd)
+        self.addCleanup(lambda: proc.poll() is None and (proc.kill(), proc.wait(timeout=5)))
+        _wait_until_cwd(proc.pid, cwd)
+        return proc
+
+    def test_finds_a_pid_whose_cwd_is_exactly_the_directory(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = self._spawn_sleeping(d)
+            self.assertEqual(server._pids_with_cwd_under(d), [proc.pid])
+
+    def test_finds_a_pid_whose_cwd_is_a_subdirectory(self):
+        with tempfile.TemporaryDirectory() as d:
+            sub = os.path.join(d, "sub")
+            os.mkdir(sub)
+            proc = self._spawn_sleeping(sub)
+            self.assertEqual(server._pids_with_cwd_under(d), [proc.pid])
+
+    def test_does_not_match_a_sibling_directory(self):
+        with tempfile.TemporaryDirectory() as parent:
+            target = os.path.join(parent, "target")
+            sibling = os.path.join(parent, "target-sibling")
+            os.mkdir(target)
+            os.mkdir(sibling)
+            proc = self._spawn_sleeping(sibling)
+            self.assertEqual(server._pids_with_cwd_under(target), [])
+            # Confirms this isn't a bare string-prefix bug ("target" is a
+            # literal prefix of "target-sibling" without the separator).
+            self.assertNotIn(proc.pid, server._pids_with_cwd_under(target))
+
+    def test_still_matches_after_the_directory_itself_is_removed(self):
+        # /proc/<pid>/cwd keeps naming the original path with a trailing
+        # " (deleted)" once the directory is unlinked out from under a
+        # process still holding it as cwd -- exactly what `git worktree
+        # remove` does to a vitest worker pool it didn't know was there.
+        d = tempfile.mkdtemp()
+        proc = self._spawn_sleeping(d)
+        shutil.rmtree(d)
+        self.assertEqual(server._pids_with_cwd_under(d), [proc.pid])
+
+    def test_returns_empty_list_without_proc(self):
+        with mock.patch("os.path.isdir", return_value=False):
+            self.assertEqual(server._pids_with_cwd_under("/anything"), [])
+
+    def test_kill_pids_with_cwd_under_signals_and_returns_the_found_pids(self):
+        with tempfile.TemporaryDirectory() as d:
+            proc = self._spawn_sleeping(d)
+            killed = server.kill_pids_with_cwd_under(d)
+            self.assertEqual(killed, [proc.pid])
+            proc.wait(timeout=5)  # raises TimeoutExpired if it's still alive
+
+
 class TerminateHandlerTests(unittest.TestCase):
     """Task-27: SIGTERM must trigger the same cleanup as a normal exit
     (atexit hooks -- browser.py's launched-child terminator among them --
@@ -3114,6 +3269,17 @@ class HttpApiTests(unittest.TestCase):
             status, body = self._get("/api/board?force=1")
         self.assertEqual(status, 200)
         self.assertEqual(body["harvestMode"], "click")
+
+    def test_api_board_carries_the_spawn_agents_summary(self):
+        # task-171: the spawn control names the agent before the click and
+        # offers a picker from this, without a call of its own.
+        with mock.patch.object(server, "run_backlog", return_value=load_fixture("my_app_list.json")), \
+             mock.patch.object(server, "run_git", return_value=git_proc([], 0, "", "")):
+            status, body = self._get("/api/board?force=1")
+        self.assertEqual(status, 200)
+        self.assertEqual(
+            body["spawnAgents"], {"names": ["claude", "codex"], "defaultAgent": "claude", "required": True}
+        )
 
     def test_api_board_reflects_configured_harvest_mode(self):
         self.config["harvest"] = {"mode": "auto"}
@@ -3607,7 +3773,7 @@ class HttpApiTests(unittest.TestCase):
             status, body = self._post_json("/api/end-session", {"project": "my-app", "taskId": "TASK-9"})
 
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"ok": True, "session": "centrale-my-app-task-9"})
+        self.assertEqual(body, {"ok": True, "session": "centrale-my-app-task-9", "killedOrphans": []})
         # The leading "=" forces exact-name matching -- tmux -t otherwise
         # prefix-matches, which could kill an unrelated session.
         self.assertEqual(kill_calls, [["kill-session", "-t", "=centrale-my-app-task-9"]])
@@ -3685,7 +3851,9 @@ class HttpApiTests(unittest.TestCase):
             status, body = self._post_json("/api/end-session", {"project": "my-app", "taskId": "TASK-11.2"})
 
         self.assertEqual(status, 200)
-        self.assertEqual(body, {"ok": True, "session": "centrale-my-app-task-11_2"})
+        self.assertEqual(
+            body, {"ok": True, "session": "centrale-my-app-task-11_2", "killedOrphans": []}
+        )
         self.assertEqual(kill_calls, [["kill-session", "-t", "=centrale-my-app-task-11_2"]])
 
     def test_post_end_session_kill_failure_returns_500(self):
@@ -3701,6 +3869,43 @@ class HttpApiTests(unittest.TestCase):
 
         self.assertEqual(status, 500)
         self.assertIn("error", body)
+
+    def test_post_end_session_kills_orphaned_process_under_the_worktree_and_spares_unrelated_ones(self):
+        # task-201: `tmux kill-session` alone does not stop a vite/vitest
+        # process the agent started -- it survives as an orphan, still
+        # cwd'd in the worktree, for as long as the machine is up. Real
+        # child processes (not mocks) prove the actual /proc cwd scan
+        # finds the one under the worktree and leaves an unrelated one,
+        # elsewhere, alone.
+        list_stdout = "centrale-my-app-task-9\t1690000000\t1\n"
+
+        def fake_run_tmux(args):
+            if args[0] == "list-sessions":
+                return subprocess.CompletedProcess(["tmux", *args], 0, list_stdout, "")
+            return subprocess.CompletedProcess(["tmux", *args], 0, "", "")
+
+        with tempfile.TemporaryDirectory() as wt_dir, tempfile.TemporaryDirectory() as elsewhere:
+            orphan = subprocess.Popen(["sleep", "300"], cwd=wt_dir)
+            unrelated = subprocess.Popen(["sleep", "300"], cwd=elsewhere)
+            try:
+                _wait_until_cwd(orphan.pid, wt_dir)
+                _wait_until_cwd(unrelated.pid, elsewhere)
+
+                with mock.patch.object(server, "run_tmux", side_effect=fake_run_tmux), \
+                     mock.patch.object(spawn, "worktree_dir", return_value=wt_dir):
+                    status, body = self._post_json(
+                        "/api/end-session", {"project": "my-app", "taskId": "TASK-9"}
+                    )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(body["killedOrphans"], [orphan.pid])
+                orphan.wait(timeout=5)  # raises TimeoutExpired if still alive
+                self.assertIsNone(unrelated.poll(), "unrelated process must survive")
+            finally:
+                for proc in (orphan, unrelated):
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
 
     # -- /api/session-pane (task-60) -------------------------------------
 
@@ -4315,6 +4520,88 @@ class HttpApiTests(unittest.TestCase):
 
         self.assertEqual(status, 200)
         self.assertEqual(body["discardedPaths"], [])
+
+    def _fake_run_git_no_branch(self, args, cwd=None):
+        # Branch existence check (rev-parse) fails -> branch_exists is
+        # False, so the merge/external-checkout gates never run and the
+        # worktree-removal path (where the orphan-process check lives)
+        # is reached directly.
+        if args[:1] == ["rev-parse"]:
+            return git_proc(args, 1, "", "")
+        if args[:1] == ["status"]:
+            return git_proc(args, 0, "", "")
+        return git_proc(args, 0, "", "")
+
+    def test_post_cleanup_branch_refuses_naming_pids_while_a_process_has_cwd_under_the_worktree(self):
+        # task-201: cleanup-branch used to remove the worktree directory
+        # out from under a still-running vite/vitest process without
+        # noticing -- proven here with a real child process, not a mock,
+        # since what's under test is the actual /proc cwd scan.
+        with tempfile.TemporaryDirectory() as wt_dir:
+            orphan = subprocess.Popen(["sleep", "300"], cwd=wt_dir)
+            try:
+                _wait_until_cwd(orphan.pid, wt_dir)
+
+                with mock.patch.object(server, "run_tmux", side_effect=self._no_live_sessions_run_tmux), \
+                     mock.patch.object(server, "run_git", side_effect=self._fake_run_git_no_branch), \
+                     mock.patch.object(spawn, "worktree_dir", return_value=wt_dir):
+                    status, body = self._post_json(
+                        "/api/cleanup-branch", {"project": "my-app", "taskId": "TASK-9"}
+                    )
+
+                self.assertEqual(status, 409)
+                self.assertIn(str(orphan.pid), body["error"])
+                self.assertTrue(os.path.isdir(wt_dir), "refusal must not remove the worktree")
+                self.assertIsNone(orphan.poll(), "the refused process must not be killed")
+            finally:
+                orphan.kill()
+                orphan.wait(timeout=5)
+
+    def test_post_cleanup_branch_succeeds_once_the_process_is_gone(self):
+        with tempfile.TemporaryDirectory() as wt_dir:
+            orphan = subprocess.Popen(["sleep", "300"], cwd=wt_dir)
+            _wait_until_cwd(orphan.pid, wt_dir)
+            orphan.kill()
+            orphan.wait(timeout=5)
+
+            with mock.patch.object(server, "run_tmux", side_effect=self._no_live_sessions_run_tmux), \
+                 mock.patch.object(server, "run_git", side_effect=self._fake_run_git_no_branch), \
+                 mock.patch.object(spawn, "worktree_dir", return_value=wt_dir):
+                status, body = self._post_json(
+                    "/api/cleanup-branch", {"project": "my-app", "taskId": "TASK-9"}
+                )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["killedOrphans"], [])
+
+    def test_post_cleanup_branch_force_kills_the_process_and_removes_the_worktree(self):
+        with tempfile.TemporaryDirectory() as wt_dir:
+            orphan = subprocess.Popen(["sleep", "300"], cwd=wt_dir)
+            git_calls = []
+
+            def fake_run_git(args, cwd=None):
+                git_calls.append(tuple(args))
+                return self._fake_run_git_no_branch(args, cwd)
+
+            try:
+                _wait_until_cwd(orphan.pid, wt_dir)
+
+                with mock.patch.object(server, "run_tmux", side_effect=self._no_live_sessions_run_tmux), \
+                     mock.patch.object(server, "run_git", side_effect=fake_run_git), \
+                     mock.patch.object(spawn, "worktree_dir", return_value=wt_dir):
+                    status, body = self._post_json(
+                        "/api/cleanup-branch",
+                        {"project": "my-app", "taskId": "TASK-9", "force": True},
+                    )
+
+                self.assertEqual(status, 200)
+                self.assertEqual(body["killedOrphans"], [orphan.pid])
+                orphan.wait(timeout=5)  # raises TimeoutExpired if force didn't kill it
+                self.assertIn(("worktree", "remove", "--force", wt_dir), git_calls)
+            finally:
+                if orphan.poll() is None:
+                    orphan.kill()
+                    orphan.wait(timeout=5)
 
     def test_post_cleanup_branch_accepts_identity_via_json_body(self):
         wt_dir = os.path.join(self.config["worktreeRoot"], "my-app-task-9")

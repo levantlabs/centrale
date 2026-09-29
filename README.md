@@ -260,9 +260,9 @@ All responses are JSON; errors are `{"error": "<message>"}` with a 4xx or 5xx
 status, and the server never leaks a traceback to the client. `GET /` serves
 `static/index.html` and `GET /static/*` the other assets it pulls in
 (the per-concern `*.js` files, `styles.css`, `favicon.svg`). Every routed endpoint — `GET /api/board`, `/api/task`, `/api/sessions`, `/api/session-pane`,
-`/api/harvest`, `/api/harvest-progress`, `/api/discard-preview`, `/api/settings`, and `POST /api/spawn`, `/api/resume`,
+`/api/harvest`, `/api/harvest-progress`, `/api/discard-preview`, `/api/settings`, `/api/deliveries`, and `POST /api/spawn`, `/api/resume`,
 `/api/harvest`, `/api/agent-event`, `/api/end-session`, `/api/session-input`,
-`/api/cleanup-branch`, `/api/discard-attempt`, `/api/abandon-worktree`,
+`/api/deliver`, `/api/cleanup-branch`, `/api/discard-attempt`, `/api/abandon-worktree`,
 `/api/browser`, `/api/settings` — is documented in full
 in [docs/api.md](docs/api.md), including the `CENTRALE_EVENT_URL` contract a
 custom agent uses to report its own lifecycle.

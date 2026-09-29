@@ -15,6 +15,25 @@
     return projectName + "::" + taskId;
   }
 
+  // task-177: derive the project launch gate from the latest board cap
+  // and live tmux sessions on every read. The parsed session identity
+  // avoids counting another project whose name starts the same way.
+  function projectSpawnCapReason(projectName) {
+    var projects = C.boardData && C.boardData.projects || [];
+    var project = projects.find(function (p) { return p.name === projectName; });
+    var cap = project && project.maxAgents;
+    if (!Number.isInteger(cap) || cap < 1) return null;
+    var sessions = C.sessionsData.filter(function (s) {
+      var parsed = C.parseSessionTask(s.name);
+      return parsed && parsed.project === projectName;
+    });
+    if (sessions.length < cap) return null;
+    return "Project " + projectName + " has " + sessions.length + " live agent session" +
+      (sessions.length === 1 ? "" : "s") + " (maxAgents: " + cap + "): " +
+      sessions.map(function (s) { return s.name; }).join(", ") +
+      ". End a session before launching another agent.";
+  }
+
   function refreshSpawnButtons(projectName, taskId) {
     C.renderBoard();
     if (C.currentDrawer && C.currentDrawer.project === projectName && C.currentDrawer.id === taskId) {
@@ -22,6 +41,93 @@
       C.renderDrawerHarvestArea();
       C.renderDrawerSessionArea();
     }
+  }
+
+  // task-171: which agent a Spawn click would launch, resolved the way
+  // the server does (spawn.choose_agent) from GET /api/board's
+  // spawnAgents: a picked agent, else the first assignee when it names a
+  // configured agent, else -- only with requireAgentAssignment off -- the
+  // default. `needsPick` is true whenever the assignee names no agent, so
+  // the picker stays on screen (and changeable) after a pick. A board
+  // without spawnAgents (an older server) keeps the old assignee label
+  // and offers no picker.
+  function spawnAgentPlan(task, projectName, taskId) {
+    var summary = C.boardData && C.boardData.spawnAgents;
+    var assignee = task ? C.firstAssignee(task) : null;
+    if (!summary || !Array.isArray(summary.names)) {
+      return { agent: assignee ? assignee.toLowerCase() : null, source: assignee ? "assignee" : null,
+               needsPick: false, names: [], required: false, defaultAgent: null };
+    }
+    var names = summary.names.map(function (n) { return String(n); });
+    var lower = names.map(function (n) { return n.toLowerCase(); });
+    var plan = { agent: null, source: null, needsPick: false, names: names,
+                 required: summary.required !== false, defaultAgent: summary.defaultAgent || null };
+    var choice = C.spawnAgentChoices[spawnKey(projectName, taskId)];
+    var assigneeResolves = !!assignee && lower.indexOf(assignee.toLowerCase()) !== -1;
+    plan.needsPick = !assigneeResolves;
+    if (choice && lower.indexOf(String(choice).toLowerCase()) !== -1) {
+      plan.agent = String(choice).toLowerCase();
+      plan.source = "choice";
+    } else if (assigneeResolves) {
+      plan.agent = assignee.toLowerCase();
+      plan.source = "assignee";
+    } else if (!plan.required && plan.defaultAgent) {
+      plan.agent = String(plan.defaultAgent).toLowerCase();
+      plan.source = "default";
+    }
+    return plan;
+  }
+
+  // Why the spawn control looks the way it does, for its tooltip: the
+  // assignee it could not resolve, and what happens about it.
+  function spawnAgentReason(task, plan) {
+    if (!plan.needsPick) return "";
+    var assignee = task ? C.firstAssignee(task) : null;
+    var why = assignee
+      ? ("@" + assignee + " is not a configured agent")
+      : "This task has no assignee";
+    if (plan.source === "choice") return why + " -- " + plan.agent + " will run, and be recorded as its assignee.";
+    if (plan.source === "default") {
+      return why + " -- the default agent (" + plan.agent + ") will run, and be recorded as its assignee. Pick another to override.";
+    }
+    return why + " -- pick the agent to run. It will be recorded as the task's assignee.";
+  }
+
+  // The picker offered beside the spawn button when the task's assignee
+  // names no configured agent. Its value lives in C.spawnAgentChoices,
+  // not in the element, so a board re-render keeps the pick.
+  function renderSpawnAgentPicker(task, projectName, taskId, plan) {
+    var key = spawnKey(projectName, taskId);
+    var select = C.h("select", {
+      className: "spawn-agent-picker",
+      title: spawnAgentReason(task, plan),
+      attrs: { "aria-label": "Agent to spawn" }
+    });
+    var placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = plan.required
+      ? "Choose agent…"
+      : ("Default (" + plan.defaultAgent + ")");
+    select.appendChild(placeholder);
+    plan.names.forEach(function (name) {
+      var opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      select.appendChild(opt);
+    });
+    var choice = C.spawnAgentChoices[key];
+    select.value = plan.source === "choice" && choice ? choice : "";
+    // Picking must neither open the drawer (the card's own click) nor
+    // spawn anything: it only changes what the button will launch.
+    select.addEventListener("click", function (e) { e.stopPropagation(); });
+    select.addEventListener("change", function (e) {
+      if (e && e.stopPropagation) e.stopPropagation();
+      if (select.value) C.spawnAgentChoices[key] = select.value;
+      else delete C.spawnAgentChoices[key];
+      delete C.spawnConfirmPending[key];
+      refreshSpawnButtons(projectName, taskId);
+    });
+    return select;
   }
 
   // The three confirm-armed actions -- Spawn, Re-spawn and Resume --
@@ -45,11 +151,17 @@
   // path -- the confirm step only ever applies when the button would
   // otherwise be a plain, enabled "Spawn" click.
   function spawnButtonDisplay(task, projectName, taskId, live, state) {
+    var plan = spawnAgentPlan(task, projectName, taskId);
     if (!C.isTmuxAvailable()) {
-      return { text: C.spawnButtonLabel(task), disabled: true, confirming: false, noTmux: true };
+      return { text: C.spawnButtonLabel(plan), disabled: true, confirming: false, noTmux: true, plan: plan };
     }
     if (live) return { text: "Session live", disabled: true, confirming: false };
     if (state && state.status === "loading") return { text: "Spawning…", disabled: true, confirming: false };
+    var capReason = projectSpawnCapReason(projectName);
+    if (capReason) {
+      return { text: C.spawnButtonLabel(plan), disabled: true, confirming: false,
+               capReason: capReason, plan: plan };
+    }
 
     var key = spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
@@ -81,7 +193,15 @@
         confirming: true
       };
     }
-    return { text: C.spawnButtonLabel(task), disabled: false, confirming: false };
+    // task-171: with nothing picked and no agent the server would
+    // accept, the button says so and waits for the picker.
+    return {
+      text: C.spawnButtonLabel(plan),
+      disabled: !plan.agent,
+      confirming: false,
+      agentTitle: spawnAgentReason(task, plan),
+      plan: plan
+    };
   }
 
   // A task can already be claimed by a worker the board can't see -- a
@@ -112,6 +232,10 @@
     // (e.g. a stray programmatic click), since the button should never
     // be enabled while tmux is unavailable.
     if (!C.isTmuxAvailable()) return;
+    if (projectSpawnCapReason(projectName)) return;
+    // task-171: nothing to launch until an agent is picked (the button is
+    // disabled then; this covers a stray programmatic click).
+    if (!spawnAgentPlan(C.findTask(projectName, taskId), projectName, taskId).agent) return;
 
     var key = spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
@@ -157,6 +281,7 @@
   // deliberate every time, not just when something else is in the way.
   function handleRespawnClick(projectName, taskId) {
     if (!C.isTmuxAvailable()) return;
+    if (projectSpawnCapReason(projectName)) return;
 
     var key = spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
@@ -188,6 +313,7 @@
   // render together (see armedFor).
   function handleResumeClick(projectName, taskId) {
     if (!C.isTmuxAvailable()) return;
+    if (projectSpawnCapReason(projectName)) return;
 
     var key = spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
@@ -209,6 +335,7 @@
   }
 
   function spawnTask(projectName, taskId) {
+    if (projectSpawnCapReason(projectName)) return;
     var key = spawnKey(projectName, taskId);
     C.spawnStates[key] = { status: "loading" };
     C.renderBoard();
@@ -218,10 +345,14 @@
       C.renderDrawerSessionArea();
     }
 
+    // task-171: a picked agent is sent as the explicit choice; otherwise
+    // the server resolves the assignee itself (and refuses to guess).
+    var payload = { project: projectName, taskId: taskId };
+    if (C.spawnAgentChoices[key]) payload.agent = C.spawnAgentChoices[key];
     fetch("/api/spawn", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project: projectName, taskId: taskId })
+      body: JSON.stringify(payload)
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
         if (!res.ok) {
@@ -231,6 +362,9 @@
       });
     }).then(function (data) {
       C.spawnStates[key] = { status: "success", session: data.session, attach: data.attach, agent: data.agent };
+      // task-171: the claim recorded the pick as the assignee, so the
+      // next board read resolves it without one.
+      delete C.spawnAgentChoices[key];
       // task-94: an agent is about to work on this branch, so a
       // remembered blocked/error merge verdict for it is already stale
       // -- drop it (a successful merge/cleanup verdict is kept; see
@@ -259,6 +393,7 @@
   // ({reconcile: true}) -- the server runs the same resume path with the
   // reconcile prompt instead; nothing else here differs.
   function resumeTask(projectName, taskId, reconcile) {
+    if (projectSpawnCapReason(projectName)) return;
     var key = spawnKey(projectName, taskId);
     C.spawnStates[key] = { status: "loading" };
     C.renderBoard();
@@ -287,6 +422,9 @@
       // flow takes, since "Resume to reconcile" exists precisely to fix
       // the branch the blocked verdict was complaining about.
       C.invalidateStaleMergeVerdict(projectName, taskId);
+      if (Array.isArray(data.warnings)) {
+        data.warnings.forEach(function (w) { C.showToast(w, "error"); });
+      }
       C.fetchSessions();
     }).catch(function (err) {
       C.spawnStates[key] = { status: "error", error: err.message || String(err) };
@@ -308,7 +446,10 @@
   C.handleRespawnClick = handleRespawnClick;
   C.handleResumeClick = handleResumeClick;
   C.handleSpawnClick = handleSpawnClick;
+  C.projectSpawnCapReason = projectSpawnCapReason;
   C.resumeTask = resumeTask;
+  C.renderSpawnAgentPicker = renderSpawnAgentPicker;
+  C.spawnAgentPlan = spawnAgentPlan;
   C.spawnButtonDisplay = spawnButtonDisplay;
   C.spawnKey = spawnKey;
 })(window.Centrale = window.Centrale || {});

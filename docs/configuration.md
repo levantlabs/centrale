@@ -110,7 +110,32 @@ Fields:
   position in `projects`, 0-indexed) gets `browserPortBase + N`, unless that
   project sets its own `browserPort`.
 - `defaultAgent` — the agent name to spawn when a task has no assignee, or an
-  assignee that doesn't match any key in `agents`. Defaults to `"claude"`.
+  assignee that doesn't match any key in `agents` — but only while
+  `requireAgentAssignment` is `false`; with it on, such a spawn is refused
+  instead. Defaults to `"claude"`. (Resume still falls back to it: it
+  relaunches work already under way.)
+- `requireAgentAssignment` — whether a spawn refuses to guess the agent
+  (task-171). `true` (the default, and what any value other than `false`
+  means): a task whose first assignee is missing, a person, or a typo — no
+  key in `agents` — is refused with a 409 naming the task, its assignee and
+  the configured agents, and the spawn control offers a picker of agents
+  instead. `false`: such a spawn launches `defaultAgent` and the response
+  carries a warning saying so, which the board shows as a toast. Either way
+  an agent chosen explicitly (the picker, or `POST /api/spawn`'s `agent`
+  field) wins over the assignee, and when the agent that ran did not come
+  from the assignee the spawn's claim commit records it as the task's first
+  assignee, keeping any person already assigned behind it (see
+  [`POST /api/spawn`](api.md#post-apispawn)). Editable in Settings.
+- `lockSpawnedTaskFiles` — whether a spawn makes the main checkout's copy
+  of the task's own file read-only while the task is spawned (task-172),
+  so the agent on its branch is that file's only writer and a ruling goes
+  through `POST /api/rule` instead (see "Ruling on a spawned task" in
+  [docs/agents.md](agents.md#ruling-on-a-spawned-task)). `true` (the
+  default, and what any value other than `false` means); `false`: spawn
+  behaves exactly as it did without the lock. Existing locks are kept
+  either way — a merge, discard, abandon or cleanup still releases them,
+  and startup releases one with no task branch behind it. Editable in
+  Settings.
 - `agents` — a map of agent name to command, used to pick which CLI to spawn
   based on a task's assignee (see "Agent selection" in [docs/agents.md](agents.md#agent-selection)). Defaults to
   `{"claude": ["claude"], "codex": ["codex"]}` if omitted or an empty object.
@@ -244,6 +269,43 @@ Fields:
     five safety gates (see "Merging finished branches" in [docs/merging.md](merging.md#merging-finished-branches)). A project
     without one skips that gate — it passes vacuously,
     the same way a task with no dependencies is trivially unblocked.
+  - `maxAgents` (optional) — a positive integer limiting this project's live
+    Centrale tmux sessions. Omitted or `null` means no cap. Each spawn,
+    re-spawn and resume counts tmux sessions again before claiming or
+    creating anything; at the cap it returns 409 naming the live sessions.
+    Launches in the same server process are serialized per project so two
+    requests cannot both take the last slot. Agent lifecycle badges do not
+    affect the count: an idle or finished agent still occupies its session.
+    The launch controls stay visible but disabled with the reason. Other
+    projects have independent caps. Settings applies a changed cap to the
+    next launch; lowering it does not stop existing sessions.
+  - `worktreeLinks` (optional) — an array of literal repo-relative paths,
+    e.g. `[".venv", "local/data"]`. Omitted, `null` or `[]` means no links.
+    Each **new** worktree receives symlinks to these paths in the configured
+    main checkout. Existing worktrees are reused unchanged. The contents
+    are shared: writing through a link writes to the source. Removing the
+    worktree during discard, abandon, cleanup or harvest removes the link,
+    preserving the source.
+
+    Centrale first adds root-anchored entries such as `/.venv` (without a
+    trailing slash) to the repo's shared `.git/info/exclude`, and verifies
+    that git ignores the destination, keeping links out of ordinary
+    `git add`/`git add -A`. Do not force-add these links. Missing sources
+    produce spawn/resume warnings and are skipped. Tracked or existing
+    destinations, symlinked destination parents, exclusion failures and
+    overriding `.gitignore` rules also warn and skip the link. Exclusions
+    remain when links or settings are removed.
+
+    Paths must be canonical and non-overlapping: no absolute paths, empty
+    components, `.`/`..`/`.git` components, leading/trailing whitespace,
+    backslashes, ASCII control characters, or pattern characters `*?[]!#`.
+    Malformed `maxAgents` or `worktreeLinks` values raise a configuration
+    error at startup and a field error in Settings. Both keys belong on a
+    `projects` entry next to `checkCommand`, not in the target repo itself:
+
+    ```json
+    {"name": "my-app", "path": "~/code/my-app", "maxAgents": 4, "worktreeLinks": [".venv"]}
+    ```
   - `checkTimeoutSeconds` (optional) — how long `checkCommand` is allowed to
     run before it's killed and treated as a failed gate 5 ("checkCommand
     timed out after Xs", not a hung request). Defaults to `600` (10 minutes
@@ -300,11 +362,12 @@ subset of `projects.json`:
    labeled "Automatically merge branches when all safety gates pass." Read
    live by the auto-merge thread, so this takes effect on its next cycle —
    no restart.
-2. **Per-project test command** — one text field per configured project,
-   editing that project's `checkCommand` (see "Setup / configuration"
-   above); empty means no test gate. Only affects merge attempts made
-   *after* saving — one already in flight uses whatever was configured
-   when it started.
+2. **Per-project settings** — each project's `checkCommand`, `maxAgents`
+   and `worktreeLinks` (see above). Empty test command means no test gate;
+   blank max agents means no cap; links are one repo-relative path per
+   line, with an empty field meaning no links. Changes apply to future
+   launches and merge attempts. Links are added only when a new worktree
+   is created.
 3. **Board auto-refresh interval** — `refreshIntervalSeconds`, a whole
    number of seconds, minimum 5. Purely client-side; changing it doesn't
    affect a countdown already in progress, only the one after it.
@@ -346,7 +409,13 @@ subset of `projects.json`:
    - A hand-written `resumeCmd` (or any other key) on an entry survives
      an editor save untouched; the editor only writes `cmd` and
      `promptSuffix`.
-5. **Live session pane** — two toggles editing the one tiered
+5. **Require an agent assignee** — `requireAgentAssignment`, the toggle
+   "Refuse to spawn a task whose assignee isn't a configured agent"
+   beside Automatic merging's. On by default; off, such a spawn falls back to
+   the default agent with a warning. Takes effect on the next spawn.
+   Under it, **Lock a spawned task's file on the main checkout** —
+   `lockSpawnedTaskFiles`, on by default; takes effect on the next spawn.
+6. **Live session pane** — two toggles editing the one tiered
    `sessionPreview.mode` (see "Setup / configuration"): "Show the live
    session pane in the task drawer" and, under it, "Allow replying to the
    agent from the drawer (send text and keys)". Both on → `"interact"`; pane on,
@@ -359,7 +428,7 @@ subset of `projects.json`:
    poll stops on its own.
 
 Saving posts the form's current values (harvest mode, refresh interval,
-check commands, default agent, live-pane tier, and — only if the Agents
+check commands, default agent, `requireAgentAssignment`, `lockSpawnedTaskFiles`, live-pane tier, and — only if the Agents
 section was touched — the whole agents map) to `POST /api/settings`. Only if every
 provided field passes validation does anything change: the in-memory
 config is updated immediately (so it applies without a restart wherever
@@ -397,8 +466,8 @@ visible right away.
   left in the dashboard able to end, merge, discard or abandon them — so
   end the session or merge/discard/abandon the branch first, and the
   removal goes through.
-- **Add a project** takes a name and a path, plus an "Initialize
-  Backlog.md in this repo" checkbox (off by default). Server-side
+- **Add a project** takes a name and a path, plus one "Set up Backlog.md
+  and Centrale in this repo" checkbox (off by default). Server-side
   validation, in order: the name must be non-empty, unused, and
   filesystem/URL-safe (letters, digits, `-`, `_`, `.`, starting with a
   letter or digit); the path must expand (`~` supported) and exist; the
@@ -406,22 +475,33 @@ visible right away.
   --is-inside-work-tree`, through the same injectable `run_git` boundary
   as everything else). If all of that passes but the repo has no
   `backlog/config.yml`, the add is refused with a message telling you to
-  tick the checkbox — unless it's already ticked, in which case the server
-  runs `backlog init <name> --defaults --integration-mode cli
-  --agent-instructions claude,agents` in that repo (through the same
-  injectable `run_backlog_raw` boundary `checkCommand`/harvest use); an
-  `init` failure refuses the add with the CLI's own message, and nothing
-  is added. On success the new entry (name + path as typed, so a `~/...`
+  tick the checkbox. When ticked, setup runs `backlog init <name> --defaults
+  --integration-mode cli --agent-instructions claude,agents` only if the
+  config is missing, and installs a short Centrale guide pointer in both
+  `CLAUDE.md` and `AGENTS.md` even when Backlog already exists. Setup commits
+  only files it changed; unrelated staging and edits stay as they were.
+  Dirty target files, symlinks and malformed pointer markers refuse before
+  writing. Identical pointers are a no-op; a changed server port is repaired
+  in place. Failures refuse the add with their reason. If initialization or
+  a later write/commit fails, inspect any files it left behind; a failed
+  commit names the exact files to commit before retrying. On success the new
+  entry (name + path as typed, so a `~/...`
   path round-trips the same way existing entries do) is appended to
   `projects.json` and to the live config, with `checkCommand`/`browserPort`
   left at their defaults — edit those from their own settings afterward.
+
+For projects already added, use [POST /api/setup-project](api.md#post-apisetup-project).
+There is no additional UI button. `python3 server.py --check` reports missing
+or stale pointers and prints the single command that runs setup for each
+project. Setup is always an explicit owner action, never a startup side effect.
+The pointer uses the configured Centrale port; re-run setup after changing it.
 
 **API:**
 
 - `GET /api/settings` responds `{"harvestMode", "sessionPreviewMode",
   "refreshIntervalSeconds",
   "checkCommands": {"<project>": "<command>" | null, ...}, "defaultAgent",
-  "agents": ["<name>", ...], "agentEntries": [{"name", "cmd": [argv],
+  "agents": ["<name>", ...], "requireAgentAssignment": bool, "lockSpawnedTaskFiles": bool, "agentEntries": [{"name", "cmd": [argv],
   "cmdText", "promptSuffix": str | null, "builtin": bool, "onPath": bool},
   ...], "projects": [{"name", "path"}, ...]}` — the
   current value of every whitelisted setting, plus `agents` (every
@@ -433,9 +513,13 @@ visible right away.
   `PATH` lookup of `argv[0]`) and `projects` (every configured project's
   name/path, for the Projects list).
 - `POST /api/settings` accepts a partial version of that same shape.
-  Besides the original three, five more keys are whitelisted:
+  Besides the original three, seven more keys are whitelisted:
   - `sessionPreviewMode` (`"interact"` | `"view"` | `"off"`) — the live
     session pane / reply tier; written to `sessionPreview.mode`.
+  - `requireAgentAssignment` (boolean) — see the Fields list above;
+    anything but a JSON boolean is a 400.
+  - `lockSpawnedTaskFiles` (boolean) — see the Fields list above;
+    anything but a JSON boolean is a 400.
   - `defaultAgent` (string) — must name a key in the configured `agents`
     map (or in the map an `agents` field in the same request installs).
   - `agents` (a list of `{"name", "cmd", "promptSuffix"}`) — the WHOLE
@@ -456,9 +540,10 @@ visible right away.
     whose executable isn't on `PATH` — informational only.
   - `removeProject` (string) — a project name; see "Remove" above.
   - `addProject` (`{"name", "path", "initBacklog": bool}`) — see "Add a
-    project" above; `initBacklog` defaults to `false` if omitted.
+    project" above; `initBacklog` defaults to `false` if omitted and must be
+    a boolean. The existing API key now opts into both Backlog and Centrale setup.
 
-  Any of these eight top-level fields may be omitted, leaving that setting
+  Any of these nine top-level fields may be omitted, leaving that setting
   untouched. Responds with the same shape, updated, on success (200). A
   validation failure responds 400 with `{"error", "fields": {"<field
   name>": "<reason>", ...}}` — dotted for a per-project, per-add or

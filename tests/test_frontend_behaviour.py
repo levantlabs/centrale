@@ -1040,7 +1040,9 @@ var SCENARIOS = [
   { name: "mergedExternal", opts: { checkout: EXTERNAL, alreadyMerged: true } },
   { name: "merged", opts: { alreadyMerged: true } },
   { name: "liveExternal", opts: { checkout: EXTERNAL, dirty: true, live: "working" } },
-  { name: "badge", opts: {} }
+  { name: "badge", opts: {} },
+  // task-172: spawned, so main's copy of its task file is read-only.
+  { name: "locked", opts: { locked: true } }
 ];
 
 function build(name) {
@@ -1053,7 +1055,8 @@ function build(name) {
     alreadyMerged: !!opts.alreadyMerged,
     worktreeDirty: !!opts.dirty,
     branchCheckout: "checkout" in opts ? opts.checkout : CENTRALE,
-    agentState: opts.agentState
+    agentState: opts.agentState,
+    taskFileLocked: !!opts.locked
   };
 }
 var TASKS = SCENARIOS.map(function (s) { return build(s.name); });
@@ -5726,6 +5729,294 @@ class SpawnClaimCopyTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------
+# task-171: the spawn control names the agent and offers a picker
+# ---------------------------------------------------------------------
+
+SPAWN_AGENT_PICKER_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "board.js",
+                      "spawn.js", "harvest.js", "drawer.js"]);
+
+C.renderSessionsPanel = function () {};
+C.syncDrawerPanePolling = function () {};
+C.renderProjectChips = function () {};
+C.renderErrorBanners = function () {};
+C.doRefresh = function () {};
+C.fetchSessions = function () {};
+C.showToast = function () {};
+
+var bodies = [];
+global.fetch = function (url, opts) {
+  bodies.push({ url: url, body: opts && opts.body ? JSON.parse(opts.body) : null });
+  return Promise.resolve({
+    ok: true, status: 200,
+    json: function () { return Promise.resolve({ session: "s", attach: "a", agent: "codex" }); }
+  });
+};
+
+var SCENARIOS = [
+  { name: "agent",      assignees: ["@Codex"] },
+  { name: "unassigned", assignees: [] },
+  { name: "person",     assignees: ["@dana"] }
+];
+var TASKS = SCENARIOS.map(function (s, i) {
+  return {
+    id: "TASK-" + (i + 1), title: "A task", status: "To Do", ready: true,
+    assignees: s.assignees, hasSpawnBranch: false, alreadyMerged: false,
+    worktreeDirty: false, branchCheckout: null, lastDiscardedAt: null
+  };
+});
+var PROJECT = { name: "my-tool", tasks: TASKS, statuses: ["To Do", "In Progress", "Done"] };
+
+function reset(required) {
+  C.knownProjects.length = 0;
+  C.knownProjects.push("my-tool");
+  C.activeProjects = new Set(["my-tool"]);
+  C.boardData = {
+    projects: [PROJECT], capabilities: { tmux: true },
+    spawnAgents: { names: ["claude", "codex"], defaultAgent: "claude", required: required }
+  };
+  C.sessionsData = [];
+  C.firstLoadDone = true;
+  [C.harvestStates, C.spawnStates, C.cleanupStates, C.spawnConfirmPending, C.spawnAgentChoices].forEach(function (m) {
+    Object.keys(m).forEach(function (k) { delete m[k]; });
+  });
+  bodies.length = 0;
+  C.renderBoard();
+}
+
+function cardOf(name) {
+  var id = "TASK-" + (SCENARIOS.map(function (s) { return s.name; }).indexOf(name) + 1);
+  var found = null;
+  (function walk(n) {
+    if (String(n.className || "").split(/\s+/).indexOf("card") !== -1) {
+      var idNode = n.childNodes.filter(function (c) {
+        return String(c.className || "").split(/\s+/).indexOf("card-id") !== -1;
+      })[0];
+      if (idNode && idNode.textContent === id) found = n;
+      return;
+    }
+    n.childNodes.forEach(walk);
+  })(C.byId("board"));
+  return found;
+}
+
+function control(name) {
+  var card = cardOf(name);
+  var btn = card.querySelectorAll("button").filter(function (b) {
+    return String(b.className || "").indexOf("spawn-inline") !== -1;
+  })[0];
+  var picker = card.querySelectorAll("select")[0] || null;
+  return {
+    text: btn.textContent, disabled: !!btn.disabled, title: btn.title || "",
+    picker: picker ? picker.childNodes.map(function (o) { return o.textContent; }) : null,
+    btn: btn, select: picker
+  };
+}
+
+function plain(c) {
+  return { text: c.text, disabled: c.disabled, title: c.title, picker: c.picker };
+}
+
+var out = { required: {}, optional: {} };
+[true, false].forEach(function (required) {
+  var bucket = required ? out.required : out.optional;
+  reset(required);
+  SCENARIOS.forEach(function (s) { bucket[s.name] = plain(control(s.name)); });
+});
+
+// Required, unassigned: clicking the disabled button sends nothing; a
+// pick relabels it and the POST carries the choice.
+reset(true);
+control("unassigned").btn.click();
+out.clickBeforePick = bodies.length;
+var sel = control("unassigned").select;
+sel.value = "codex";
+sel.dispatch("change", {});
+out.afterPick = plain(control("unassigned"));
+control("unassigned").btn.click();
+out.pickedBody = bodies.length ? bodies[0].body : null;
+
+// A resolvable assignee sends no agent field at all.
+reset(true);
+control("agent").btn.click();
+out.agentBody = bodies.length ? bodies[0].body : null;
+
+// Optional, person-assigned: the default runs without a pick.
+reset(false);
+control("person").btn.click();
+out.defaultBody = bodies.length ? bodies[0].body : null;
+
+// The drawer offers the same picker, with the reason as a visible line.
+reset(true);
+C.currentDrawer = { project: "my-tool", id: "TASK-3", summary: C.findTask("my-tool", "TASK-3") };
+C.renderDrawerSpawnArea();
+var area = C.byId("drawer-spawn-area");
+out.drawer = {
+  picker: (area.querySelectorAll("select")[0] || { childNodes: [] }).childNodes.map(function (o) { return o.textContent; }),
+  button: area.querySelectorAll("button")[0].textContent,
+  disabled: !!area.querySelectorAll("button")[0].disabled,
+  reason: area.querySelectorAll(".spawn-agent-reason").map(function (n) { return n.textContent; })
+};
+
+setTimeout(function () { process.stdout.write(JSON.stringify(out)); }, 0);
+"""
+
+
+@js_harness.requires_node
+class SpawnAgentPickerTests(unittest.TestCase):
+    """task-171: the spawn control names the agent that will run before
+    the click, and offers a picker of configured agents -- never a bare
+    Spawn -- when the task's assignee names none. Read off the real card
+    and drawer the real render path built."""
+
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, SPAWN_AGENT_PICKER_DRIVER_JS, timeout=30)
+
+    def test_a_resolvable_assignee_names_its_agent_and_offers_no_picker(self):
+        for bucket in ("required", "optional"):
+            control = self.out[bucket]["agent"]
+            self.assertEqual(control["text"], "Spawn (codex)", bucket)
+            self.assertFalse(control["disabled"], bucket)
+            self.assertIsNone(control["picker"], bucket)
+
+    def test_required_mode_waits_for_a_pick_on_an_unresolvable_assignee(self):
+        for name in ("unassigned", "person"):
+            control = self.out["required"][name]
+            self.assertEqual(control["text"], "Pick an agent to spawn", name)
+            self.assertTrue(control["disabled"], name)
+            self.assertEqual(control["picker"], ["Choose agent…", "claude", "codex"], name)
+        self.assertIn("@dana is not a configured agent", self.out["required"]["person"]["title"])
+        self.assertIn("no assignee", self.out["required"]["unassigned"]["title"])
+
+    def test_optional_mode_names_the_default_and_still_offers_the_picker(self):
+        control = self.out["optional"]["person"]
+        self.assertEqual(control["text"], "Spawn (claude · default)")
+        self.assertFalse(control["disabled"])
+        self.assertEqual(control["picker"], ["Default (claude)", "claude", "codex"])
+
+    def test_a_pick_relabels_the_button_and_is_sent_as_the_agent(self):
+        self.assertEqual(self.out["clickBeforePick"], 0)
+        self.assertEqual(self.out["afterPick"]["text"], "Spawn (codex)")
+        self.assertFalse(self.out["afterPick"]["disabled"])
+        self.assertEqual(self.out["pickedBody"], {"project": "my-tool", "taskId": "TASK-2", "agent": "codex"})
+
+    def test_no_pick_sends_no_agent_field(self):
+        self.assertEqual(self.out["agentBody"], {"project": "my-tool", "taskId": "TASK-1"})
+        self.assertEqual(self.out["defaultBody"], {"project": "my-tool", "taskId": "TASK-3"})
+
+    def test_the_drawer_offers_the_same_picker_with_its_reason(self):
+        drawer = self.out["drawer"]
+        self.assertEqual(drawer["picker"], ["Choose agent…", "claude", "codex"])
+        self.assertEqual(drawer["button"], "Pick an agent to spawn")
+        self.assertTrue(drawer["disabled"])
+        self.assertEqual(len(drawer["reason"]), 1)
+        self.assertIn("@dana is not a configured agent", drawer["reason"][0])
+
+
+@js_harness.requires_node
+class TaskFileLockedBadgeTests(unittest.TestCase):
+    """task-172: the card says when the main checkout's copy of its task
+    file is locked -- the CLI's own refusal is a bare EACCES that does
+    not say why -- and says what to do instead."""
+
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, BRANCH_STATE_DRIVER_JS)
+
+    def _locked_badges(self, scenario):
+        return [b for b in self.out["cards"][scenario]["badges"] if b["className"] == "badge-locked"]
+
+    def test_a_locked_task_file_shows_on_the_card_with_why_and_what_to_do(self):
+        [badge] = self._locked_badges("locked")
+        self.assertEqual(badge["text"], "task file locked")
+        self.assertIn("only writer", badge["title"])
+        self.assertIn("EACCES", badge["title"])
+        self.assertIn("POST /api/rule", badge["title"])
+        # Alongside the branch badge, not instead of it.
+        self.assertIn("status-dot-branch", [b["className"] for b in self.out["cards"]["locked"]["badges"]])
+
+    def test_an_unlocked_task_file_shows_nothing(self):
+        for scenario in ("centrale", "dirty", "parked", "merged"):
+            with self.subTest(scenario=scenario):
+                self.assertEqual(self._locked_badges(scenario), [])
+
+
+SETTINGS_REQUIRE_AGENT_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+global.setTimeout = function () { return 0; };
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "settings.js"]);
+wireSettingsShell();
+C.showToast = function () {};
+C.doRefresh = function () {};
+C.syncDrawerPanePolling = function () {};
+
+var saves = [];
+global.fetch = function (url, opts) {
+  var body = opts && opts.body ? JSON.parse(opts.body) : null;
+  if (body) saves.push(body);
+  return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({
+    harvestMode: "click", sessionPreviewMode: "interact", refreshIntervalSeconds: 10,
+    checkCommands: {}, defaultAgent: "claude", agents: ["claude"], requireAgentAssignment: false,
+    lockSpawnedTaskFiles: true,
+    agentEntries: [{ name: "claude", cmdText: "claude", promptSuffix: "", builtin: true, onPath: true }],
+    projects: []
+  }); } });
+};
+
+var toggle = document.getElementById("settings-require-agent-toggle");
+var lockToggle = document.getElementById("settings-lock-task-files-toggle");
+var out = {};
+document.getElementById("settings-open").click();
+settle().then(function () {
+  out.loadedChecked = toggle.checked;
+  document.getElementById("settings-save").click();
+  return settle();
+}).then(function () {
+  out.savedUnchanged = saves[0].requireAgentAssignment;
+  toggle.checked = true;
+  document.getElementById("settings-save").click();
+  return settle();
+}).then(function () {
+  out.savedTurnedOn = saves[1].requireAgentAssignment;
+  // task-172: the lock toggle rides the same form, same way.
+  out.lockLoadedChecked = saves.length && lockToggle.checked;
+  out.lockSavedUnchanged = saves[0].lockSpawnedTaskFiles;
+  out.lockSavedOn = saves[1].lockSpawnedTaskFiles;
+  lockToggle.checked = false;
+  document.getElementById("settings-save").click();
+  return settle();
+}).then(function () {
+  out.lockSavedOff = saves[2].lockSpawnedTaskFiles;
+  process.stdout.write(JSON.stringify(out));
+});
+"""
+
+
+@js_harness.requires_node
+class SettingsRequireAgentToggleTests(unittest.TestCase):
+    """task-171: requireAgentAssignment is shown and saved by the
+    Settings modal, as a boolean, beside the harvest-mode toggle."""
+
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, SETTINGS_REQUIRE_AGENT_DRIVER_JS, timeout=30)
+
+    def test_the_toggle_shows_the_server_value(self):
+        self.assertIs(self.out["loadedChecked"], False)
+
+    def test_save_posts_the_toggle_as_a_boolean(self):
+        self.assertIs(self.out["savedUnchanged"], False)
+        self.assertIs(self.out["savedTurnedOn"], True)
+
+    def test_the_task_file_lock_toggle_shows_and_saves_the_setting(self):
+        # task-172: lockSpawnedTaskFiles, editable beside it.
+        self.assertIs(self.out["lockLoadedChecked"], True)
+        self.assertIs(self.out["lockSavedUnchanged"], True)
+        self.assertIs(self.out["lockSavedOn"], True)
+        self.assertIs(self.out["lockSavedOff"], False)
+
+
+# ---------------------------------------------------------------------
 # task-157: the board you just opened may be running an older backlog
 # ---------------------------------------------------------------------
 
@@ -5991,12 +6282,12 @@ global.fetch = function (url, opts) {
 // -- reading the rendered form --
 function byId(id) { return document.getElementById(id); }
 function checkCommandRows() {
-  return byId("settings-check-commands").querySelectorAll("input[data-project]")
+  return byId("settings-check-commands").querySelectorAll('input[data-setting="checkCommand"]')
     .map(function (input) { return input.getAttribute("data-project"); });
 }
 function checkCommandValues() {
   var out = {};
-  byId("settings-check-commands").querySelectorAll("input[data-project]").forEach(function (input) {
+  byId("settings-check-commands").querySelectorAll('input[data-setting="checkCommand"]').forEach(function (input) {
     out[input.getAttribute("data-project")] = input.value;
   });
   return out;
@@ -6304,7 +6595,7 @@ global.fetch = function (url, opts) {
 // -- reading the rendered form --
 function byId(id) { return document.getElementById(id); }
 function checkCommandInputs() {
-  return byId("settings-check-commands").querySelectorAll("input[data-project]");
+  return byId("settings-check-commands").querySelectorAll('input[data-setting="checkCommand"]');
 }
 function checkCommandRows() {
   return checkCommandInputs().map(function (input) { return input.getAttribute("data-project"); });
@@ -6359,7 +6650,7 @@ settle().then(function () {
 
   byId("settings-add-project-name").value = "gamma";
   byId("settings-add-project-path").value = ADD_PATH;
-  byId("settings-add-project-init").checked = false;
+  byId("settings-add-project-init").checked = process.argv[3] === "setup";
   byId("settings-add-project-btn").click();
   return settle();
 }).then(function () {
@@ -6409,6 +6700,11 @@ settle().then(function () {
 
 @js_harness.requires_node
 class SettingsProjectAdditionBehaviourTests(unittest.TestCase):
+    def test_setup_checkbox_sends_explicit_opt_in_and_resets_after_add(self):
+        out = js_harness.run_driver(self, SETTINGS_PROJECT_ADDITION_DRIVER_JS, "/repos/gamma", "setup")
+        self.assertIs(out["addBody"]["addProject"]["initBacklog"], True)
+        self.assertIs(out["afterAdd"]["addFields"]["init"], False)
+
     """Task-159: adding a project used to leave the check-command rows
     unchanged, so the new project could not be given a test command
     until the page was reloaded -- and the Save that saved nothing said
@@ -6647,7 +6943,7 @@ function projectRows() {
     .map(function (el) { return el.textContent; });
 }
 function checkCommandRows() {
-  return byId("settings-check-commands").querySelectorAll("input[data-project]")
+  return byId("settings-check-commands").querySelectorAll('input[data-setting="checkCommand"]')
     .map(function (input) { return input.getAttribute("data-project"); });
 }
 function status() {
@@ -6900,6 +7196,280 @@ class SidebarAfterProjectRemovalBehaviourTests(unittest.TestCase):
         after = self.out["afterFailedThenGoodRefresh"]
         self.assertEqual(after["known"], ["solo"])
         self.assertEqual(after["count"], "1")
+
+
+SETTINGS_PROJECT_SPAWN_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+global.setTimeout = function () { return 0; };
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "settings.js"]);
+wireSettingsShell();
+C.showToast = function () {};
+C.doRefresh = function () {};
+C.syncDrawerPanePolling = function () {};
+var saved = [];
+var stored = {
+  harvestMode: "click", sessionPreviewMode: "interact", refreshIntervalSeconds: 10,
+  checkCommands: {alpha: ""}, maxAgents: {alpha: 4}, worktreeLinks: {alpha: [".venv"]},
+  defaultAgent: "claude", agentEntries: [], projects: [{name: "alpha", path: "/repos/alpha"}]
+};
+global.fetch = function (url, opts) {
+  var body = opts && opts.body ? JSON.parse(opts.body) : null;
+  if (body) saved.push(body);
+  var invalid = body && body.maxAgents.alpha === 0;
+  if (body && !invalid) {
+    stored.maxAgents = body.maxAgents;
+    stored.worktreeLinks = body.worktreeLinks;
+  }
+  return Promise.resolve({ok: !invalid, status: invalid ? 400 : 200,
+    json: function () { return Promise.resolve(invalid ?
+      {error: "Invalid settings", fields: {"maxAgents.alpha": "must be positive"}} : stored); }
+  });
+};
+function field(setting) {
+  return document.querySelectorAll('#settings-check-commands [data-setting="' + setting + '"]')
+    .filter(function (input) {
+      return (input.getAttribute("data-project-name") || input.getAttribute("data-project")) === "alpha";
+    })[0];
+}
+function error(setting) {
+  return document.querySelector('#settings-check-commands [data-setting-error="' + setting + '"][data-project-error="alpha"]');
+}
+function save() { document.getElementById("settings-save").click(); return settle(); }
+var out = {};
+document.getElementById("settings-open").click();
+settle().then(function () {
+  out.loaded = {cap: field("maxAgents").value, links: field("worktreeLinks").value};
+  field("maxAgents").value = "2";
+  field("worktreeLinks").value = ".venv\n\n tools/cache \n";
+  return save();
+}).then(function () {
+  out.edited = saved[0];
+  out.afterEdit = {cap: field("maxAgents").value, links: field("worktreeLinks").value};
+  // Native number inputs expose an unfinished token (for example "-")
+  // as value="" while validity.badInput remains true. Saving must not
+  // interpret that empty value as a request to clear the configured cap.
+  field("maxAgents").value = "";
+  field("maxAgents").validity = {badInput: true};
+  return save();
+}).then(function () {
+  out.badInput = {requests: saved.length, storedCap: stored.maxAgents.alpha,
+    visible: !error("maxAgents").hidden,
+    status: document.getElementById("settings-status").textContent};
+  field("maxAgents").validity = {badInput: false};
+  field("maxAgents").value = "";
+  field("worktreeLinks").value = "";
+  return save();
+}).then(function () {
+  out.cleared = saved[1];
+  out.afterClear = {cap: field("maxAgents").value, links: field("worktreeLinks").value};
+  field("maxAgents").value = "0";
+  return save();
+}).then(function () {
+  out.invalid = {body: saved[2], visible: !error("maxAgents").hidden,
+    message: error("maxAgents").textContent,
+    status: document.getElementById("settings-status").textContent};
+  process.stdout.write(JSON.stringify(out));
+}).catch(function (err) {
+  process.stderr.write((err && err.stack) || String(err));
+  process.exit(1);
+});
+"""
+
+
+@js_harness.requires_node
+class SettingsProjectSpawnBehaviourTests(unittest.TestCase):
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, SETTINGS_PROJECT_SPAWN_DRIVER_JS)
+
+    def test_load_edit_and_clear_project_cap_and_links(self):
+        self.assertEqual(self.out["loaded"], {"cap": "4", "links": ".venv"})
+        self.assertEqual(self.out["edited"]["maxAgents"], {"alpha": 2})
+        self.assertEqual(self.out["edited"]["worktreeLinks"],
+                         {"alpha": [".venv", "tools/cache"]})
+        self.assertEqual(self.out["afterEdit"],
+                         {"cap": "2", "links": ".venv\ntools/cache"})
+        self.assertEqual(self.out["cleared"]["maxAgents"], {"alpha": None})
+        self.assertEqual(self.out["cleared"]["worktreeLinks"], {"alpha": []})
+        self.assertEqual(self.out["afterClear"], {"cap": "", "links": ""})
+
+    def test_invalid_cap_shows_the_server_error_beside_its_field(self):
+        self.assertEqual(self.out["invalid"]["body"]["maxAgents"], {"alpha": 0})
+        self.assertTrue(self.out["invalid"]["visible"])
+        self.assertEqual(self.out["invalid"]["message"], "must be positive")
+        self.assertEqual(self.out["invalid"]["status"],
+                         "Fix the highlighted field and try again.")
+
+    def test_unfinished_native_number_does_not_clear_the_cap(self):
+        self.assertEqual(self.out["badInput"]["requests"], 1)
+        self.assertEqual(self.out["badInput"]["storedCap"], 2)
+        self.assertTrue(self.out["badInput"]["visible"])
+        self.assertIn("highlighted field", self.out["badInput"]["status"])
+
+
+SPAWN_CAP_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "board.js",
+                      "spawn.js", "harvest.js", "drawer.js"]);
+wireDrawerShell();
+C.renderProjectChips = function () {};
+C.renderErrorBanners = function () {};
+C.doRefresh = function () {};
+C.fetchSessions = function () {};
+var toasts = [];
+C.showToast = function (message, kind) { toasts.push({message: message, kind: kind}); };
+C.syncDrawerPanePolling = function () {};
+global.setTimeout = function () { return 1; };
+var requests = [];
+global.fetch = function (url, opts) {
+  requests.push((opts && opts.method || "GET") + " " + url);
+  return Promise.resolve({ok: true, status: 200, json: function () {
+    return Promise.resolve({session: "new", attach: "attach", agent: "codex",
+      warnings: url === "/api/resume" ? ["Skipped missing worktree link .venv"] : []});
+  }});
+};
+
+function task(id, branch) {
+  return {id: id, title: id, status: "To Do", ready: true,
+    assignees: ["@codex"], hasSpawnBranch: !!branch,
+    alreadyMerged: false, worktreeDirty: !!branch,
+    branchCheckout: branch ? {kind: "centrale"} : null};
+}
+var fresh = task("TASK-1", false);
+var branch = task("TASK-2", true);
+var project = {name: "alpha", maxAgents: 1, tasks: [fresh, branch],
+  statuses: ["To Do", "In Progress", "Done"]};
+C.knownProjects.length = 0;
+C.knownProjects.push("alpha", "alpha-extra");
+C.activeProjects = new Set(["alpha"]);
+C.boardData = {projects: [project, {name: "alpha-extra", tasks: [],
+  statuses: ["To Do", "In Progress", "Done"]}],
+  capabilities: {tmux: true}, spawnAgents: {names: ["codex"], required: true}};
+C.firstLoadDone = true;
+function live(name) { return {name: "centrale-" + name, agentState: "working"}; }
+function read(button) {
+  return button ? {text: button.textContent, disabled: !!button.disabled,
+    title: button.title || "", confirming: button.className.indexOf("confirming") !== -1} : null;
+}
+function cardButton(id) {
+  C.renderBoard();
+  var cards = C.byId("board").querySelectorAll(".card");
+  var card = cards.filter(function (n) { return n.textContent.indexOf(id) !== -1; })[0];
+  return card.querySelectorAll(".spawn-inline")[0];
+}
+function drawerButtons(t, harvest) {
+  C.currentDrawer = {project: "alpha", id: t.id, summary: t,
+    branchTask: t};
+  if (harvest) C.renderDrawerHarvestArea();
+  else C.renderDrawerSpawnArea();
+  var area = C.byId(harvest ? "drawer-harvest-area" : "drawer-spawn-area");
+  return {buttons: area.querySelectorAll("button").map(read), text: area.textContent};
+}
+function clearState() {
+  [C.spawnStates, C.spawnConfirmPending, C.reconcileConfirmPending,
+   C.harvestStates].forEach(function (m) {
+    Object.keys(m).forEach(function (k) { delete m[k]; });
+  });
+  requests.length = 0;
+}
+
+var out = {};
+C.sessionsData = [live("alpha-extra-TASK-9")];
+out.prefixCard = read(cardButton("TASK-1"));
+out.prefixCount = C.projectSpawnCapReason("alpha");
+
+clearState();
+C.sessionsData = [live("alpha-TASK-9")];
+out.cappedCard = read(cardButton("TASK-1"));
+out.cappedDrawer = drawerButtons(fresh, false);
+out.cappedBranch = drawerButtons(branch, true);
+out.cappedReconcile = C.reconcileButtonDisplay("alpha", "TASK-2", {baseBranch: "main", count: 1});
+// A previously armed confirmation must lose to the live cap, including
+// the reconcile path and direct calls to the POST helpers.
+C.spawnConfirmPending[C.spawnKey("alpha", "TASK-1")] =
+  {action: "spawn", expires: Date.now() + 10000, count: 1};
+C.spawnConfirmPending[C.spawnKey("alpha", "TASK-2")] =
+  {action: "resume", expires: Date.now() + 10000, count: 0};
+C.reconcileConfirmPending[C.spawnKey("alpha", "TASK-2")] =
+  {expires: Date.now() + 10000};
+out.armedCardAtCap = read(cardButton("TASK-1"));
+out.armedBranchAtCap = drawerButtons(branch, true);
+C.handleSpawnClick("alpha", "TASK-1");
+C.handleRespawnClick("alpha", "TASK-2");
+C.handleResumeClick("alpha", "TASK-2");
+C.handleReconcileClick("alpha", "TASK-2");
+C.resumeTask("alpha", "TASK-2", true);
+out.cappedRequests = requests.slice();
+
+clearState();
+C.sessionsData = [];
+out.afterEndCard = read(cardButton("TASK-1"));
+out.afterEndBranch = drawerButtons(branch, true);
+cardButton("TASK-1").click();
+out.afterEndRequests = requests.slice();
+
+clearState();
+delete project.maxAgents;
+C.sessionsData = [live("alpha-TASK-8"), live("alpha-TASK-9")];
+out.unsetCard = read(cardButton("TASK-1"));
+cardButton("TASK-1").click();
+out.unsetArmed = read(cardButton("TASK-1"));
+cardButton("TASK-1").click();
+out.unsetRequests = requests.slice();
+
+clearState();
+C.sessionsData = [];
+C.resumeTask("alpha", "TASK-2", false);
+settle().then(function () {
+  out.resumeWarnings = toasts;
+  process.stdout.write(JSON.stringify(out));
+});
+"""
+
+
+@js_harness.requires_node
+class SpawnCapBehaviourTests(unittest.TestCase):
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, SPAWN_CAP_DRIVER_JS)
+
+    def test_cap_counts_exact_project_and_disables_card_and_drawer(self):
+        self.assertIsNone(self.out["prefixCount"])
+        self.assertFalse(self.out["prefixCard"]["disabled"])
+        card = self.out["cappedCard"]
+        self.assertTrue(card["disabled"])
+        self.assertIn("maxAgents: 1", card["title"])
+        self.assertIn("1 live agent session", card["title"])
+        self.assertIn("centrale-alpha-TASK-9", card["title"])
+        self.assertTrue(self.out["cappedDrawer"]["buttons"][0]["disabled"])
+        self.assertIn("centrale-alpha-TASK-9", self.out["cappedDrawer"]["text"])
+
+    def test_cap_disables_all_branch_launches_and_guards_direct_calls(self):
+        branch = self.out["cappedBranch"]
+        buttons = {b["text"]: b for b in branch["buttons"]}
+        for label in ("Resume agent", "Re-spawn agent"):
+            self.assertTrue(buttons[label]["disabled"])
+            self.assertIn("maxAgents: 1", buttons[label]["title"])
+        self.assertTrue(self.out["cappedReconcile"]["disabled"])
+        self.assertIn("maxAgents: 1", self.out["cappedReconcile"]["title"])
+        self.assertFalse(self.out["armedCardAtCap"]["confirming"])
+        armed = {b["text"]: b for b in self.out["armedBranchAtCap"]["buttons"]}
+        self.assertTrue(armed["Resume agent"]["disabled"])
+        self.assertTrue(armed["Re-spawn agent"]["disabled"])
+        self.assertFalse(armed["Resume agent"]["confirming"])
+        self.assertEqual(self.out["cappedRequests"], [])
+
+    def test_ending_session_reenables_and_unset_preserves_confirmation(self):
+        self.assertFalse(self.out["afterEndCard"]["disabled"])
+        self.assertEqual(self.out["afterEndRequests"], ["POST /api/spawn"])
+        labels = {b["text"]: b for b in self.out["afterEndBranch"]["buttons"]}
+        self.assertFalse(labels["Resume agent"]["disabled"])
+        self.assertFalse(labels["Re-spawn agent"]["disabled"])
+        self.assertFalse(self.out["unsetCard"]["disabled"])
+        self.assertTrue(self.out["unsetArmed"]["confirming"])
+        self.assertEqual(self.out["unsetRequests"], ["POST /api/spawn"])
+
+    def test_resume_displays_worktree_link_warnings(self):
+        self.assertEqual(self.out["resumeWarnings"],
+                         [{"message": "Skipped missing worktree link .venv", "kind": "error"}])
 
 
 if __name__ == "__main__":

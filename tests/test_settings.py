@@ -59,6 +59,8 @@ class CurrentSettingsTests(unittest.TestCase):
         self.assertEqual(result["sessionPreviewMode"], "interact")  # task-60/61: fully enabled by default
         self.assertEqual(result["refreshIntervalSeconds"], settings.DEFAULT_REFRESH_INTERVAL_SECONDS)
         self.assertEqual(result["checkCommands"], {"my-app": None})
+        self.assertEqual(result["maxAgents"], {"my-app": None})
+        self.assertEqual(result["worktreeLinks"], {"my-app": []})
 
 
 class ApplySettingsValidationTests(unittest.TestCase):
@@ -80,6 +82,42 @@ class ApplySettingsValidationTests(unittest.TestCase):
         with self.assertRaises(settings.ValidationError) as ctx:
             settings.apply_settings(self.config, {"harvestMode": "sometimes"}, path=self.tmp_path)
         self.assertIn("harvestMode", ctx.exception.fields)
+
+    def test_require_agent_assignment_defaults_true_and_round_trips(self):
+        # task-171: on unless explicitly turned off, written to
+        # projects.json and applied live (no restart).
+        self.assertTrue(settings.current_settings(self.config)["requireAgentAssignment"])
+        result = settings.apply_settings(self.config, {"requireAgentAssignment": False}, path=self.tmp_path)
+        self.assertFalse(result["requireAgentAssignment"])
+        self.assertFalse(self.config["requireAgentAssignment"])
+        with open(self.tmp_path, encoding="utf-8") as f:
+            self.assertIs(json.load(f)["requireAgentAssignment"], False)
+        self.assertFalse(server.load_config(path=self.tmp_path)["requireAgentAssignment"])
+
+    def test_lock_spawned_task_files_defaults_true_and_round_trips(self):
+        # task-172: on unless explicitly turned off, written to
+        # projects.json and applied live -- the next spawn reads it.
+        self.assertTrue(settings.current_settings(self.config)["lockSpawnedTaskFiles"])
+        result = settings.apply_settings(self.config, {"lockSpawnedTaskFiles": False}, path=self.tmp_path)
+        self.assertFalse(result["lockSpawnedTaskFiles"])
+        self.assertFalse(self.config["lockSpawnedTaskFiles"])
+        with open(self.tmp_path, encoding="utf-8") as f:
+            self.assertIs(json.load(f)["lockSpawnedTaskFiles"], False)
+        self.assertFalse(server.load_config(path=self.tmp_path)["lockSpawnedTaskFiles"])
+
+    def test_rejects_non_boolean_lock_spawned_task_files(self):
+        for bad in ("false", 0, None):
+            with self.assertRaises(settings.ValidationError) as ctx:
+                settings.apply_settings(self.config, {"lockSpawnedTaskFiles": bad}, path=self.tmp_path)
+            self.assertIn("lockSpawnedTaskFiles", ctx.exception.fields)
+        self.assertNotIn("lockSpawnedTaskFiles", self.config)
+
+    def test_rejects_non_boolean_require_agent_assignment(self):
+        for bad in ("false", 0, None):
+            with self.assertRaises(settings.ValidationError) as ctx:
+                settings.apply_settings(self.config, {"requireAgentAssignment": bad}, path=self.tmp_path)
+            self.assertIn("requireAgentAssignment", ctx.exception.fields)
+        self.assertNotIn("requireAgentAssignment", self.config)
 
     def test_rejects_invalid_session_preview_mode(self):
         for bad in ("on", "auto", True, None, 1):
@@ -112,6 +150,30 @@ class ApplySettingsValidationTests(unittest.TestCase):
         with self.assertRaises(settings.ValidationError) as ctx:
             settings.apply_settings(self.config, {"checkCommands": {"my-app": 123}}, path=self.tmp_path)
         self.assertIn("checkCommands.my-app", ctx.exception.fields)
+
+    def test_rejects_invalid_project_spawn_settings_without_partial_write(self):
+        with open(self.tmp_path, "rb") as f:
+            before = f.read()
+        for field, value in (("maxAgents", False), ("maxAgents", 0), ("maxAgents", 1.5),
+                             ("maxAgents", "4"), ("worktreeLinks", ["../escape"]),
+                             ("worktreeLinks", ["a", "a/b"])):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(settings.ValidationError) as ctx:
+                    settings.apply_settings(self.config, {
+                        "harvestMode": "auto", field: {"my-app": value}}, path=self.tmp_path)
+                self.assertIn(f"{field}.my-app", ctx.exception.fields)
+                with open(self.tmp_path, "rb") as f:
+                    self.assertEqual(f.read(), before)
+                self.assertEqual(self.config["harvest"], {"mode": "click"})
+
+    def test_project_spawn_settings_reject_unknown_project_and_malformed_maps(self):
+        for field in ("maxAgents", "worktreeLinks"):
+            with self.subTest(field=field):
+                with self.assertRaises(settings.ValidationError) as ctx:
+                    settings.apply_settings(self.config, {field: {"missing": None}}, path=self.tmp_path)
+                self.assertIn(f"{field}.missing", ctx.exception.fields)
+                with self.assertRaises(settings.SettingsError):
+                    settings.apply_settings(self.config, {field: []}, path=self.tmp_path)
 
     def test_rejects_check_commands_that_is_not_an_object(self):
         with self.assertRaises(settings.SettingsError):
@@ -215,6 +277,28 @@ class ApplySettingsSuccessTests(unittest.TestCase):
         disk_by_name = {p["name"]: p for p in disk["projects"]}
         self.assertEqual(disk_by_name["my-app"]["checkCommand"], "pytest")
         self.assertNotIn("checkCommand", disk_by_name["my-tool"])
+
+    def test_project_spawn_settings_set_clear_and_apply_live(self):
+        result = settings.apply_settings(self.config, {
+            "maxAgents": {"my-app": 4, "my-tool": None},
+            "worktreeLinks": {"my-app": [".venv", "build/cache"], "my-tool": []},
+        }, path=self.tmp_path)
+        self.assertEqual(result["maxAgents"], {"my-app": 4, "my-tool": None})
+        self.assertEqual(result["worktreeLinks"], {"my-app": [".venv", "build/cache"], "my-tool": []})
+        self.assertEqual(self.config["projects"][0]["maxAgents"], 4)
+        self.assertEqual(self.config["projects"][0]["worktreeLinks"], [".venv", "build/cache"])
+        disk = self._read_disk()
+        self.assertEqual(disk["projects"][0]["maxAgents"], 4)
+        self.assertEqual(disk["projects"][0]["worktreeLinks"], [".venv", "build/cache"])
+        self.assertEqual(server.load_config(path=self.tmp_path)["projects"][0]["maxAgents"], 4)
+
+        result = settings.apply_settings(self.config, {
+            "maxAgents": {"my-app": None}, "worktreeLinks": {"my-app": []},
+        }, path=self.tmp_path)
+        self.assertIsNone(result["maxAgents"]["my-app"])
+        self.assertEqual(result["worktreeLinks"]["my-app"], [])
+        self.assertNotIn("maxAgents", self._read_disk()["projects"][0])
+        self.assertNotIn("worktreeLinks", self._read_disk()["projects"][0])
 
     def test_omitted_fields_left_untouched(self):
         settings.apply_settings(self.config, {"harvestMode": "auto"}, path=self.tmp_path)
@@ -537,6 +621,78 @@ class AddProjectTests(unittest.TestCase):
         with open(os.path.join(self.repo_dir, "backlog", "config.yml"), "w") as f:
             f.write("statuses: [To Do, In Progress, Done]\n")
 
+    def _setup_git(self, args, **kwargs):
+        return _git_result(stdout="true\n" if args == ["rev-parse", "--is-inside-work-tree"] else "")
+
+    def test_setup_checkbox_installs_pointer_even_with_existing_backlog(self):
+        self._with_backlog_config()
+        self.config["port"] = 7420
+        with mock.patch.object(server, "run_git", side_effect=self._setup_git), \
+             mock.patch.object(server, "run_backlog_raw") as init:
+            settings.apply_settings(
+                self.config,
+                {"addProject": {"name": "newproj", "path": self.repo_dir, "initBacklog": True}},
+                path=self.tmp_path,
+            )
+        init.assert_not_called()
+        for name in ("AGENTS.md", "CLAUDE.md"):
+            self.assertTrue(os.path.isfile(os.path.join(self.repo_dir, name)), name)
+            with open(os.path.join(self.repo_dir, name), "rb") as f:
+                self.assertIn(b"http://127.0.0.1:7420/api/agent-guide", f.read())
+
+    def test_setup_requires_a_boolean_opt_in(self):
+        self._with_backlog_config()
+        with mock.patch.object(server, "run_git", side_effect=self._setup_git):
+            with self.assertRaises(settings.ValidationError) as raised:
+                settings.apply_settings(self.config,
+                    {"addProject": {"name": "newproj", "path": self.repo_dir, "initBacklog": "false"}},
+                    path=self.tmp_path)
+        self.assertIn("addProject.initBacklog", raised.exception.fields)
+        self.assertFalse(os.path.exists(os.path.join(self.repo_dir, "AGENTS.md")))
+
+    def test_malformed_markers_refuse_before_any_file_changes(self):
+        self._with_backlog_config()
+        path = os.path.join(self.repo_dir, "AGENTS.md")
+        for data in (b"<!-- CENTRALE GUIDELINES START -->", settings.POINTER_END + settings.POINTER_START,
+                     settings.POINTER_START * 2 + settings.POINTER_END):
+            with self.subTest(data=data):
+                with open(path, "wb") as f:
+                    f.write(data)
+                with self.assertRaises(settings.SettingsError) as raised:
+                    settings.setup_project(self.config, {"name": "scratch", "path": self.repo_dir})
+                self.assertEqual(raised.exception.status, 409)
+                with open(path, "rb") as f:
+                    self.assertEqual(f.read(), data)
+                self.assertFalse(os.path.exists(os.path.join(self.repo_dir, "CLAUDE.md")))
+
+    def test_symlink_refusal_leaves_target_unchanged(self):
+        self._with_backlog_config()
+        path = os.path.join(self.repo_dir, "AGENTS.md")
+        os.symlink(self.tmp_path, path)
+        with open(self.tmp_path, "rb") as f:
+            before = f.read()
+        with self.assertRaises(settings.SettingsError) as raised:
+            settings.setup_project(self.config, {"name": "scratch", "path": self.repo_dir})
+        self.assertEqual(raised.exception.status, 409)
+        with open(self.tmp_path, "rb") as f:
+            self.assertEqual(f.read(), before)
+
+    def test_commit_failure_is_reported_and_does_not_add_project(self):
+        self._with_backlog_config()
+        def git(args, **kwargs):
+            if args[0] == "commit":
+                return _git_result(returncode=1, stdout="", stderr="commit hook failed")
+            return self._setup_git(args, **kwargs)
+        with mock.patch.object(server, "run_git", side_effect=git):
+            with self.assertRaises(settings.SettingsError) as raised:
+                settings.apply_settings(self.config,
+                    {"addProject": {"name": "newproj", "path": self.repo_dir, "initBacklog": True}},
+                    path=self.tmp_path)
+        self.assertEqual(raised.exception.status, 502)
+        self.assertIn("commit hook failed", str(raised.exception))
+        self.assertIn("AGENTS.md", str(raised.exception))
+        self.assertEqual(len(self.config["projects"]), 1)
+
     def test_rejects_path_that_does_not_exist(self):
         ghost = os.path.join(self.repo_dir, "does-not-exist")
         with self.assertRaises(settings.ValidationError) as ctx:
@@ -589,8 +745,11 @@ class AddProjectTests(unittest.TestCase):
         self.assertEqual(len(self.config["projects"]), 1)  # not added
 
     def test_init_checkbox_runs_backlog_init_through_injectable_boundary(self):
-        with mock.patch.object(server, "run_git", return_value=_git_result()), \
-             mock.patch.object(server, "run_backlog_raw", return_value=_backlog_init_result()) as run_backlog_raw:
+        def initialize(*args, **kwargs):
+            self._with_backlog_config()
+            return _backlog_init_result()
+        with mock.patch.object(server, "run_git", side_effect=self._setup_git), \
+             mock.patch.object(server, "run_backlog_raw", side_effect=initialize) as run_backlog_raw:
             result = settings.apply_settings(
                 self.config,
                 {"addProject": {"name": "newproj", "path": self.repo_dir, "initBacklog": True}},
@@ -610,18 +769,18 @@ class AddProjectTests(unittest.TestCase):
         self.assertIn("newproj", [p["name"] for p in disk["projects"]])
 
     def test_init_failure_refuses_add_with_cli_message(self):
-        with mock.patch.object(server, "run_git", return_value=_git_result()), \
+        with mock.patch.object(server, "run_git", side_effect=self._setup_git), \
              mock.patch.object(
                  server, "run_backlog_raw",
                  return_value=_backlog_init_result(returncode=1, stderr="boom: already initialized"),
              ):
-            with self.assertRaises(settings.ValidationError) as ctx:
+            with self.assertRaises(settings.SettingsError) as ctx:
                 settings.apply_settings(
                     self.config,
                     {"addProject": {"name": "newproj", "path": self.repo_dir, "initBacklog": True}},
                     path=self.tmp_path,
                 )
-        self.assertIn("boom: already initialized", ctx.exception.fields["addProject.path"])
+        self.assertIn("boom: already initialized", str(ctx.exception))
         self.assertEqual(len(self.config["projects"]), 1)  # not added
         with open(self.tmp_path) as f:
             disk = json.load(f)
@@ -651,6 +810,8 @@ class AddProjectTests(unittest.TestCase):
         self.assertEqual(added["path"], os.path.expanduser(self.repo_dir))
         self.assertIsNone(added["checkCommand"])
         self.assertIsNone(added["browserPort"])
+        self.assertIsNone(added["maxAgents"])
+        self.assertEqual(added["worktreeLinks"], [])
 
     def test_disk_path_stores_what_user_typed_not_expanded(self):
         self._with_backlog_config()
@@ -966,6 +1127,34 @@ class _SettingsHttpBase(unittest.TestCase):
 
 
 class SettingsHttpApiTests(_SettingsHttpBase):
+    def test_agent_guide_uses_bound_port_and_survives_file_changes(self):
+        with mock.patch("builtins.open", side_effect=AssertionError("guide should be loaded at boot")):
+            with urllib.request.urlopen(self._url("/api/agent-guide")) as response:
+                self.assertEqual(response.headers.get_content_type(), "text/plain")
+                self.assertEqual(response.headers["Cache-Control"], "no-store")
+                guide = response.read().decode()
+        self.assertIn(self._url(""), guide)
+        self.assertNotIn("{{CENTRALE_URL}}", guide)
+
+    def test_setup_api_rejects_invalid_or_unknown_project(self):
+        with mock.patch.object(server, "run_git", side_effect=AssertionError("no side effects")):
+            for body, expected in (({}, 400), ([], 400), ({"project": []}, 400),
+                                   ({"project": "absent"}, 404)):
+                with self.subTest(body=body):
+                    status, result = self._post("/api/setup-project", json.dumps(body).encode())
+                    self.assertEqual(status, expected)
+                    self.assertIn("error", result)
+
+    def test_new_routes_reject_foreign_origin_before_any_side_effect(self):
+        for path, data in (("/api/agent-guide", None), ("/api/setup-project", b'{"project":"my-app"}')):
+            with self.subTest(path=path):
+                req = urllib.request.Request(self._url(path), data=data,
+                    headers={"Origin": "https://example.invalid", "Content-Type": "application/json"})
+                with mock.patch.object(server, "run_git", side_effect=AssertionError("no side effects")):
+                    with self.assertRaises(urllib.error.HTTPError) as raised:
+                        urllib.request.urlopen(req)
+                self.assertEqual(raised.exception.code, 403)
+
     def test_get_settings_returns_current_values(self):
         status, body = self._get("/api/settings")
         self.assertEqual(status, 200)

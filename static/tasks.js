@@ -22,9 +22,12 @@
     return name ? ("@" + name) : "unassigned";
   }
 
-  function spawnButtonLabel(task) {
-    var name = firstAssignee(task);
-    return name ? ("Spawn (" + name.toLowerCase() + ")") : "Spawn agent";
+  // task-171: names the agent that will actually run (spawn.js's
+  // spawnAgentPlan), not the raw assignee -- a person's name here used
+  // to read like an agent. No agent yet means one has to be picked.
+  function spawnButtonLabel(plan) {
+    if (!plan || !plan.agent) return plan && plan.needsPick ? "Pick an agent to spawn" : "Spawn agent";
+    return "Spawn (" + plan.agent + (plan.source === "default" ? " · default" : "") + ")";
   }
 
   // Coarse relative time for the out-of-board-claim confirm message

@@ -242,6 +242,30 @@
       </div>
 
       <div class="settings-section">
+        <label class="toggle-field" for="settings-require-agent-toggle" title="When on, spawning a task whose assignee is missing or isn't a configured agent is refused, and the spawn button offers a picker of agents instead. When off, such a task gets the default agent, with a warning.">
+          <span class="switch">
+            <input type="checkbox" id="settings-require-agent-toggle">
+            <span class="track"><span class="knob"></span></span>
+          </span>
+          Refuse to spawn a task whose assignee isn't a configured agent
+        </label>
+        <div class="settings-hint">Off: such a task spawns the default agent, with a warning. Either way the agent that runs is recorded as its assignee.</div>
+        <div class="settings-field-error" id="settings-error-requireAgentAssignment" hidden></div>
+      </div>
+
+      <div class="settings-section">
+        <label class="toggle-field" for="settings-lock-task-files-toggle" title="When on, spawning a task makes the main checkout's copy of its task file read-only until the branch is merged, discarded, abandoned or cleaned up, so the agent is its only writer and the file cannot conflict at merge time.">
+          <span class="switch">
+            <input type="checkbox" id="settings-lock-task-files-toggle">
+            <span class="track"><span class="knob"></span></span>
+          </span>
+          Lock a spawned task's file on the main checkout
+        </label>
+        <div class="settings-hint">Rulings then go to the agent (POST /api/rule), which records them on its branch. Takes effect on the next spawn; existing locks are kept.</div>
+        <div class="settings-field-error" id="settings-error-lockSpawnedTaskFiles" hidden></div>
+      </div>
+
+      <div class="settings-section">
         <label class="toggle-field" for="settings-session-preview-toggle" title="When on, the task drawer of a task with a live tmux session shows a read-only, ~2s-refreshing capture of what the agent is displaying. Off disables the drawer section AND the /api/session-pane endpoint.">
           <span class="switch">
             <input type="checkbox" id="settings-session-preview-toggle">
@@ -269,9 +293,10 @@
       </div>
 
       <div class="settings-section">
-        <div class="settings-label">Per-project test command</div>
+        <div class="settings-label">Per-project settings</div>
         <div class="settings-hint" style="margin-top: 0; margin-bottom: 8px;">
-          Run against the merged tree before a merge completes; empty = no test gate. Only affects future merge attempts.
+          Test commands run against the merged tree; blank = no test gate. Max agents limits live sessions; blank = no limit.
+          Links share paths from the main checkout with new worktrees, one path per line.
         </div>
         <div id="settings-check-commands"></div>
       </div>
@@ -311,12 +336,12 @@
         <div class="settings-field-error" id="settings-error-addProject.name" hidden></div>
         <input type="text" id="settings-add-project-path" class="settings-input" style="margin-top: 6px;" placeholder="Path (e.g. ~/code/my-app)">
         <div class="settings-field-error" id="settings-error-addProject.path" hidden></div>
-        <label class="toggle-field" style="margin-top: 10px;" title="Only needed if the repo has no backlog/config.yml yet -- runs 'backlog init' in it.">
+        <label class="toggle-field" style="margin-top: 10px;" title="Initializes Backlog.md if missing and adds the Centrale guide pointer to CLAUDE.md and AGENTS.md. Commits only the files setup changes.">
           <span class="switch">
             <input type="checkbox" id="settings-add-project-init">
             <span class="track"><span class="knob"></span></span>
           </span>
-          Initialize Backlog.md in this repo
+          Set up Backlog.md and Centrale in this repo
         </label>
         <div id="settings-add-project-status" class="settings-hint"></div>
         <button type="button" id="settings-add-project-btn" class="btn btn-sm" style="margin-top: 10px;">Add project</button>

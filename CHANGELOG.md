@@ -23,6 +23,78 @@ would protect is the shape of `projects.json`, the `/api` endpoints
 documented in [docs/api.md](docs/api.md), and what a spawned agent is
 handed.
 
+## v0.2.0 — orchestrating agents
+
+This release is about a second kind of user: an agent that runs other
+agents. Master agents in several projects were spawning, reviewing and
+merging through Centrale's API, and the gaps they hit are what changed.
+
+Tested against **`backlog` v1.51.0**, the same baseline as v0.1.0.
+
+**Changed defaults — read these first:**
+
+- **Spawn no longer guesses the agent.** A task whose first assignee is
+  not a configured agent (unassigned, or a person) is refused with `409`
+  instead of silently getting the default agent. Pass `"agent"` on
+  `POST /api/spawn`, or pick one in the drawer. The chosen agent is
+  recorded as the task's assignee in the claim, ahead of any person
+  already assigned. `requireAgentAssignment: false` in `projects.json`
+  restores the old behavior.
+- **A spawned task's file is locked on the main checkout.** Right after the
+  claim, the main checkout's copy of that one task file is made read-only,
+  so a `backlog task edit` on it fails instead of creating a conflict with
+  the agent's copy on its branch. Merging the branch releases it; discard,
+  abandon and cleanup release it; a stale lock is cleared at startup and
+  by `--check`. The card shows a "task file locked" badge. Turn it off
+  with `lockSpawnedTaskFiles: false`. It is a guard rail, not security.
+
+**New:**
+
+- **Rulings go to the agent.** `POST /api/rule` sends a ruling to a
+  spawned task's agent and confirms it arrived; the agent is told to
+  record it on its task as a comment by the sender. With no agent
+  running, the ruling is committed as a comment on the task's branch.
+- **Deliver a message and know it arrived.** `POST /api/deliver` types a
+  message into a spawned agent's session and waits for it to show up on
+  screen, including a message Codex queues while it is mid-turn. Every
+  delivery is logged; `GET /api/deliveries` reads the log.
+- **Wait instead of polling.** `GET /api/orchestrator-wait` holds the
+  request until something needs the orchestrator — a task finished, is
+  waiting for input, merged, or had its merge blocked — and answers with
+  one plain line and a cursor for the next call. Nothing is lost between
+  calls, and repeated identical results are sent once. Codex only reports
+  "waiting" when an approval dialog has actually been on screen for 30
+  seconds, not for every request its own reviewer approves.
+- **A guide for agents, served by Centrale.** `GET /api/agent-guide` is a
+  short operating guide for an agent using Centrale: spawning, rulings,
+  merging (through the API is recommended), states and badges, waiting.
+- **One setup checkbox.** Adding a project now offers "Set up Backlog.md
+  and Centrale in this repo", which runs `backlog init` if needed and adds
+  a short pointer to the guide in `CLAUDE.md` and `AGENTS.md`, committing
+  only those files. `POST /api/setup-project` does the same for a project
+  already added, and `--check` lists projects without the pointer.
+- **Per-project spawn settings.** `maxAgents` caps a project's live agent
+  sessions (counted from tmux on every spawn and resume; a refusal names
+  the sessions). `worktreeLinks` symlinks paths such as `.venv` or
+  `node_modules` from the main checkout into every new worktree, keeps
+  them out of git, and removes the link, never its target, on cleanup.
+
+**Fixed:**
+
+- **Spawned Claude agents' hooks are passed inline.** They were read from
+  one shared `~/.cache/centrale/hooks-settings.json`, rewritten on every
+  spawn with the path of whichever Centrale copy spawned last; a copy run
+  from a since-deleted worktree then blocked every agent's tool calls.
+  Each agent's settings are now fixed at launch, and the file is no
+  longer written.
+- **Spawned agents don't stop on setup offers or hold messages.** A new
+  Claude agent no longer shows the "teach auto mode" offer, and accepts
+  messages from your other sessions instead of holding them for approval.
+- **The spawn claim commits only the board.** It no longer sweeps other
+  staged changes in the main checkout into the claim commit.
+- **Ending a session stops what it left running.** End-session and cleanup
+  also stop processes still running inside the task's worktree.
+
 ## v0.1.0 — first public release
 
 The first published snapshot. Everything below is what Centrale does at

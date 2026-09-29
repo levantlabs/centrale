@@ -385,6 +385,16 @@
         title: "An agent's task/<id> branch exists for this task -- its own status/ACs/notes may be ahead of what's shown here until it's merged"
       }));
     }
+    // task-172: while a task is spawned, the main checkout's copy of its
+    // task file is read-only, and `backlog task edit` on it fails with a
+    // bare EACCES that does not say why. The card says it.
+    if (task.taskFileLocked) {
+      meta.appendChild(C.h("span", {
+        className: "badge-locked",
+        text: "task file locked",
+        title: "Spawned: the agent is this task file's only writer until its branch is merged, discarded, abandoned or cleaned up, so `backlog task edit` on the main checkout is refused (EACCES). To rule on the task, POST /api/rule -- it messages a live agent, or commits the ruling as a comment on the branch when none is running."
+      }));
+    }
     card.appendChild(meta);
 
     // task-86: the milestone chip leads the same chips row the labels
@@ -437,14 +447,26 @@
         spawnBtn.title = C.TMUX_UNAVAILABLE_TOOLTIP;
       } else if (live) {
         spawnBtn.title = "Session already running: " + live.name;
+      } else if (display.capReason) {
+        spawnBtn.title = display.capReason;
       } else if (display.confirming) {
         spawnBtn.title = display.confirmTitle || "";
+      } else if (display.agentTitle) {
+        spawnBtn.title = display.agentTitle;
       }
       spawnBtn.addEventListener("click", function (e) {
         e.stopPropagation();
         C.handleSpawnClick(project.name, task.id);
       });
+      // task-171: an assignee that names no configured agent gets a
+      // picker beside the button rather than a silent default.
+      if (!live && !display.noTmux && display.plan && display.plan.needsPick) {
+        footer.appendChild(C.renderSpawnAgentPicker(task, project.name, task.id, display.plan));
+      }
       footer.appendChild(spawnBtn);
+      if (display.capReason) {
+        footer.appendChild(C.h("div", { className: "spawn-status-line", text: display.capReason }));
+      }
       card.appendChild(footer);
 
       if (state && (state.status === "error" || state.status === "success")) {

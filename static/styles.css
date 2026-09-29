@@ -1184,6 +1184,21 @@
     letter-spacing: 0.3px;
   }
 
+  /* task-172: the main checkout's copy of a spawned task's file is
+     read-only. Information, not a call to act -- so muted, outlined. */
+  .badge-locked {
+    display: inline-flex;
+    align-items: center;
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text-dim);
+    border: 1px dashed var(--border-strong);
+    border-radius: 999px;
+    padding: 1px 7px;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+
   .badge-blocked {
     font-size: 10px;
     font-weight: 700;
@@ -1293,6 +1308,24 @@
     margin-top: 2px;
     font-size: 11px;
   }
+  /* task-171: the agent picker offered beside Spawn when the task's
+     assignee names no configured agent -- the button keeps the width. */
+  .card-footer { gap: 6px; }
+  .card-footer .spawn-agent-picker { flex: 0 0 auto; max-width: 55%; min-width: 0; margin-top: 2px; font-size: 11px; }
+  .card-footer .spawn-inline { flex: 1 1 auto; min-width: 0; }
+  .spawn-agent-picker {
+    background: var(--bg-input);
+    border: 1px solid var(--border-strong);
+    color: var(--text);
+    padding: 3px 6px;
+    border-radius: var(--radius-sm);
+    font-size: 12px;
+    font-family: inherit;
+  }
+  .spawn-agent-picker:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+  .spawn-agent-pick-row { display: flex; margin-bottom: 6px; }
+  .spawn-agent-pick-row .spawn-agent-picker { flex: 1 1 auto; padding: 6px 8px; }
+  .spawn-status-line.spawn-agent-reason { margin: 0 0 8px; word-break: normal; color: var(--text-dim); }
   .spawn-status-line {
     font-size: 10.5px;
     margin-top: 6px;

@@ -1,0 +1,8 @@
+• Messages to be submitted after next tool call (press esc to interrupt and send immediately)
+  ↳ centrale probe 176: queued delivery fixture; continue TASK-176.
+
+
+› Ask Codex to do anything
+
+  GPT-6-Astra xhigh · ~/project · probe session
+  ? for shortcuts                                                                                                                                                                                 ⚠ 5 warnings · f2 to view

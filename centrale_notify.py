@@ -3,9 +3,9 @@
 
 Invoked two ways, both injected transiently at spawn/resume time (never
 written into the user's home config or the target repo -- see
-server.ensure_hooks_settings_file / spawn._inject_agent_hooks):
+server.hooks_settings_payload / spawn._inject_agent_hooks):
 
-- by a generated Claude Code hooks settings file, as
+- by Claude Code hooks passed inline via ``--settings '<json>'``, as
   ``python3 centrale_notify.py working|waiting|finished`` (plus whatever
   extra hook-payload arguments Claude Code itself appends -- ignored);
 - by codex's ``-c notify=[...]`` override, as

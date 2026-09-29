@@ -259,6 +259,8 @@
                                 // share this one entry per task, and the drawer can now show two of
                                 // them at once, so arming one must not arm the other (spawn.armedFor).
   var SPAWN_CONFIRM_WINDOW_MS = 5000;
+  var spawnAgentChoices = {};   // key "project::taskId" -> agent name picked in the spawn control
+                                // (task-171: only offered when the task's assignee names no agent)
 
   var harvestStates = {};      // key "project::taskId" -> {status: 'loading'|'success'|'blocked'|'error', report, error, progressLabel}
   // TASK-64's destructive/authoritative harvest actions each get their
@@ -341,6 +343,7 @@
   C.persistSidebarCollapsed = persistSidebarCollapsed;
   C.readStoredSidebarCollapsed = readStoredSidebarCollapsed;
   C.reconcileConfirmPending = reconcileConfirmPending;
+  C.spawnAgentChoices = spawnAgentChoices;
   C.spawnConfirmPending = spawnConfirmPending;
   C.spawnStates = spawnStates;
 })(window.Centrale = window.Centrale || {});

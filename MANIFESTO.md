@@ -81,8 +81,10 @@ layer that gradually absorbs it, and the test of that is who may change a
 task's status.
 
 Centrale writes to a board in exactly two places, and in neither is it forming
-an opinion. Spawning claims the task (`In Progress`) and commits that claim —
-you clicked Spawn, and the claim records it. A merge can carry a `Done` you
+an opinion. Spawning claims the task (`In Progress`, and — when the task
+named no agent — the agent you chose to run it, ahead of anyone already
+assigned) and commits that claim — you clicked Spawn, and the claim records
+it. A merge can carry a `Done` you
 already set on the board across onto the agent's branch, so the gate can see
 the status you already chose. That is all.
 

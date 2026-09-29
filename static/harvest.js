@@ -359,6 +359,7 @@
   // ordinary gates re-verify afterward.
   function handleReconcileClick(projectName, taskId) {
     if (!C.isTmuxAvailable()) return;
+    if (C.projectSpawnCapReason(projectName)) return;
     var key = C.spawnKey(projectName, taskId);
     if (harvestActionIsArmed(C.reconcileConfirmPending, key)) {
       delete C.reconcileConfirmPending[key];
@@ -375,6 +376,11 @@
     }
     if (!C.isTmuxAvailable()) {
       return { text: "Resume to reconcile", disabled: true, confirming: false, title: C.TMUX_UNAVAILABLE_TOOLTIP };
+    }
+    var capReason = C.projectSpawnCapReason(projectName);
+    if (capReason) {
+      return { text: "Resume to reconcile", disabled: true, confirming: false,
+               title: capReason };
     }
     var base = (behind && behind.baseBranch) || "main";
     var count = (behind && behind.count) || 0;

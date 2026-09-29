@@ -16,6 +16,8 @@ import os
 import re
 import shlex
 import tempfile
+import threading
+from pathlib import Path
 
 import server
 
@@ -34,6 +36,11 @@ PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 # -- no whitespace, not absurdly long. Anything stricter would refuse
 # names an existing hand-edited projects.json already uses.
 AGENT_NAME_RE = re.compile(r"^\S{1,64}$")
+
+POINTER_START = b"<!-- CENTRALE GUIDELINES START -->"
+POINTER_END = b"<!-- CENTRALE GUIDELINES END -->"
+INSTRUCTION_FILES = ("CLAUDE.md", "AGENTS.md")
+_setup_lock = threading.Lock()
 
 
 class SettingsError(Exception):
@@ -68,14 +75,20 @@ def current_settings(config):
     /api/settings response, and the base of what a successful POST
     /api/settings returns."""
     check_commands = {p["name"]: p.get("checkCommand") for p in config.get("projects", [])}
+    max_agents = {p["name"]: p.get("maxAgents") for p in config.get("projects", [])}
+    worktree_links = {p["name"]: list(p.get("worktreeLinks") or []) for p in config.get("projects", [])}
     projects = [{"name": p["name"], "path": p.get("path", "")} for p in config.get("projects", [])]
     return {
         "harvestMode": (config.get("harvest") or {}).get("mode", "click"),
         "sessionPreviewMode": server.session_preview_mode(config),
         "refreshIntervalSeconds": config.get("refreshIntervalSeconds", DEFAULT_REFRESH_INTERVAL_SECONDS),
         "checkCommands": check_commands,
+        "maxAgents": max_agents,
+        "worktreeLinks": worktree_links,
         "defaultAgent": config.get("defaultAgent") or server.DEFAULT_AGENT_NAME,
         "agents": sorted((config.get("agents") or {}).keys()),
+        "requireAgentAssignment": config.get("requireAgentAssignment", True) is not False,
+        "lockSpawnedTaskFiles": config.get("lockSpawnedTaskFiles", True) is not False,
         "agentEntries": agent_entries(config),
         "projects": projects,
     }
@@ -385,6 +398,8 @@ def _validate_add_project(value, config):
     fields = {}
     if not isinstance(value, dict):
         return {"addProject": "must be an object with name and path"}, None
+    if "initBacklog" in value and not isinstance(value["initBacklog"], bool):
+        fields["addProject.initBacklog"] = "must be true or false"
 
     name = value.get("name")
     path_raw = value.get("path")
@@ -423,35 +438,124 @@ def _validate_add_project(value, config):
     }
 
 
-def _finalize_add_project(add_project):
-    """Runs once every field in the request is otherwise known-valid, right
-    before the write: if the target repo has no backlog/config.yml, either
-    refuses (returning an error string) or runs `backlog init` through the
-    same injectable run_backlog_raw boundary every other write command
-    uses, depending on the caller-supplied initBacklog flag. Returns None
-    on success."""
+def agent_pointer(config, port=None):
+    """Only a pointer lives in projects; the running server owns the guide."""
+    port = config.get("port", 7420) if port is None else port
+    return (POINTER_START + b"\n## Centrale\n\n"
+            + b"This project uses Centrale for agent spawning and gated merging.\n"
+            + b"Before using Centrale, fetch and follow the running server's guide:\n\n"
+            + f"curl --fail --silent --show-error http://127.0.0.1:{port}/api/agent-guide\n".encode()
+            + POINTER_END)
+
+
+def _replace_pointer(data, block):
+    starts, ends = data.count(POINTER_START), data.count(POINTER_END)
+    if not starts and not ends:
+        separator = b"\n" if data.endswith(b"\n") else b"\n\n" if data else b""
+        return data + separator + block + b"\n"
+    if starts != 1 or ends != 1 or data.index(POINTER_START) > data.index(POINTER_END):
+        raise SettingsError("malformed or duplicate Centrale pointer markers; repair the instruction file first", 409)
+    start, end = data.index(POINTER_START), data.index(POINTER_END) + len(POINTER_END)
+    return data[:start] + block + data[end:]
+
+
+def missing_agent_pointers(config, project):
+    """Read-only diagnosis, including stale URLs and malformed blocks."""
+    missing = []
+    block = agent_pointer(config)
+    for name in INSTRUCTION_FILES:
+        try:
+            data = (Path(project["path"]).expanduser() / name).read_bytes()
+            if _replace_pointer(data, block) == data:
+                continue
+        except (OSError, SettingsError):
+            pass
+        missing.append(name)
+    return missing
+
+
+def setup_project(config, project, port=None):
+    """Explicit owner opt-in: initialize what is missing and commit only
+    files we changed. Serialize the add-project and existing-project routes.
+    Dirty target files refuse; unrelated work and staging are never included.
+    All CLI calls stay on the injectable server boundaries (task-175)."""
+    with _setup_lock:
+        root = Path(project["path"]).expanduser()
+        block = agent_pointer(config, port)
+        init_needed = not (root / "backlog/config.yml").is_file()
+        candidates = list(INSTRUCTION_FILES) + (["backlog/config.yml"] if init_needed else [])
+        originals = {}
+        planned = {}
+        try:
+            if not root.is_dir():
+                raise SettingsError(f"project path does not exist: {root}", 400)
+            for name in candidates:
+                target = root / name
+                if target.is_symlink() or (name.startswith("backlog/") and (root / "backlog").is_symlink()):
+                    raise SettingsError(f"setup refuses symlink: {name}", 409)
+                originals[name] = target.read_bytes() if target.exists() else None
+            for name in INSTRUCTION_FILES:
+                planned[name] = _replace_pointer(originals[name] or b"", block)
+        except OSError as exc:
+            raise SettingsError(f"cannot read setup files: {exc}", 409) from exc
+
+        targets = candidates if init_needed else [n for n in INSTRUCTION_FILES if planned[n] != originals[n]]
+        if not targets:
+            return {"project": project["name"], "writtenFiles": [], "commit": None}
+        proc = server.run_git(["status", "--porcelain", "--untracked-files=all", "--", *targets], cwd=str(root))
+        if proc.returncode:
+            raise SettingsError(f"cannot inspect setup files: {proc.stderr.strip()}", 502)
+        if proc.stdout.strip():
+            raise SettingsError("setup files have uncommitted changes; commit or move those changes first: "
+                                + proc.stdout.strip(), 409)
+
+        if init_needed:
+            proc = server.run_backlog_raw(
+                ["init", project["name"], "--defaults", "--integration-mode", "cli",
+                 "--agent-instructions", "claude,agents"], cwd=str(root))
+            if proc.returncode:
+                raise SettingsError("backlog init failed: " + (proc.stderr or proc.stdout).strip(), 502)
+
+        try:
+            for name in INSTRUCTION_FILES:
+                target = root / name
+                data = target.read_bytes() if target.exists() else b""
+                updated = _replace_pointer(data, block)
+                if updated != data:
+                    target.write_bytes(updated)
+            written = [n for n in candidates if (root / n).read_bytes() != originals[n]]
+        except OSError as exc:
+            raise SettingsError(f"setup could not write files: {exc}; inspect the project before retrying", 500) from exc
+        for args in (["add", "--", *written],
+                     ["commit", "--only", "-m", "chore: set up Backlog.md and Centrale", "--", *written]):
+            proc = server.run_git(args, cwd=str(root))
+            if proc.returncode:
+                raise SettingsError("setup files were written but could not be committed; "
+                                    "commit only " + ", ".join(written) + ": " + proc.stderr.strip(), 502)
+        proc = server.run_git(["rev-parse", "HEAD"], cwd=str(root))
+        return {"project": project["name"], "writtenFiles": written,
+                "commit": proc.stdout.strip() if proc.returncode == 0 else None}
+
+
+def _finalize_add_project(add_project, config, port=None):
+    """Do the opted-in setup even when Backlog already exists."""
     expanded = os.path.expanduser(add_project["path"])
     config_yml = os.path.join(expanded, "backlog", "config.yml")
+    if add_project["initBacklog"]:
+        setup_project(config, add_project, port)
+        return None
     if os.path.isfile(config_yml):
         return None
-    if not add_project["initBacklog"]:
-        return (
-            "this repo has no backlog/config.yml -- tick \"Initialize Backlog.md in this repo\" "
-            "to run 'backlog init' here, or initialize it yourself first"
-        )
-    proc = server.run_backlog_raw(
-        ["init", add_project["name"], "--defaults", "--integration-mode", "cli", "--agent-instructions", "claude,agents"],
-        cwd=expanded,
+    return (
+        'this repo has no backlog/config.yml -- tick "Set up Backlog.md and Centrale in this repo" '
+        "or initialize it yourself first"
     )
-    if proc.returncode != 0:
-        message = (proc.stderr or proc.stdout or "backlog init failed").strip()
-        return f"backlog init failed: {message}"
-    return None
 
 
-def apply_settings(config, body, path=None):
+def apply_settings(config, body, path=None, port=None):
     """Validates `body` (a partial /api/settings POST payload -- any of
-    "harvestMode", "refreshIntervalSeconds", "checkCommands" may be
+    "harvestMode", "refreshIntervalSeconds", "checkCommands", "maxAgents"
+    and "worktreeLinks" may be
     omitted, leaving that setting untouched) against the whitelist.
 
     Only once every *provided* field is valid does this update `config`
@@ -465,6 +569,12 @@ def apply_settings(config, body, path=None):
     "sessionPreviewMode" ("interact" | "view" | "off" -- the tiered
     task-60/61 drawer live-pane + reply knob, stored as projects.json's
     sessionPreview.mode),
+    "requireAgentAssignment" (a boolean -- task-171: whether a spawn
+    whose task has no assignee naming a configured agent is refused
+    rather than handed to the default agent),
+    "lockSpawnedTaskFiles" (a boolean -- task-172: whether a spawn makes
+    the main checkout's copy of the task file read-only while the task
+    is spawned),
     "defaultAgent" (must name a key in the configured agents map -- or,
     when "agents" is in the same request, in the map that request
     installs),
@@ -484,8 +594,9 @@ def apply_settings(config, body, path=None):
     Raises ValidationError, naming every invalid field at once, for bad
     values. Raises SettingsError for a structurally malformed body (e.g.
     "checkCommands" present but not an object) or a write failure.
-    Never partially applies: on any error, nothing in `config` or on
-    disk changes.
+    Validation precedes all writes. A setup failure can leave repository
+    files for the owner to inspect/commit; no project is added on that path.
+    A config-write failure after successful setup does not undo its commit.
 
     Returns current_settings(config) after applying.
     """
@@ -527,10 +638,39 @@ def apply_settings(config, body, path=None):
             if err:
                 fields[f"checkCommands.{name}"] = err
 
+    known_names = {p["name"] for p in config.get("projects", [])}
+    project_settings = {}
+    for key, normalizer in (
+        ("maxAgents", server.normalize_project_max_agents),
+        ("worktreeLinks", server.normalize_project_worktree_links),
+    ):
+        if key not in body:
+            continue
+        submitted = body[key]
+        if not isinstance(submitted, dict):
+            raise SettingsError(f"{key} must be an object mapping project name to value")
+        normalized = {}
+        for name, value in submitted.items():
+            field = f"{key}.{name}"
+            if not isinstance(name, str) or name not in known_names:
+                fields[field] = "unknown project"
+                continue
+            try:
+                normalized[name] = normalizer(value, f"projects.{name}.{key}")
+            except server.ConfigError as exc:
+                fields[field] = str(exc).removeprefix("projects.json: ")
+        project_settings[key] = normalized
+
     agents_map = None
     if "agents" in body:
         agent_fields, agents_map = _validate_agents(body.get("agents"), config)
         fields.update(agent_fields)
+
+    if "requireAgentAssignment" in body and not isinstance(body.get("requireAgentAssignment"), bool):
+        fields["requireAgentAssignment"] = "must be true or false"
+
+    if "lockSpawnedTaskFiles" in body and not isinstance(body.get("lockSpawnedTaskFiles"), bool):
+        fields["lockSpawnedTaskFiles"] = "must be true or false"
 
     default_agent = body.get("defaultAgent")
     if "defaultAgent" in body:
@@ -569,7 +709,7 @@ def apply_settings(config, body, path=None):
     # the "nothing changes unless the whole request is valid" guarantee
     # for everything that's just a config write.
     if add_project is not None:
-        err = _finalize_add_project(add_project)
+        err = _finalize_add_project(add_project, config, port)
         if err:
             raise ValidationError({"addProject.path": err})
 
@@ -577,11 +717,13 @@ def apply_settings(config, body, path=None):
         path, body, harvest_mode, refresh_interval, check_commands,
         default_agent, remove_project, add_project, session_preview_mode,
         agents_map,
+        project_settings,
     )
     _apply_to_live_config(
         config, body, harvest_mode, refresh_interval, check_commands,
         default_agent, remove_project, add_project, session_preview_mode,
         agents_map,
+        project_settings,
     )
 
     result = current_settings(config)
@@ -593,6 +735,7 @@ def _write_whitelisted_changes(
     path, body, harvest_mode, refresh_interval, check_commands,
     default_agent, remove_project, add_project, session_preview_mode=None,
     agents_map=None,
+    project_settings=None,
 ):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -619,6 +762,12 @@ def _write_whitelisted_changes(
 
     if "defaultAgent" in body:
         raw["defaultAgent"] = default_agent
+
+    if "requireAgentAssignment" in body:
+        raw["requireAgentAssignment"] = body["requireAgentAssignment"]
+
+    if "lockSpawnedTaskFiles" in body:
+        raw["lockSpawnedTaskFiles"] = body["lockSpawnedTaskFiles"]
 
     if agents_map is not None:
         raw_agents = raw.get("agents")
@@ -647,6 +796,20 @@ def _write_whitelisted_changes(
                 entry.pop("checkCommand", None)
             else:
                 entry["checkCommand"] = normalized
+        raw["projects"] = raw_projects
+
+    for key, values in (project_settings or {}).items():
+        raw_projects = raw.get("projects")
+        if not isinstance(raw_projects, list):
+            raw_projects = []
+        for entry in raw_projects:
+            if not isinstance(entry, dict) or entry.get("name") not in values:
+                continue
+            value = values[entry["name"]]
+            if value is None or value == []:
+                entry.pop(key, None)
+            else:
+                entry[key] = value
         raw["projects"] = raw_projects
 
     if add_project is not None:
@@ -694,6 +857,7 @@ def _apply_to_live_config(
     config, body, harvest_mode, refresh_interval, check_commands,
     default_agent, remove_project, add_project, session_preview_mode=None,
     agents_map=None,
+    project_settings=None,
 ):
     if agents_map is not None:
         # Same canonical shape server.normalize_agents_map produces, so
@@ -717,12 +881,20 @@ def _apply_to_live_config(
         config["refreshIntervalSeconds"] = refresh_interval
     if "defaultAgent" in body:
         config["defaultAgent"] = default_agent
+    if "requireAgentAssignment" in body:
+        config["requireAgentAssignment"] = body["requireAgentAssignment"]
+    if "lockSpawnedTaskFiles" in body:
+        config["lockSpawnedTaskFiles"] = body["lockSpawnedTaskFiles"]
     if "removeProject" in body:
         config["projects"] = [p for p in config.get("projects", []) if p["name"] != remove_project]
     if "checkCommands" in body:
         for project in config.get("projects", []):
             if project["name"] in check_commands:
                 project["checkCommand"] = _normalized_check_command(check_commands[project["name"]])
+    for key, values in (project_settings or {}).items():
+        for project in config.get("projects", []):
+            if project["name"] in values:
+                project[key] = list(values[project["name"]]) if key == "worktreeLinks" else values[project["name"]]
     if add_project is not None:
         config.setdefault("projects", []).append({
             "name": add_project["name"],
@@ -730,6 +902,8 @@ def _apply_to_live_config(
             "browserPort": None,
             "checkCommand": None,
             "checkTimeoutSeconds": server.DEFAULT_CHECK_TIMEOUT_SECONDS,
+            "maxAgents": None,
+            "worktreeLinks": [],
         })
 
 

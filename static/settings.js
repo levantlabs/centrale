@@ -86,6 +86,8 @@
   function populateSettingsForm(data) {
     lastSettingsData = data;
     C.byId("settings-harvest-mode-toggle").checked = data.harvestMode === "auto";
+    C.byId("settings-require-agent-toggle").checked = data.requireAgentAssignment !== false;
+    C.byId("settings-lock-task-files-toggle").checked = data.lockSpawnedTaskFiles !== false;
     C.byId("settings-session-preview-toggle").checked = data.sessionPreviewMode !== "off";
     C.byId("settings-session-reply-toggle").checked = data.sessionPreviewMode === "interact";
     syncSettingsReplyToggle();
@@ -94,6 +96,8 @@
     var container = C.byId("settings-check-commands");
     C.clearChildren(container);
     var checkCommands = data.checkCommands || {};
+    var maxAgents = data.maxAgents || {};
+    var worktreeLinks = data.worktreeLinks || {};
     // task-158: the names come from THIS payload, never from the board's
     // C.knownProjects. That list is "every project name ever seen" and
     // is only ever pushed to, so a removed project stayed in it and its
@@ -110,14 +114,54 @@
       input.type = "text";
       input.className = "settings-input";
       input.setAttribute("data-project", name);
+      input.setAttribute("data-setting", "checkCommand");
       input.placeholder = "e.g. python3 -m unittest discover tests";
       input.value = checkCommands[name] || "";
       row.appendChild(input);
       var err = C.h("div", { className: "settings-field-error" });
       err.hidden = true;
       err.setAttribute("data-project-error", name);
+      err.setAttribute("data-setting-error", "checkCommand");
       row.appendChild(err);
       container.appendChild(row);
+
+      // task-177: these are project config beside checkCommand. The
+      // textarea holds literal repo-relative paths, one per line.
+      var capRow = C.h("div", { className: "settings-check-command-row" });
+      capRow.appendChild(C.h("span", { className: "settings-check-command-name", text: name + " · max agents" }));
+      var capInput = document.createElement("input");
+      capInput.type = "number";
+      capInput.min = "1";
+      capInput.step = "1";
+      capInput.className = "settings-input";
+      capInput.setAttribute("data-project", name);
+      capInput.setAttribute("data-setting", "maxAgents");
+      capInput.placeholder = "No limit";
+      capInput.value = maxAgents[name] == null ? "" : String(maxAgents[name]);
+      capRow.appendChild(capInput);
+      var capError = C.h("div", { className: "settings-field-error" });
+      capError.hidden = true;
+      capError.setAttribute("data-project-error", name);
+      capError.setAttribute("data-setting-error", "maxAgents");
+      capRow.appendChild(capError);
+      container.appendChild(capRow);
+
+      var linksRow = C.h("div", { className: "settings-check-command-row" });
+      linksRow.appendChild(C.h("span", { className: "settings-check-command-name", text: name + " · links" }));
+      var linksInput = document.createElement("textarea");
+      linksInput.className = "settings-input";
+      linksInput.rows = 2;
+      linksInput.setAttribute("data-project", name);
+      linksInput.setAttribute("data-setting", "worktreeLinks");
+      linksInput.placeholder = ".venv (one repo-relative path per line)";
+      linksInput.value = (worktreeLinks[name] || []).join("\n");
+      linksRow.appendChild(linksInput);
+      var linksError = C.h("div", { className: "settings-field-error" });
+      linksError.hidden = true;
+      linksError.setAttribute("data-project-error", name);
+      linksError.setAttribute("data-setting-error", "worktreeLinks");
+      linksRow.appendChild(linksError);
+      container.appendChild(linksRow);
     });
 
     settingsAgentRows = (data.agentEntries || []).map(function (e) {
@@ -486,7 +530,9 @@
 
     var name = C.byId("settings-add-project-name").value;
     var path = C.byId("settings-add-project-path").value;
-    var initBacklog = C.byId("settings-add-project-init").checked;
+    // Keep the API key for existing clients; the checkbox now opts into
+    // both Backlog initialization and Centrale's guide pointer (task-175).
+    var setupProject = C.byId("settings-add-project-init").checked;
 
     settingsProjectActionInFlight = true;
     var btn = C.byId("settings-add-project-btn");
@@ -498,7 +544,7 @@
     fetch("/api/settings", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ addProject: { name: name, path: path, initBacklog: initBacklog } })
+      body: JSON.stringify({ addProject: { name: name, path: path, initBacklog: setupProject } })
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
         if (!res.ok) {
@@ -564,12 +610,15 @@
       C.byId("settings-agents-section").open = true;
       return true;
     }
-    // "checkCommands.<project>" -- shown under that project's own row,
+    // Per-project setting errors -- shown under that project's own row,
     // when there is one: the server validates against projects.json, so
     // it can name a project this form is not showing.
-    if (fieldName.indexOf("checkCommands.") === 0) {
-      var project = fieldName.slice("checkCommands.".length);
-      var rowErr = document.querySelector('#settings-check-commands [data-project-error="' + project + '"]');
+    var projectSetting = fieldName.split(".")[0];
+    if (["checkCommands", "maxAgents", "worktreeLinks"].indexOf(projectSetting) !== -1 &&
+        fieldName.indexOf(projectSetting + ".") === 0) {
+      var project = fieldName.slice(projectSetting.length + 1);
+      var setting = projectSetting === "checkCommands" ? "checkCommand" : projectSetting;
+      var rowErr = document.querySelector('#settings-check-commands [data-setting-error="' + setting + '"][data-project-error="' + project + '"]');
       if (rowErr) {
         rowErr.hidden = false;
         rowErr.textContent = message;
@@ -614,15 +663,46 @@
     saveBtn.disabled = true;
 
     var checkCommands = {};
-    document.querySelectorAll("#settings-check-commands input[data-project]").forEach(function (input) {
+    document.querySelectorAll('#settings-check-commands input[data-setting="checkCommand"]').forEach(function (input) {
       checkCommands[input.getAttribute("data-project")] = input.value;
+    });
+    var maxAgents = {};
+    var capErrors = {};
+    document.querySelectorAll('#settings-check-commands input[data-setting="maxAgents"]').forEach(function (input) {
+      // A native number input can report value="" for an unfinished
+      // token such as "-" or "1e" while badInput is true. It is not a
+      // request to clear the existing cap (task-177).
+      if (input.validity && input.validity.badInput) {
+        capErrors["maxAgents." + input.getAttribute("data-project")] =
+          "Finish the number, or clear the field to remove the limit.";
+        return;
+      }
+      var value = input.value.trim();
+      maxAgents[input.getAttribute("data-project")] = value === "" ? null :
+        (/^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : value);
+    });
+    if (Object.keys(capErrors).length) {
+      setSettingsStatus(applySettingsFieldErrors(capErrors), "error");
+      settingsSaveInFlight = false;
+      saveBtn.disabled = false;
+      return;
+    }
+    var worktreeLinks = {};
+    document.querySelectorAll('#settings-check-commands textarea[data-setting="worktreeLinks"]').forEach(function (input) {
+      worktreeLinks[input.getAttribute("data-project")] = input.value.split(/\r?\n/).map(function (line) {
+        return line.trim();
+      }).filter(function (line) { return line !== ""; });
     });
 
     var body = {
       harvestMode: C.byId("settings-harvest-mode-toggle").checked ? "auto" : "click",
+      requireAgentAssignment: C.byId("settings-require-agent-toggle").checked,
+      lockSpawnedTaskFiles: C.byId("settings-lock-task-files-toggle").checked,
       sessionPreviewMode: settingsSessionPreviewModeFromToggles(),
       refreshIntervalSeconds: parseInt(C.byId("settings-refresh-interval").value, 10),
       checkCommands: checkCommands,
+      maxAgents: maxAgents,
+      worktreeLinks: worktreeLinks,
       defaultAgent: C.byId("settings-default-agent").value
     };
     // task-78: only a touched Agents section rewrites the map -- an
@@ -664,7 +744,7 @@
         C.sessionPreviewMode = data.sessionPreviewMode;
         C.syncDrawerPanePolling();
       }
-      C.doRefresh(true); // harvestMode/refreshIntervalSeconds/sessionPreviewMode may have changed
+      C.doRefresh(true); // harvestMode/refreshIntervalSeconds/sessionPreviewMode/requireAgentAssignment may have changed
     }).catch(function (err) {
       var summary = err.fields ? applySettingsFieldErrors(err.fields) : "";
       setSettingsStatus(summary || err.message || String(err), "error");

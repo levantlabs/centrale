@@ -1,0 +1,30 @@
+
+ ▐▛███▛█   Claude Code v2.1.283
+▝▜██████▀  Opus 5.5 · Claude Max
+ ▝▝   ▝▝   ~/src/.centrale-worktrees/my-app-task-9
+
+
+❯ centrale probe 1702: reply with only the word pong
+
+● pong
+
+✻ Worked for 1s · done 2:54 PM
+
+❯ centrale probe 1702 long: this is a deliberately long message that should wrap across several
+  lines of a one hundred column pane so that the echo check can be measured against real word
+  wrapping; reply with only the word pong
+
+● pong
+
+✻ Churned for 1s · done 2:54 PM
+
+
+
+
+
+
+────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⚠ Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker · restart with CLAUDE_C…
+  ⏵⏵ auto mode on (shift+tab to cycle)

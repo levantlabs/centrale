@@ -140,12 +140,12 @@ function removeButtonNodes() {
   return byId("settings-projects-list").querySelectorAll("button");
 }
 function checkCommandRows() {
-  return byId("settings-check-commands").querySelectorAll("input[data-project]")
+  return byId("settings-check-commands").querySelectorAll('input[data-setting="checkCommand"]')
     .map(function (input) { return input.getAttribute("data-project"); });
 }
 function checkCommandValues() {
   var out = {};
-  byId("settings-check-commands").querySelectorAll("input[data-project]").forEach(function (input) {
+  byId("settings-check-commands").querySelectorAll('input[data-setting="checkCommand"]').forEach(function (input) {
     out[input.getAttribute("data-project")] = input.value;
   });
   return out;
@@ -210,7 +210,7 @@ renderBoardFromServer().then(function (board) {
   };
 
   // 3. Configure it: a check command, saved through the main Save.
-  byId("settings-check-commands").querySelectorAll("input[data-project]")[0]
+  byId("settings-check-commands").querySelectorAll('input[data-setting="checkCommand"]')[0]
     .value = "echo first-run-check";
   byId("settings-save").click();
   return waitFor("the save to land", function () {

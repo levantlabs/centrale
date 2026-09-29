@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 
+import orchestrator
 import server
 import spawn
 
@@ -154,6 +155,7 @@ def _record_event(project_name, report, trigger, error=None):
             event["reason"] = f"{failed['name']}: {failed.get('reason')}"
     with _events_lock:
         _events.append(event)
+        orchestrator.publish_harvest(event)
 
 
 def recent_events(project_name=None):
@@ -1108,6 +1110,11 @@ def _harvest_branch_locked(config, project, project_name, task_id):
         stderr = (merge_proc.stderr or merge_proc.stdout or "merge failed").strip()
         server.run_git(["merge", "--abort"], cwd=repo_path)
         raise HarvestError(f"merge of {branch} into {base_branch} failed unexpectedly: {stderr}", status=500)
+
+    # task-172: the merge has already released the task file's lock if it
+    # touched the file (git replaces it, and the replacement is
+    # writable); this covers a merge that did not.
+    spawn.unlock_task_file(repo_path, task_id)
 
     warnings = []
     wt_dir = spawn.worktree_dir(config, project_name, task_id)

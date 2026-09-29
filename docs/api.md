@@ -10,7 +10,8 @@ together, and the manual chapters — [board.md](board.md), [agents.md](agents.m
 product-level behavior (the board, spawning, merging, settings) each endpoint
 backs; the root [README](../README.md) is the front door.
 
-All responses are JSON. All examples below assume the shipped default port
+Responses are JSON except successful `GET /api/orchestrator-wait` answers,
+which are one plain-text line. All examples below assume the shipped default port
 (`7420`) and are copy-pasteable as-is against a running server — the `GET`
 ones were captured from a real instance; the `POST` ones are shaped from the
 code (see each section for how, since most of them mutate real state — a
@@ -152,7 +153,8 @@ server never leaks a traceback to the client. The status generally means:
 | 400 | Malformed input — a missing/invalid `project`, `taskId`, request body, or (for `/api/settings`) a field that failed validation. |
 | 403 | A request refused by the trust boundary — a `Host` that isn't a loopback name at the bound port, a `Sec-Fetch-Site` other than `same-origin`/`none`, or an `Origin`/`Referer` that isn't this server's own. `GET` and `POST` alike; see "Request requirements" above. (Also `/api/session-pane` and `/api/session-input` when `sessionPreview.mode` disables them.) |
 | 404 | The named project (or, for `/api/end-session`, the session) doesn't exist. Also: nothing to act on — no worktree *and* no branch for `/api/cleanup-branch`, `/api/discard-preview` and `/api/discard-attempt`, or no worktree for `/api/abandon-worktree`. |
-| 409 | A conflicting state — a session already live for that project+task, a task already Done, a `task/<id>` branch checked out in a worktree Centrale doesn't manage (`/api/spawn`, `/api/resume`, `/api/cleanup-branch`, `/api/discard-attempt` and `/api/abandon-worktree` all refuse this with the same sentence naming that checkout), a repository that moved since the preview a destructive confirm was armed from (`/api/discard-attempt`, `/api/abandon-worktree`), or (for `/api/cleanup-branch`) a branch that isn't fully merged yet. |
+| 409 | A conflicting state — a session already live for that project+task, a task already Done, a `task/<id>` branch checked out in a worktree Centrale doesn't manage (`/api/spawn`, `/api/resume`, `/api/cleanup-branch`, `/api/discard-attempt` and `/api/abandon-worktree` all refuse this with the same sentence naming that checkout), a repository that moved since the preview a destructive confirm was armed from (`/api/discard-attempt`, `/api/abandon-worktree`), a branch that isn't fully merged yet (`/api/cleanup-branch`), or (`/api/cleanup-branch`, without `force`) a live process still running with its cwd under the worktree. Also `/api/deliver` when a dialog occupies the agent's pane. |
+| 504 | `POST /api/deliver` only: the text was sent to the agent's pane, but its echo never appeared (see that section). |
 | 500 | An unexpected failure in a subprocess Centrale fully controls (`git`, `tmux`, launching `backlog browser`) — the operation was attempted and didn't work, not a validation problem. |
 | 415 | A `POST` whose body isn't declared `Content-Type: application/json` — see "Request requirements" above. |
 | 502 | A failure in the `backlog` CLI itself, or a project `path` that no longer exists — Centrale asked an external tool for data and didn't get a usable answer. |
@@ -185,6 +187,7 @@ one project/task trimmed for length):
     {
       "name": "my-app",
       "path": "/home/user/code/my-app",
+      "maxAgents": null,
       "error": null,
       "statuses": ["To Do", "In Progress", "Done"],
       "tasks": [
@@ -207,7 +210,8 @@ one project/task trimmed for length):
           "branchCheckout": null,
           "alreadyMerged": false,
           "milestoneTitle": "mobile-fixes",
-          "lastDiscardedAt": null
+          "lastDiscardedAt": null,
+          "taskFileLocked": false
         }
       ]
     }
@@ -216,14 +220,19 @@ one project/task trimmed for length):
   "version": "v0.1.0-14-g4570911",
   "codeDrift": null,
   "harvestMode": "click",
+  "spawnAgents": {"names": ["claude", "codex"], "defaultAgent": "claude", "required": true},
   "refreshIntervalSeconds": 10,
   "sessionPreviewMode": "interact"
 }
 ```
 
+Each project's `maxAgents` is its configured positive integer cap or `null`
+for no cap. The frontend derives the live count from `/api/sessions`; the
+server always checks tmux again when launching, independent of board cache.
+
 Every task from `backlog task list --json` round-trips as-is (`id`, `title`,
 `status`, `priority`, `assignees`, `labels`, `milestone`, `ordinal`,
-timestamps, ...), plus nine fields Centrale adds:
+timestamps, ...), plus ten fields Centrale adds:
 
 - `ready` — from `backlog task list --ready --json`: unblocked by its
   dependencies.
@@ -285,6 +294,14 @@ timestamps, ...), plus nine fields Centrale adds:
   branch is indistinguishable from one claimed by a worker Centrale
   cannot see, so the spawn confirm names the discard when a tag says the
   user threw the last attempt away themselves.
+- `taskFileLocked` — the task's own file in this checkout
+  (`backlog/tasks/<id> - *.md`) is read-only: spawned, and locked so the
+  agent on its branch is its only writer (task-172; see [Ruling on a
+  spawned task](agents.md#ruling-on-a-spawned-task)). Read from the
+  files' modes on every load — one directory listing per project, one
+  `stat` per task file — never stored. The card shows "task file
+  locked"; `backlog task edit` on that copy fails with `EACCES`, and a
+  ruling goes through [`POST /api/rule`](#post-apirule) instead.
 
 A project whose `path` doesn't exist, or whose `backlog` CLI call fails or
 returns an unsupported schema, gets `"error": "<message>"` and empty
@@ -293,7 +310,10 @@ other configured project still loads normally.
 
 **Top-level flags:** besides `projects`, every response carries
 `capabilities` (`{"tmux": bool}`), `version`, `codeDrift`, `harvestMode` (`"click"` |
-`"auto"`),
+`"auto"`), `spawnAgents` (task-171: `names`, the configured agents in
+`projects.json` order; `defaultAgent`, the effective default; `required`,
+`requireAgentAssignment` — what the spawn control needs to name the agent
+it will launch, and to offer a picker when the task's assignee names none),
 `refreshIntervalSeconds`, and `sessionPreviewMode` (`"interact"` | `"view"` |
 `"off"` — the tiered `sessionPreview.mode` knob behind `GET /api/session-pane`
 / `POST /api/session-input` and the drawer's live pane and reply row; the
@@ -335,7 +355,7 @@ from a running server — see
 
 **Caching:** `get_board()` caches its result in memory for `CACHE_TTL_SECONDS`
 (5 seconds) across *all* callers, keyed on nothing but time — not
-per-project, not per-client. `capabilities`, `harvestMode`,
+per-project, not per-client. `capabilities`, `harvestMode`, `spawnAgents`,
 `refreshIntervalSeconds`, and `sessionPreviewMode` are computed fresh on every request and layered onto
 the cached (or freshly fetched) board data, so they're never stale even when
 the board itself is served from cache. `version` is layered on the same
@@ -705,6 +725,250 @@ was pasted but before Enter went in; the message names the tmux command —
 first deletes the buffer it would have consumed, so nothing lingers in the
 tmux buffer list).
 
+## `POST /api/deliver`
+
+Delivers one line of text to a project/task's live agent **and confirms it
+arrived**: the one supported way for a program — an orchestrating session,
+a script, another agent — to message a spawned agent. Use it instead of
+hand-rolling `tmux load-buffer`/`paste-buffer`/`send-keys`: "sent" is a
+hope, and this endpoint returns either the echo that proves the text landed
+or an explicit failure saying why it did not. Every attempt is recorded in
+the delivery log (`GET /api/deliveries` below).
+
+**Body:** `{"project", "taskId", "sender", "text"}` (`taskId` is also
+accepted as `task`); every other field is rejected. `text` follows exactly
+the rules of `POST /api/session-input`'s `"text"`: one line of printable
+text, 1–1000 characters. `sender` is required — a short name for who is
+speaking (1–100 characters, one line), recorded in the log with the text.
+
+Unlike `POST /api/session-input`, this needs **no prior pane capture**: it
+does its own, before and after. Nor is it switched off by
+`sessionPreview.mode`, which governs the drawer's pane and reply row; this
+is the orchestration channel, and every use of it is logged.
+
+```bash
+curl -s -X POST 'http://127.0.0.1:7420/api/deliver' \
+  -H 'Content-Type: application/json' \
+  -d '{"project": "my-app", "taskId": "TASK-2", "sender": "orchestrator", "text": "Ruling: keep the old flag, deprecate it in the next release"}'
+```
+
+**Response** — delivered (`200`), shaped from the code:
+
+```json
+{
+  "id": "5f0c3c2b9d6e4f5aa1d2c3b4e5f60718",
+  "time": "2026-09-26T19:04:11Z",
+  "project": "my-app",
+  "task": "TASK-2",
+  "sender": "orchestrator",
+  "text": "Ruling: keep the old flag, deprecate it in the next release",
+  "session": "centrale-my-app-task-2",
+  "outcome": "delivered",
+  "echo": "❯ Ruling: keep the old flag, deprecate it in the next release",
+  "echoAt": "2026-09-26T19:04:12Z",
+  "dialog": null,
+  "reason": null,
+  "ok": true,
+  "logged": true
+}
+```
+
+The body is the log entry (below) plus `ok`, `logged` and, when the log
+could not be written, `logError` — the delivery result stands, but you are
+told it went unrecorded. `echo` is the pane line that showed the text;
+`echoAt` is when it was seen. A failure has `ok: false`, the same fields,
+and `error` (equal to `reason`):
+
+| `outcome` | Status | Meaning |
+| --- | --- | --- |
+| `delivered` | 200 | The text was pasted and a capture afterwards showed it echoed. |
+| `no-session` | 404 | No live session for that project/task (including no tmux server), or the session ended mid-delivery. |
+| `dialog` | 409 | A dialog occupies the pane. Checked **before** anything is pasted — `dialog` carries the line that gave it away and `error` says nothing was sent. Also reported if the echo never came and a dialog is on the pane afterwards (then `error` says the text *was* sent). |
+| `no-echo` | 504 | The text was sent, but no echo of it appeared within 5 seconds. |
+| `tmux-error` | 500 | A tmux call failed for another reason; `error` names it. |
+
+```json
+{
+  "outcome": "dialog",
+  "dialog": "Enter to confirm · Esc to cancel",
+  "reason": "a dialog is occupying the pane ('Enter to confirm · Esc to cancel'); nothing was sent",
+  "error": "a dialog is occupying the pane ('Enter to confirm · Esc to cancel'); nothing was sent",
+  "ok": false,
+  "...": "the rest of the log entry"
+}
+```
+
+**Behavioral notes:**
+
+- **One paste path.** The send is `POST /api/session-input`'s own
+  bracketed paste — `load-buffer` from stdin, `paste-buffer -d -p`,
+  `send-keys Enter`, all against the exact-match `=<session>:` target —
+  through the same function. Only the checks around it are new.
+- **Dialog check first.** Pasted text would land *in* a dialog, and the
+  Enter after it would confirm whatever option the dialog has focused. So
+  the pane is captured first and a dialog refuses the delivery. A dialog is
+  recognised from the rendered text, among the bottom 12 non-blank lines: a
+  key-hint footer naming Enter then Esc (Claude Code's `Enter to confirm ·
+  Esc to cancel`, codex's `enter continue · esc back` and `Press enter to
+  confirm or esc to cancel`), or a cursor on a numbered menu (`❯ 1. Yes`
+  next to `2. …`). These were taken from real Claude Code 2.1.283 and codex
+  0.157.1 panes (`tests/fixtures/panes/`); it is a heuristic, and a dialog
+  that looks like neither will not be caught before the send — it then
+  surfaces as `no-echo`, not success. Clear a dialog with
+  `POST /api/session-input`'s `{"key": "Escape"}` after looking at the pane.
+- **What counts as the echo.** A pane line with a prompt glyph (`❯` Claude
+  Code, `›` codex, `>` generic) followed by the message — all of it, or,
+  when the TUI wrapped it, a leading run of at least 20 characters of it.
+  Whitespace is collapsed. Codex's `↳ <text>` rows under “Messages to be
+  submitted after next tool call” also count. An arrow outside that queue
+  region does not count, nor does an agent reply quoting the words.
+- **An earlier identical message cannot pass for this one.** Echo lines for
+  this text are counted before the send (over the last 200 lines,
+  scrollback included); delivery needs *more* of them afterwards. The pane
+  is re-captured every 0.25 s for up to 5 s. Both measured agents echo a
+  submitted line within a second.
+- **What the echo does not prove.** That the agent has read or acted on the
+  text: it shows the text reached the pane as a prompt or queued message. Sent to a
+  *busy* Claude Code agent, the message is shown queued (`❯ <text>` with
+  `ctrl+enter to send now` under it) and counts as delivered; the agent
+  takes it at its next turn — verified against 2.1.283. Busy Codex 0.157.1
+  can show “Messages to be submitted after next tool call” and `↳ <text>`;
+  that is delivered too, with the queued row returned as `echo`. A 504
+  `no-echo` means confirmation failed, not proof the text was lost: inspect
+  the screen before retrying. A plain capture
+  also cannot tell a submitted prompt from text still in the composer, nor
+  from Claude Code's dim ghost-text suggestion there, which renders behind
+  the same glyph and is sometimes a verbatim earlier prompt. So resending
+  an *identical* message is the one case where a lost delivery could still
+  read as delivered: the baseline count covers the transcript, not a ghost
+  that appears afterwards. Vary the wording of a repeat (a counter or a
+  time is enough).
+- **One delivery per session at a time**, so two concurrent ones cannot
+  each count the other's echo.
+- The ownership rule is `POST /api/session-input`'s: the session name is
+  derived from project+task, never accepted from the client, and must
+  resolve back to this board task (else `no-session`).
+- **No task file is written.** The record of what was said is the delivery
+  log, which is Centrale's, not the board's.
+
+**Errors that are not attempts** — 400 for a missing/malformed body, a
+missing `project`, an invalid/missing `taskId`, a missing/over-long/multi-
+line `sender`, a missing/empty/multi-line/over-long `text`, or an unknown
+field; 404 for an unknown project. These touch no tmux and are **not**
+logged; everything else is.
+
+## `GET /api/deliveries[?project=<name>&task=<taskId>&limit=N]`
+
+The delivery log: every `POST /api/deliver` attempt that got past
+validation, oldest first, the last `limit` matching entries (default 100,
+1–1000). `project` and `task` narrow it (the task id matches
+case-insensitively); both optional.
+
+```bash
+curl -s 'http://127.0.0.1:7420/api/deliveries?project=my-app&task=TASK-2&limit=20'
+```
+
+**Response** (shaped from the code):
+
+```json
+{
+  "log": "/home/user/.local/state/centrale/deliveries.jsonl",
+  "deliveries": [
+    {
+      "id": "5f0c3c2b9d6e4f5aa1d2c3b4e5f60718",
+      "time": "2026-09-26T19:04:11Z",
+      "project": "my-app",
+      "task": "TASK-2",
+      "sender": "orchestrator",
+      "text": "Ruling: keep the old flag, deprecate it in the next release",
+      "session": "centrale-my-app-task-2",
+      "outcome": "delivered",
+      "echo": "❯ Ruling: keep the old flag, deprecate it in the next release",
+      "echoAt": "2026-09-26T19:04:12Z",
+      "dialog": null,
+      "reason": null
+    }
+  ],
+  "skippedLines": 0
+}
+```
+
+Each entry: `id`, `time` (when the attempt began, UTC), `project`, `task`,
+`sender`, `text`, `session`, `outcome` (see the table above), and `echo`,
+`echoAt`, `dialog`, `reason` — each `null` where it does not apply.
+`skippedLines` counts lines in the file that were not a JSON object: never
+silently dropped.
+
+**The file.** JSON Lines at `$CENTRALE_DELIVERY_LOG` if set, else
+`$XDG_STATE_HOME/centrale/deliveries.jsonl`, else
+`~/.local/state/centrale/deliveries.jsonl`. State rather than cache,
+because it is the record of what agents were told. It is append-only and
+never rotated by Centrale; deleting it loses history and nothing else, since
+nothing on the board is derived from it. A missing file reads as an empty
+log.
+
+**Errors:** 400 for a `limit` outside 1–1000 or a malformed `task`. 500 if
+the file exists but cannot be read.
+
+## `POST /api/rule`
+
+Rules on a spawned task (task-172): **one call, whichever case the task is
+in**, so a caller never has to know whether an agent is running. While a
+task is spawned its task file has one writer — the agent — and the main
+checkout's copy is locked (`GET /api/board`'s `taskFileLocked`), so a ruling
+reaches the file through the agent rather than around it.
+
+**Body:** `{"project", "taskId", "sender", "text"}` — exactly `POST
+/api/deliver`'s body and rules (`taskId` also accepted as `task`; `sender`
+required, one line, 1–100 characters; `text` one line). The delivered line,
+`[ruling from <sender>] <text>`, must itself fit the 1000-character limit.
+
+```bash
+curl -s -X POST 'http://127.0.0.1:7420/api/rule' \
+  -H 'Content-Type: application/json' \
+  -d '{"project": "my-app", "taskId": "TASK-2", "sender": "orchestrator", "text": "Keep the old flag; deprecate it next release"}'
+```
+
+**With a live agent** — the ruling is delivered as `[ruling from
+orchestrator] Keep the old flag; deprecate it next release` through `POST
+/api/deliver`'s own deliver-confirm-and-log path, and the answer is that
+delivery's: the same status and body (a delivery-log entry plus `ok`,
+`logged`, ...), with `"mode": "delivered"`. A `dialog`, `no-echo` or
+`tmux-error` outcome is returned as it is — the agent is live, so nothing
+is written around it. The spawn prompt tells the agent to record a message
+of that shape on its task as a comment authored by the sender, then act on
+it; the delivery log records what was sent even if the agent fails to
+write it down.
+
+**With no live agent** (the session ended, the branch is not yet merged —
+or the session ended mid-delivery, a `no-session` outcome): nobody to
+message and nobody to race with. Under the task's lifecycle lock Centrale
+runs `backlog task edit <id> --comment <text> --comment-author <sender>` in
+the task's Centrale worktree and commits that one file on the task branch
+(`git commit --only -m "backlog: ruling on <id> from <sender>" -- <path>`):
+
+```json
+{
+  "branch": "task/task-2",
+  "worktree": "/home/user/code/my-app/.centrale-worktrees/my-app-task-2",
+  "path": "backlog/tasks/task-2 - Fix-the-thing.md",
+  "commit": "4b1d0c7e9a2f3e6d5c8b7a6f5e4d3c2b1a0f9e8d",
+  "mode": "committed"
+}
+```
+
+The next Resume starts on a branch whose task file carries the ruling.
+
+**Errors:** 400/404 as `POST /api/deliver` (nothing touched). **409** when
+there is nothing to write into: no `task/<id>` branch (the task is not
+spawned, so its file is not locked — edit it directly), a parked branch (no
+worktree; its main-checkout copy is unlocked), a branch checked out outside
+Centrale, or a worktree whose copy of the task file already has uncommitted
+edits (a commit labelled as a ruling must carry only the ruling); also 409
+when a session started while the ruling was being written — send it again,
+and it is delivered. **502** when listing sessions, the `backlog` edit, or
+the `git` stage/commit fails.
+
 ## `GET /api/harvest?project=<name>`
 
 Evaluates every `task/<id>` branch in a project against the five merge safety
@@ -818,6 +1082,94 @@ polls for auto-mode results without a websocket; see "Auto mode" in
 **Errors:** 400 for a missing `project` param. 404 for an unknown project.
 502 if the project's `path` doesn't exist.
 
+## `GET /api/orchestrator-wait?project=NAME[&after=CURSOR][&timeout=SECONDS]`
+
+Optional, project-scoped long wait for an orchestrating agent. Uses the
+existing lifecycle hooks and harvest attempt results; it performs no board
+polling, detection, spawning or merging. Nothing calls it unless a client
+opts in. See the [Claude loop](agents.md#waiting-for-orchestrator-events-optional).
+
+```bash
+curl --fail-with-body --silent --show-error --max-time 70 --get \
+  'http://127.0.0.1:7420/api/orchestrator-wait' \
+  --data-urlencode 'project=my-app' --data-urlencode 'timeout=60'
+```
+
+A 200 response is `text/plain; charset=utf-8`, `Cache-Control: no-store`,
+exactly one newline-terminated line. The first space separates an opaque
+cursor (no whitespace) from the event. Example responses (cursor ids vary):
+
+```text
+73549c8fd3094359aeb1345345bc1bb6:1 TASK-2 finished (ready to review)
+73549c8fd3094359aeb1345345bc1bb6:2 TASK-3 waiting for input
+73549c8fd3094359aeb1345345bc1bb6:3 TASK-2 merged
+73549c8fd3094359aeb1345345bc1bb6:4 TASK-4 merge blocked: checkCommand: tests failed
+73549c8fd3094359aeb1345345bc1bb6:5 TASK-5 idle (turn ended, may need input)
+```
+
+These illustrate five separate calls, not five lines from one call.
+`finished` is a hook observation inviting review, never proof of Done or
+permission to merge. Duplicate consecutive hooks for the same public state
+produce one notification; a new turn can produce another. Codex turn-end
+produces an `idle (turn ended, may need input)` notification, preserving
+its ambiguity. It can even arrive during ongoing work; read the current
+screen before acting on a Codex idle event. A Codex `waiting` hook only
+produces a notification after persisting for 30 seconds and a pane capture
+confirming an input dialog. Automatic reviews and approved tools still
+running do not publish waiting. A still-unconfirmed candidate is checked
+again every 30 seconds until activity/turn-end cancels it, the session ends,
+or a dialog is confirmed. Confirmation sets the badge and publishes exactly
+one event together. Claude notifications are unchanged.
+Harvest emits for actual attempts (click or auto), never an evaluate-only
+GET. Blocked attempts name the first failed gate and its reason;
+request/merge errors carry their error text. An already-merged attempt
+returns `TASK-2 merged (already merged)`. Multiline reasons are flattened
+to one line.
+
+An unchanged harvest line is suppressed per project/task, comparing with
+the last harvest line published for that task. This includes blocked,
+already-merged and error outcomes. A changed line is delivered, including
+a return to an earlier outcome after a different one. Hook events and
+other tasks do not reset that comparison. Only a real merge (`merged: true`)
+always publishes, even when repeated. Every published harvest line becomes
+the comparison for the next attempt. This prevents each auto-harvest cycle
+waking the master about the same unfinished branch, already-merged branch
+or recurring error; the dashboard's attempt log still records every attempt.
+
+Pass the last returned cursor as `after` to get **the next** project event,
+including events received while nobody was waiting. Omit `after` on the
+first call to start at the oldest event from this server run. Retrying the
+same cursor returns the same event, allowing recovery if a response is
+lost; clients advance only after handling that event. Independent callers
+have independent cursors. This is replayable delivery, not an exactly-once
+guarantee for a client's actions: reconcile an interrupted merge/spawn
+before retrying it.
+
+`timeout` is finite seconds from 0 through 300 (fractional values allowed),
+default 60; 0 reads without waiting. Expiry returns 200 with the unchanged
+cursor and the plain message `nothing yet`:
+
+```text
+73549c8fd3094359aeb1345345bc1bb6:5 nothing yet
+```
+
+Call again with that cursor. Use a client timeout longer than the server's
+wait. An abandoned connection holds at most its bounded request wait and
+consumes no events. Other HTTP requests continue while a call waits.
+
+History is in memory for the lifetime of the server process, with no size
+or age eviction; memory grows with notification count. Server restart
+clears it. A cursor from before restart, from another project, or ahead
+of the stream returns **409 JSON**, explicitly refusing to hide a gap:
+reconcile current tasks/sessions/branches through the ordinary APIs, then
+restart without `after`. Notifications are historical observations; act
+on freshly read task/session/gate state. No disk log or new external
+resource is introduced.
+
+Errors use the ordinary JSON `{"error": ...}` shape: **400** missing
+project, malformed cursor or invalid timeout; **404** unknown project;
+**409** unavailable cursor; **403** the shared request trust boundary.
+
 ## `GET /api/harvest-progress`
 
 What the one in-flight merge is doing *right now*, or `null` when nothing is
@@ -895,8 +1247,12 @@ curl -s 'http://127.0.0.1:7420/api/settings' | python3 -m json.tool
     "centrale": "python3 -m unittest discover tests",
     "my-lib": "python3 -m unittest discover tests"
   },
+  "maxAgents": {"my-app": 4, "centrale": null, "my-lib": null},
+  "worktreeLinks": {"my-app": [".venv"], "centrale": [], "my-lib": []},
   "defaultAgent": "claude",
   "agents": ["claude", "claude-haiku", "claude-sonnet", "codex"],
+  "requireAgentAssignment": true,
+  "lockSpawnedTaskFiles": true,
   "agentEntries": [
     {"name": "claude", "cmd": ["claude"], "cmdText": "claude",
      "promptSuffix": null, "builtin": true, "onPath": true},
@@ -915,8 +1271,14 @@ curl -s 'http://127.0.0.1:7420/api/settings' | python3 -m json.tool
 ```
 
 `checkCommands` maps every configured project name to its `checkCommand`, or
-`null` if it has none (no test gate). `agents` is every key in the configured
+`null` if it has none (no test gate). `maxAgents` maps each project name to
+its positive integer cap or `null`; `worktreeLinks` maps each project name
+to its array of repo-relative paths (empty when unset).
+`agents` is every key in the configured
 `agents` map (for a default-agent dropdown), not each entry's full command.
+`requireAgentAssignment` is `true` unless `projects.json` sets it to `false` —
+see `POST /api/spawn`'s 409 below. `lockSpawnedTaskFiles` follows the same
+rule — see `POST /api/spawn`'s task-file lock below.
 
 `agentEntries` is always present and is the same map as a list, in
 `projects.json`'s own order, with each entry's full definition — what the
@@ -933,19 +1295,121 @@ aside, exposed separately above) is out of scope for this endpoint.
 
 ---
 
+## `GET /api/agent-guide`
+
+The concise operating guide for an agent in any project, served as
+`text/plain; charset=utf-8` with `Cache-Control: no-store`. Covers spawn and
+agent selection, rulings, task-file locks, session/merge gates, badge meanings
+and orchestrator waits. Its curl examples use this server's bound loopback
+port. Loaded from `static/agent-guide.md` with the Python code at startup,
+so a checkout update cannot give an old process a newer contract. Restart
+after guide changes, as after Python changes.
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:7420/api/agent-guide
+```
+
+No parameters or side effects. 200 returns the guide; 403 is the shared
+request trust boundary. Refusals use the normal JSON error format.
+
+## `POST /api/setup-project`
+
+Explicitly set up an already-configured project's Backlog.md and Centrale
+instructions. Body: `{"project":"my-app"}`. No settings entry is rewritten.
+The add-project checkbox calls this same setup operation.
+
+```bash
+curl --fail-with-body --silent --show-error http://127.0.0.1:7420/api/setup-project \
+  -H 'Content-Type: application/json' -d '{"project":"my-app"}'
+```
+
+Setup runs `backlog init` if `backlog/config.yml` is missing, then installs
+or refreshes a pointer to `/api/agent-guide` in both `CLAUDE.md` and `AGENTS.md`,
+between `<!-- CENTRALE GUIDELINES START -->` and
+`<!-- CENTRALE GUIDELINES END -->`. Replacement preserves every byte outside
+the markers. Missing blocks are appended; malformed or duplicate markers
+refuse. A correct block is untouched. Backlog initialization may also install
+its own instructions when creating a board.
+
+Changed files are staged by exact path and committed using `git commit
+--only`; candidates are `CLAUDE.md`, `AGENTS.md`, and (only on init)
+`backlog/config.yml`. Unchanged files are excluded. Unrelated staged/unstaged
+work is preserved. A dirty target that setup would change refuses first, so
+the commit cannot absorb existing edits. Instruction-file symlinks also
+refuse. A successful response, with an illustrative SHA:
+
+```json
+{"project":"my-app","writtenFiles":["CLAUDE.md","AGENTS.md"],"commit":"0123456789abcdef0123456789abcdef01234567"}
+```
+
+When both are already set up, `writtenFiles` is `[]`, `commit` is `null`, and
+there is no write or commit. Re-run after a port change to refresh the URL.
+`--check` prints this command for each project with missing/stale pointers.
+There are no new ports, caches or persistent setup records; the existing
+`port` config controls the URL.
+
+Errors: **400** invalid/missing project or missing directory; **404** unknown
+project; **409** dirty target files, symlinks or invalid markers; **502** git
+inspection, initialization, staging or commit failure; **500** file I/O
+failure. Initializer/write/commit failures can leave setup files in the repo;
+inspect them before retrying. A commit failure names the exact files to commit
+and never reports success. **403/415** are the shared request trust/JSON gates.
+
 ## `POST /api/spawn`
 
 Claims a task, cuts (or reuses) a git worktree and branch for it, and starts
 a detached tmux session running the resolved coding agent. See "Spawning an
 agent" in [docs/agents.md](agents.md#spawning-an-agent) for the full six-step flow this triggers in `spawn.py`.
 
-**Body:** `{"project": "<name>", "taskId": "<id>"}`.
+**Body:** `{"project": "<name>", "taskId": "<id>", "agent": "<name>"}` —
+`agent` is optional (task-171).
 
 ```bash
 curl -s -X POST http://127.0.0.1:7420/api/spawn \
   -H 'Content-Type: application/json' \
-  -d '{"project": "my-app", "taskId": "TASK-2"}'
+  -d '{"project": "my-app", "taskId": "TASK-2", "agent": "codex"}'
 ```
+
+**Which agent runs.** Centrale does not guess (task-171):
+
+1. `agent`, when given, names the agent — matched case-insensitively
+   against `projects.json`'s `agents` map, a leading `@` allowed. It wins
+   over the task's assignee: an explicit choice is not a guess. A name that
+   matches no configured agent (or a non-string) is a **400**
+   (`unknown agent: 'gpt' -- configured agents are claude, codex`), before
+   any side effect.
+2. Otherwise the task's **first** assignee, when it names a configured agent.
+3. Otherwise — no assignee, an assignee that is a person or a typo, or a
+   task whose assignee could not be read — the spawn is **refused with
+   409** while `requireAgentAssignment` is on (the default), before anything
+   is claimed, committed or created. The message is written for a program
+   as much as a person: it names the task, what its assignee was (or that it
+   had none, or could not be read), and the configured agents, e.g.
+
+   ```text
+   task TASK-2 is assigned to @dana, which is not a configured agent, and
+   requireAgentAssignment is on, so Centrale will not guess which agent to
+   launch. Configured agents: claude, codex. Retry with "agent" set to one
+   of them, or assign the task to one first (backlog task edit TASK-2 -a
+   @<agent>). Nothing was claimed or created.
+   ```
+
+   A caller retries the same request with `"agent"` set.
+4. With `requireAgentAssignment` off, step 3 instead launches
+   `defaultAgent` and says so in `warnings`
+   (`task TASK-2 has no assignee; launched the default agent 'claude'
+   instead (requireAgentAssignment is off)`).
+
+**Recording the choice.** When the launched agent did not come from the
+task's first assignee (steps 1 and 4 on a task whose assignee names no
+agent), the claim below also sets the assignees — the agent **first**, then
+every assignee the task already had. A person's name is never dropped; it
+moves behind the agent because the first assignee is what resolves an agent,
+so the next Re-spawn or Resume launches the same one. A task whose first
+assignee already names an agent is left alone even when `agent` overrides it
+for this launch. When the task could not be read at all, nothing is
+recorded (the edit replaces the list, and the list is unknown) and a
+`warnings` line says so.
 
 **Response shape** (derived from `spawn.spawn`; not fired against the live
 server for this doc — it starts a real tmux session and creates a real
@@ -960,14 +1424,31 @@ worktree/branch):
 }
 ```
 
-`warnings` is only present if the pre-worktree claim/commit step (below) hit
-a problem; it never blocks the spawn.
+`warnings` is present when the claim/commit or task-file lock step hit a
+problem, the default agent was fallen back to, or a configured worktree link
+was skipped. These warnings do not block the spawn.
 
 **Behavioral notes:**
 
+- **Per-project cap.** `maxAgents` limits live Centrale tmux sessions for
+  this project, counted afresh on every spawn and resume. At the cap the
+  response is 409 naming the sessions, before any claim or worktree side
+  effect. Count-through-launch is serialized per project in this server
+  process. Omitted or `null` means no cap; an idle or finished session still
+  counts until it ends.
+- **Worktree links.** Each newly created worktree receives the project's
+  `worktreeLinks` as symlinks to paths in the main checkout. Root-anchored
+  entries in the shared `.git/info/exclude` keep them out of ordinary
+  staging; git's effective ignore rule is checked before linking. Missing
+  sources, tracked/existing destinations, symlinked destination parents or
+  failed exclusions warn and skip the link. Reused worktrees stay unchanged.
+  Omitted or empty settings add no links. Destroying a worktree removes its
+  links and preserves the source paths. See [Configuration](configuration.md#setup--configuration)
+  for path validation rules.
 - **Claim-commit side effect, before the worktree exists.** Step 2 of a spawn
-  runs `backlog task edit <id> -s "In Progress"` (leaving the assignee
-  untouched) *directly against the project's main checkout*, then `git add
+  runs `backlog task edit <id> -s "In Progress"` (plus `-a @<agent> -a
+  <existing>...` when the choice is being recorded — see above; otherwise
+  the assignee is untouched) *directly against the project's main checkout*, then `git add
   backlog && git commit -m "backlog: claim <id> for spawn"` on whatever branch
   the repo's `HEAD` currently points at — all of this **before** the worktree
   is cut in step 3, and even when `CENTRALE_SPAWN_CMD` is set (only the
@@ -976,6 +1457,20 @@ a problem; it never blocks the spawn.
   branch second means it never disagrees with main about who owns the task.
   Both the claim and the commit are best-effort — a failure at either step
   becomes a `warnings` string in the response instead of blocking the spawn.
+- **Task-file lock, right after the claim commit** (task-172). With
+  `lockSpawnedTaskFiles` on (the default), the main checkout's copy of the
+  task file is then made read-only (`chmod a-w`), so the agent on its
+  branch is its only writer: `backlog task edit` on that copy fails with
+  `EACCES` and changes nothing, and `git status` shows nothing. A respawn
+  unlocks it for its own claim and locks it again. A lock that could not
+  be taken is a `warnings` line (`did not lock TASK-2's task file: ...`),
+  never a refusal. The lock is released by the merge, by `POST
+  /api/discard-attempt`, `/api/abandon-worktree` and `/api/cleanup-branch`,
+  and — for one with no task branch behind it — at startup and by
+  `--check`; `POST /api/resume` and `/api/end-session` leave it. With the
+  setting off, nothing is locked. See [Ruling on a spawned
+  task](agents.md#ruling-on-a-spawned-task), and
+  [`POST /api/rule`](#post-apirule) for what to do instead of editing.
 - A task whose status is already `Done` is refused outright (409), before any
   side effect — including the claim commit above.
 - A duplicate spawn (a `centrale-<project>-<taskid>` session already live) is
@@ -988,19 +1483,21 @@ a problem; it never blocks the spawn.
   worktree first` — also before any side effect. Without this, the claim
   would already be committed on the base branch by the time `git worktree
   add` failed with its raw "is already checked out at" error.
-- `agent` reflects the actually-resolved agent (from the task's first
-  assignee, matched against `projects.json`'s `agents` map, falling back to
-  `defaultAgent`) — `"custom"` when `CENTRALE_SPAWN_CMD` overrode the
-  launched command entirely.
+- `agent` reflects the agent actually launched (see "Which agent runs"
+  above) — `"custom"` when `CENTRALE_SPAWN_CMD` overrode the launched
+  command entirely, in which case no agent is chosen, refused or recorded.
 
-**Errors:** 503 if tmux isn't on `PATH`. 409 for an already-live session, a
-Done task, or a branch checked out outside Centrale. 400/404 for a missing/unknown project or an invalid task ID. 500
+**Errors:** 503 if tmux isn't on `PATH`. 409 for a project at `maxAgents`, an already-live session, a
+Done task, a branch checked out outside Centrale, or (with
+`requireAgentAssignment` on) a task with no `agent` given and no assignee
+naming a configured agent. 400/404 for a missing/unknown project, an invalid
+task ID, or an unknown `agent`. 500
 for a `git worktree add` or `tmux new-session` failure. 502 if checking for
 an existing session (`tmux list-sessions`) fails unexpectedly.
 
 ## `POST /api/resume`
 
-Same validation, session naming, and 409-on-duplicate as `/api/spawn`, but
+Same validation, session naming, project cap and 409-on-duplicate as `/api/spawn`, but
 never claims/commits the task or creates a new branch — it only reuses the
 worktree that's already there, starting a fresh tmux session running the
 resolved agent's *resume* command (its configured `resumeCmd`, else `claude
@@ -1026,6 +1523,9 @@ curl -s -X POST http://127.0.0.1:7420/api/resume \
   "resumed": true
 }
 ```
+
+When resume recreates a missing worktree, its response may also contain
+`warnings` for skipped `worktreeLinks`, as on spawn.
 
 **Errors:** same as `/api/spawn`. A Done task is refused with 409 here too,
 before the worktree is touched — a Done task's worktree may still exist, and
@@ -1246,7 +1746,7 @@ curl -s -X POST 'http://127.0.0.1:7420/api/end-session' \
   -d '{"project": "my-app", "taskId": "TASK-2"}'
 ```
 
-**Response:** `{"ok": true, "session": "centrale-my-app-task-2"}`.
+**Response:** `{"ok": true, "session": "centrale-my-app-task-2", "killedOrphans": []}`.
 
 **Behavioral notes:** the exact session name is computed the same way
 spawn/resume compute it (`spawn.session_name`), confirmed live via
@@ -1255,6 +1755,15 @@ spawn/resume compute it (`spawn.session_name`), confirmed live via
 matching. Without it, `tmux -t` prefix-matches by default, which could kill
 an unrelated session whose name happens to start with this one's (e.g.
 `centrale-my-app-task-1` vs. `centrale-my-app-task-10`).
+
+Killing the tmux session does not reliably kill everything it started: a
+vite dev server or a vitest worker pool the agent launched survives its
+parent pane and keeps running, cwd'd in the worktree, for as long as the
+machine stays up. So once the session itself is confirmed killed, this also
+finds every remaining pid whose cwd is under this task's worktree and kills
+it (SIGTERM, best-effort) — matched by resolved cwd, never by scanning
+command lines. `killedOrphans` lists the pids it acted on (empty when there
+were none). Nothing outside that worktree directory is touched.
 
 There is **no agent-state gate**: a session reporting `working` is killed
 just like one reporting `finished`, and a session with no lifecycle event
@@ -1275,7 +1784,8 @@ prompt's "don't merge your own branch" instruction), which Centrale's own
 `GET /api/board` would otherwise keep showing as `alreadyMerged: true` with
 nothing left to actually clean it up.
 
-**Body:** `{"project", "taskId"}` — the same shape as `/api/end-session`.
+**Body:** `{"project", "taskId"}` — the same shape as `/api/end-session`, plus
+an optional `"force": true` (see below).
 
 ```bash
 curl -s -X POST 'http://127.0.0.1:7420/api/cleanup-branch' \
@@ -1290,9 +1800,15 @@ curl -s -X POST 'http://127.0.0.1:7420/api/cleanup-branch' \
   "ok": true,
   "branch": "task/task-2",
   "worktreeRemoved": true,
-  "discardedPaths": ["some/untracked-file.txt"]
+  "discardedPaths": ["some/untracked-file.txt"],
+  "killedOrphans": [],
+  "taskFileUnlocked": "backlog/tasks/task-2 - Fix-the-thing.md"
 }
 ```
+
+`taskFileUnlocked` (task-172) is the main checkout's task file this call
+made writable again — nothing is spawned on the task any more — or `null`
+when it was not locked.
 
 `discardedPaths` lists every uncommitted/untracked path found in the
 worktree (dequoted — see `server.dequote_git_path` — so a spaced Backlog.md
@@ -1330,6 +1846,15 @@ nothing to do on that side.
   unaffected. The frontend mirrors it: the card and drawer render a disabled
   "Worked externally" button with that reason as tooltip instead of
   "Merged — clean up" for such a task.
+- **Refuses with 409, naming the pids, if a live process still has its cwd
+  under the worktree** (task-201) — removing the directory does not stop a
+  vite dev server or vitest worker pool the agent left running there; it
+  survives the removal outright and leaks for as long as the machine is up.
+  Checked (via the same cwd-under-directory scan `/api/end-session` uses)
+  once the worktree is confirmed to still exist, before anything is touched.
+  Pass `"force": true` in the body to kill those processes here and proceed
+  with the removal anyway; either way, `killedOrphans` in the response lists
+  the pids that were actually killed (empty when there was nothing to kill).
 - Removal order: `git worktree remove --force` first (if a worktree exists),
   then `git branch -d` (never `-D` — ancestry was just re-verified server-side,
   so a safe delete should always succeed; a failure surfaces as a 500 with
@@ -1457,9 +1982,13 @@ curl -s -X POST 'http://127.0.0.1:7420/api/discard-attempt' \
   "worktreeRemoved": true,
   "discardedPaths": ["src/half-done.py", "notes.md"],
   "recoveryTag": "abandoned/task-9-20260904-163012",
-  "recoveryCommand": "git branch task/task-9 1fb0261627d96454a5d478560631e4bbdc9bd015"
+  "recoveryCommand": "git branch task/task-9 1fb0261627d96454a5d478560631e4bbdc9bd015",
+  "taskFileUnlocked": "backlog/tasks/task-9 - Rework-the-parser.md"
 }
 ```
+
+`taskFileUnlocked` (task-172): the main checkout's task file this discard
+made writable again, or `null` when it was not locked.
 
 **Behavioral notes:**
 
@@ -1559,9 +2088,15 @@ curl -s -X POST 'http://127.0.0.1:7420/api/abandon-worktree' \
   "baseBranch": "main",
   "commitCount": 3,
   "worktreeRemoved": true,
-  "discardedPaths": ["src/half-done.py", "notes.md"]
+  "discardedPaths": ["src/half-done.py", "notes.md"],
+  "taskFileUnlocked": "backlog/tasks/task-9 - Rework-the-parser.md"
 }
 ```
+
+`taskFileUnlocked` (task-172): the main checkout's task file this call made
+writable again, or `null` when it was not locked. With no worktree, no agent
+can write the branch's copy, so the lock has no reason left; the parked
+branch still merges as it is.
 
 **Behavioral notes:**
 
@@ -1655,10 +2190,14 @@ and `projects`, are not accepted back.
 | `sessionPreviewMode` | `"interact"` \| `"view"` \| `"off"` | Stored as `projects.json`'s `sessionPreview.mode`. `"interact"` (default): live pane plus the reply row. `"view"`: read-only pane only — the reply row is absent *and* `POST /api/session-input` refuses (403). `"off"`: no drawer section, and `GET /api/session-pane` refuses too. One tiered key so the reply can be switched off independently of the read-only pane. The settings modal shows it as two toggles. |
 | `refreshIntervalSeconds` | integer ≥ 5 | |
 | `checkCommands` | `{"<project>": "<command>" \| null, ...}` | `null` (or an empty/whitespace string) clears that project's check gate. Only named projects are touched. |
+| `maxAgents` | `{"<project>": positive integer \| null, ...}` | Sets a project's live-session cap. `null` clears it. Booleans, zero, negative, fractional and string values are invalid. Applies to the next spawn/resume; existing sessions remain. |
+| `worktreeLinks` | `{"<project>": ["relative/path", ...] \| null, ...}` | Sets links for new worktrees; `null` or `[]` clears. Paths must be canonical, literal, repo-relative and non-overlapping; see [Configuration](configuration.md#setup--configuration). Existing worktrees stay unchanged. |
+| `requireAgentAssignment` | boolean | Whether `POST /api/spawn` refuses (409) a task whose first assignee names no configured agent, rather than launching `defaultAgent` with a warning. Anything but a JSON boolean is a 400. |
+| `lockSpawnedTaskFiles` | boolean | Whether `POST /api/spawn` makes the main checkout's copy of the task file read-only after its claim commit (task-172). Takes effect on the next spawn; existing locks are kept. Anything but a JSON boolean is a 400. |
 | `defaultAgent` | string | Must name a key in the configured `agents` map — or, when `agents` is in the same request, in the map that request installs. |
 | `agents` | `[{"name", "cmd", "promptSuffix"}, ...]` | The **whole** agents map, in the order it should be written — not a patch. `cmd` is an argv list of strings or one shell-quoted string (split with `shlex`, the exact inverse of `agentEntries`' `cmdText`), and must be non-empty. `promptSuffix` is optional (`null`/blank means none). Names must be unique case-insensitively (agent resolution lowercases both sides). The two built-in names (`claude`, `codex`) can be edited but not dropped, the map can't end up empty, and the current default agent must survive — or the same request must name a replacement. Whether `cmd[0]` exists on `PATH` is deliberately *not* validated; it becomes a `warnings` line instead (below). |
 | `removeProject` | string | A project name. Deletes only its `projects.json` entry — never the repo itself, never its worktrees/branches. Removing the *only* configured project is allowed: a board with zero projects is a supported state, the same one a first run shows. Refused (400) only while the removal would strand work Centrale is managing — a live agent session in that project, or a `task/*` branch not yet merged into the branch its checkout is on — and the reason names the session or branches in the way. |
-| `addProject` | `{"name", "path", "initBacklog": bool}` | See below. `initBacklog` defaults to `false`. |
+| `addProject` | `{"name", "path", "initBacklog": bool}` | Defaults to `false`; `true` opts into Backlog.md and Centrale setup, even if Backlog already exists. |
 
 ```bash
 curl -s -X POST http://127.0.0.1:7420/api/settings \
@@ -1688,9 +2227,10 @@ A warning never means the save was refused: the agent is written either way
 ```
 
 `fields` keys are dotted for a per-project, per-agent or per-add field, e.g.
-`"checkCommands.my-app"`, `"agents.0.name"`, `"agents.1.cmd"`,
+`"checkCommands.my-app"`, `"maxAgents.my-app"`, `"worktreeLinks.my-app"`,
+`"agents.0.name"`, `"agents.1.cmd"`,
 `"addProject.name"`, `"addProject.path"`. A structurally malformed body
-(`checkCommands` or `addProject` present but not an object, `agents` present
+(`checkCommands`, `maxAgents`, `worktreeLinks` or `addProject` present but not an object, `agents` present
 but not a list) responds 400 with just `{"error"}`, no `fields`.
 
 **Behavioral notes:**
@@ -1702,12 +2242,14 @@ but not a list) responds 400 with just `{"error"}`, no `fields`.
   auto-harvest thread's next ~30s cycle; `refreshIntervalSeconds` and
   `sessionPreviewMode` on the frontend's next board poll, the latter also
   on the very next `/api/session-pane` or `/api/session-input` request;
-  `checkCommands`/`defaultAgent`/`agents` on the next spawn or merge attempt).
-- `addProject`'s `backlog init` step (only run when `initBacklog: true` and
-  the target repo has no `backlog/config.yml`) is a real side effect against
-  that repo, so it only runs once every other field in the same request is
-  already known-valid — it's the last thing that happens, not a
-  pre-validation probe.
+  `checkCommands`/`maxAgents`/`worktreeLinks`/`defaultAgent`/`agents`/`requireAgentAssignment` on the
+  next spawn or merge attempt).
+- `addProject` setup (when `initBacklog: true`) runs only after every request
+  field validates and before the config write. It uses the same pointer
+  installation and scoped commit as `POST /api/setup-project`, including its
+  409/500/502 errors. On failure no project is added, but setup may leave
+  files requiring attention. If the later `projects.json` write fails, the
+  already-completed repository setup commit remains.
 - `projects.json` is rewritten atomically (temp file + `os.replace`), read
   fresh from disk each time — every key outside the whitelist, and every
   other field on an existing project entry (`path`, `browserPort`, ...),
@@ -1747,10 +2289,10 @@ is the only name the notify helper accepts.
 Centrale wires this up automatically, with no config required, for the two
 built-in agent families:
 
-- **claude** — a generated Claude Code hooks settings file
+- **claude** — Claude Code hooks settings
   (`UserPromptSubmit`/`PreToolUse` → `working`, `Notification` → `waiting`,
-  `Stop` → `finished`) passed via `--settings <path>` on the launched
-  command. Each hook shells out to `centrale_notify.py`.
+  `Stop` → `finished`) passed inline as JSON via `--settings '<json>'` on
+  the launched command, never a shared file. Each hook shells out to `centrale_notify.py`.
 - **codex** (≥ 0.150.0, feature-probed) — equivalent raw transitions as
   inline `-c hooks.<Point>=...` config overrides on the codex argv itself
   (never a worktree-local file — see "Agent lifecycle events" in
@@ -1760,6 +2302,14 @@ built-in agent families:
   and when awaiting a plain chat reply. The UI says "turn ended · may need
   input" and explains this honest trade-off in its tooltip. Claude's
   trustworthy `waiting`/`finished` distinction remains unchanged.
+
+  Codex `PermissionRequest` also fires for automatic approval review.
+  `waiting` therefore starts a 30-second candidate, cancelled by `working`
+  or `finished`; `PostToolUse` now reports `working` too. The badge and wait
+  stream only expose waiting after a pane capture confirms a dialog, using
+  delivery's menu/footer signatures. Without a dialog, confirmation retries
+  every 30 seconds. Capture failure exposes unknown and retries, except a
+  gone session ends the candidate. No persistent state is added.
 
 Any other agent — a fully custom `cmd` in `projects.json`, or the
 `CENTRALE_SPAWN_CMD` test override — gets `CENTRALE_EVENT_URL` in its

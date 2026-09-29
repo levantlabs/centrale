@@ -434,6 +434,8 @@ global.wireSettingsShell = function () {
   var modal = document.getElementById("settings-modal");
   ["settings-header", "settings-title", "settings-close", "settings-body",
    "settings-harvest-mode-toggle", "settings-error-harvestMode",
+   "settings-require-agent-toggle", "settings-error-requireAgentAssignment",
+   "settings-lock-task-files-toggle", "settings-error-lockSpawnedTaskFiles",
    "settings-session-preview-toggle", "settings-session-reply-field",
    "settings-session-reply-toggle", "settings-error-sessionPreviewMode",
    "settings-refresh-interval", "settings-error-refreshIntervalSeconds",
