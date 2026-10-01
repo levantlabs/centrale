@@ -20,9 +20,9 @@ a session, before the code. A constitution nobody rereads is decoration.
 
 Centrale stores no task state of its own. The board, the live sessions, the
 branch states and the merge verdicts are re-derived on every request from the
-`backlog` CLI, from `git` and from `tmux`. No database, no synced copy of a
-task, no cache of what a branch looked like. Delete Centrale and no task data
-is lost, because none of it was ever here.
+`backlog` CLI, from `git` and from `tmux`, with one measured exception below.
+No database, no synced copy of a task, no cache of what a branch looked like.
+Delete Centrale and no task data is lost, because none of it was ever here.
 
 The reason is not purity. A remembered fact about a moving system goes wrong
 *quietly* — it keeps rendering, confidently, long after it stopped being true.
@@ -40,6 +40,17 @@ not know something, it must show that it does not know, rather than the last
 thing that was true. The fix was not a smarter cache but dropping the stale
 verdict and falling back to a plain Merge button — Centrale does not know the
 gate outcome until it asks again, and your next click asks.
+
+There is one measured exception to re-running every tool on every request
+(task-196, decision-4). Idle board polling repeatedly launched the Backlog
+CLI at normal priority and consumed enough CPU to disrupt another project's
+tests. Successful board-list inputs may therefore be reused in memory while
+recursive `backlog/` file metadata is unchanged. Each request validates that
+metadata; an unreadable tree or a failed reload never certifies the last
+answer as current. Concurrent readers share a load, and CLI children run at
+low priority where the platform supports it. Git, tmux, lifecycle enrichment,
+task-detail reads and merge gates remain fresh. This is a disposable display
+optimization, never another source of task truth.
 
 ## Gates over trust
 

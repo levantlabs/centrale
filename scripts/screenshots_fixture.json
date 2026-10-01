@@ -14,6 +14,7 @@
   "projects": [
     {
       "name": "my-app",
+      "maxAgents": 3,
       "baseBranch": "main",
       "taskBranches": [
         "task/task-2"
@@ -74,7 +75,8 @@
           "priority": null,
           "assignees": [],
           "labels": [
-            "bug"
+            "bug",
+            "needs-owner-approval"
           ],
           "ordinal": 4000,
           "createdAt": "2024-01-05T09:10:00Z",
@@ -86,6 +88,14 @@
         "TASK-3"
       ],
       "views": {
+        "TASK-4": {
+          "comments": [
+            {
+              "author": "@claude",
+              "body": "The checkout test fails about one run in twenty on CI. Should I quarantine it behind a retry now, or hold the release until the race is found?"
+            }
+          ]
+        },
         "TASK-2": {
           "path": "backlog/tasks/task-2 - Fix-pagination-off-by-one-on-the-reports-page.md",
           "description": "Page 3 of a 40-row report with a page size of 10 returns 9 rows: the last row of every full page is dropped. Fix the slice bound and cover it with a regression test.",
@@ -126,6 +136,7 @@
     },
     {
       "name": "my-lib",
+      "maxAgents": 2,
       "baseBranch": "main",
       "taskBranches": [
         "task/task-2",
@@ -208,6 +219,7 @@
       "project": "my-app",
       "task": "TASK-2",
       "agentState": "working",
+      "stateAgo": 1080,
       "agentKind": "claude"
     },
     {
@@ -217,7 +229,18 @@
       "project": "my-lib",
       "task": "TASK-2",
       "agentState": "waiting",
+      "stateAgo": 540,
       "agentKind": "codex"
+    },
+    {
+      "name": "centrale-my-lib-task-4",
+      "created": 1704463200,
+      "attached": false,
+      "project": "my-lib",
+      "task": "TASK-4",
+      "agentState": "working",
+      "stateAgo": 1680,
+      "agentKind": "claude"
     }
   ],
   "panes": {
@@ -251,11 +274,60 @@
     "centrale-my-lib-task-2": [
       "> Split the retry backoff out of client.py into its own module.",
       "",
-      "● The backoff is used by both the sync and async clients, and only the sync",
-      "  one caps the delay. Should the new module keep both behaviours behind a",
-      "  flag, or should I make the cap unconditional?",
+      "• The sync and async clients share the backoff; only the sync one caps the",
+      "  delay. I moved it into backoff.py with the cap unconditional and need to",
+      "  build the package to check the import still resolves.",
+      "",
+      "  Would you like to run the following command?",
+      "",
+      "  $ python3 -m build --wheel",
+      "",
+      "\u203a 1. Yes, proceed (y)",
+      "  2. Yes, and don't ask again for commands that start with `python3 -m build` (p)",
+      "  3. No, and tell Codex what to do differently (esc)",
+      "",
+      "  Press enter to confirm or esc to cancel"
+    ],
+    "centrale-my-lib-task-4": [
+      "> Improve the error message when the config file is invalid.",
+      "",
+      "\u25cf Read(src/config/loader.py)",
+      "  \u23bf  Read 88 lines",
+      "",
+      "\u25cf The loader raises a bare KeyError for a missing field. I'll name the",
+      "  field and the file in a ConfigError instead.",
+      "",
+      "\u25cf Update(src/config/loader.py)",
+      "  \u23bf  Updated 3 additions and 1 removal",
       "",
       ">"
+    ]
+  },
+  "fleet": {
+    "_readme": "Journal rows for the Fleet and Timeline views, as seconds before pageNowEpoch. The live agents' current state comes from sessions[]; these rows are the history behind it.",
+    "history": [
+      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "spawn", "ago": 6000},
+      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "working", "ago": 5940},
+      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "waiting", "ago": 4800},
+      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "working", "ago": 4500},
+      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "finished", "ago": 3600},
+      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "merged", "ago": 3300},
+      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "session ended", "ago": 3290},
+      {"project": "my-app", "task": "TASK-2", "agent": "claude", "state": "spawn", "ago": 2940},
+      {"project": "my-app", "task": "TASK-2", "agent": "claude", "state": "working", "ago": 2880},
+      {"project": "my-app", "task": "TASK-2", "agent": "claude", "state": "waiting", "ago": 1800},
+      {"project": "my-app", "task": "TASK-2", "agent": "claude", "state": "working", "ago": 1080},
+      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "spawn", "ago": 5400},
+      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "working", "ago": 5340},
+      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "idle", "ago": 2700},
+      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "merge blocked", "ago": 1500,
+       "harvest": {"reason": "the project's test command failed on the merged tree"}},
+      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "session ended", "ago": 1490},
+      {"project": "my-lib", "task": "TASK-2", "agent": "codex", "state": "spawn", "ago": 2700},
+      {"project": "my-lib", "task": "TASK-2", "agent": "codex", "state": "working", "ago": 2640},
+      {"project": "my-lib", "task": "TASK-2", "agent": "codex", "state": "waiting", "ago": 540},
+      {"project": "my-lib", "task": "TASK-4", "agent": "claude", "state": "spawn", "ago": 1800},
+      {"project": "my-lib", "task": "TASK-4", "agent": "claude", "state": "working", "ago": 1680}
     ]
   },
   "shots": [
@@ -275,6 +347,44 @@
       "theme": "light",
       "project": "my-app",
       "task": "TASK-2"
+    },
+    {
+      "name": "view-needs-you-light",
+      "kind": "view",
+      "view": "needs-you",
+      "height": 1180,
+      "theme": "light"
+    },
+    {
+      "name": "view-needs-you-dark",
+      "kind": "view",
+      "view": "needs-you",
+      "height": 1180,
+      "theme": "dark"
+    },
+    {
+      "name": "view-fleet-light",
+      "kind": "view",
+      "view": "fleet",
+      "theme": "light"
+    },
+    {
+      "name": "view-fleet-dark",
+      "kind": "view",
+      "view": "fleet",
+      "theme": "dark"
+    },
+    {
+      "name": "view-timeline-light",
+      "kind": "view",
+      "view": "timeline",
+      "theme": "light"
+    },
+    {
+      "name": "view-timeline-dark",
+      "kind": "view",
+      "view": "timeline",
+      "theme": "dark"
     },
     {
       "name": "session-theater",

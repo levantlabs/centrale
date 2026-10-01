@@ -212,6 +212,8 @@ The prompt given to the agent is, by default:
 > one as `[ruling from <sender>] <text>`) is a ruling on this task: first
 > record it on your task as a comment authored by the sender (`backlog task
 > edit \<ID> --comment "<text>" --comment-author <sender>`), then act on it.
+> When you need the owner to decide, add the needs-owner-approval label
+> with your question as a task comment and stop until answered.
 
 The standing-decisions sentence points the agent at Backlog.md's decision
 records — the durable "why" layer behind a repo's constraints, which an
@@ -335,7 +337,11 @@ conversation instead:
    `cmd`'s first argv element (so `claude-sonnet`/`claude-haiku`-style
    entries count too, while a wrapper script or an absolute path counts
    as neither): `["claude", "--continue"]` for `"claude"`, and
-   `["codex", "resume", "--last"]` for `"codex"`. Both continue the most
+   `["codex", "resume", "--last"]` for `"codex"`, each followed by the
+   agent's own arguments from its `cmd` (task-183) — so `claude-opus`
+   (`["claude", "--model", "opus", "--permission-mode", "auto"]`) resumes as
+   `claude --continue --model opus --permission-mode auto`, and an agent
+   with no arguments resumes with none. Both continue the most
    recent conversation **in that directory** — codex's picker and
    `--last` filter by working directory unless `--all` is passed — and
    since every task gets its own worktree, that is reliably this task's
@@ -631,9 +637,16 @@ matching task in `GET /api/board` and row in `GET /api/sessions`.
 `agentState` is `"unknown"` until an event arrives. Claude events retain
 their `working`/`waiting`/`finished` meanings; a codex `finished` event
 is exposed as `"idle"`, because codex uses the same turn-end signal when it
-is genuinely done and when it has asked a plain chat question. An idle
-event has also been observed during ongoing work: read the current screen
-before acting on it.
+is genuinely done and when it has asked a plain chat question. A stop is
+first corroborated against the current tmux screen after one second. If
+its footer still shows an interruptible working status, Centrale keeps
+working and checks again each second. A real dialog publishes waiting;
+a settled pane publishes idle. A newer activity hook, clear, or session
+reset cancels the candidate, including a capture already in flight.
+Duplicate Stop/notify signals keep the original check deadline. Empty or
+failed captures expose unknown and retry; a vanished session ends the check.
+This is shared by badges, the Needs-you inbox, and the orchestrator stream;
+an idle event still makes no claim that the task is complete.
 
 Codex `PermissionRequest` fires before automatic approval review as well as
 before human input. Centrale keeps the badge working for 30 seconds, then
@@ -646,7 +659,20 @@ for an already-approved slow tool and for workers with older hooks that
 leave waiting stale. A failed capture means unknown and retries; a vanished
 session means unknown and stops checking. The dialog check uses the same
 rendered-menu/footer signatures as message delivery, so a new CLI dialog
-format may need an updated signature. Claude events are unchanged.
+format may need an updated signature. The Codex working-footer signature
+likewise depends on the CLI's rendered `(<elapsed> • esc to interrupt)` line.
+
+Claude's Notification hook passes its stdin payload to the helper. Only
+`permission_prompt`, `elicitation_dialog`, `elicitation_url_dialog`, and
+`agent_needs_input` produce waiting. `idle_prompt` (the roughly 60-second
+no-input reminder), completion/auth notifications, and unknown or malformed
+payloads produce nothing. Real prompts keep their existing notification
+timing; Stop still publishes finished immediately. See the upstream
+[Notification contract](https://code.claude.com/docs/en/hooks#notification).
+The new Claude hook argument is installed on spawn/resume; existing
+sessions need to be relaunched to get that injection. The Codex stop
+corroboration applies to existing hook and notify senders after the server
+restarts. No new external resource or persistent state is introduced.
 
 For the two built-in agent families, Centrale wires this up automatically,
 with no config required:
@@ -655,8 +681,8 @@ with no config required:
   command: the hooks settings passed **inline as JSON**, never a file
   (built by `server.hooks_settings_payload()`, and never written to the
   user's own `~/.claude` config or the target repo). The settings map
-  `UserPromptSubmit`/`PreToolUse` to `working`, `Notification` to
-  `waiting`, and `Stop` to `finished`, each running `centrale_notify.py`
+  `UserPromptSubmit`/`PreToolUse` to `working`, input-request `Notification` to
+  `waiting` (via the helper’s `notification` mode), and `Stop` to `finished`, each running `centrale_notify.py`
   (shipped at the root of the Centrale copy that did the spawn) with the
   corresponding state. Task identity travels through `CENTRALE_EVENT_URL`
   in the session's own environment. Being inline, each agent's hooks are

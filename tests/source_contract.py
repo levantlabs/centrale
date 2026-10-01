@@ -59,6 +59,13 @@ FRONTEND_FILES = [
     "pane.js",
     "shell.js",
     "settings.js",
+    "fleet.js",
+    "views.js",
+    "shared-pulse.js",
+    "shared-feed.js",
+    "view-needs-you.js",
+    "view-fleet.js",
+    "view-timeline.js",
     "main.js",
 ]
 

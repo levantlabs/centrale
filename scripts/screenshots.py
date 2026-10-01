@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Regenerate docs/img/*.png from committed synthetic data (task-153).
 
-The four images the README and docs lead with -- board-light.png,
-board-dark.png, drawer-pane.png, session-theater.png -- were hand-taken
+The images the README and docs lead with -- board-light.png,
+board-dark.png, drawer-pane.png, session-theater.png and the
+view-{needs-you,fleet,timeline}-{light,dark}.png set -- were hand-taken
 until now, so they drifted silently as the UI moved and nobody could
-tell how stale they were. This script re-shoots all four the same way
+tell how stale they were. This script re-shoots them all the same way
 every time.
 
 WHAT IT WILL NOT DO
@@ -72,7 +73,7 @@ FIXTURE_PATH = os.path.join(SCRIPT_DIR, "screenshots_fixture.json")
 DEFAULT_OUT_DIR = os.path.join(REPO_ROOT, "docs", "img")
 
 # The size every committed image already has: a 1440x900 viewport shot at
-# device_scale_factor 2. Changing either number reshapes all four files,
+# device_scale_factor 2. Changing either number reshapes every file,
 # so they live here as one pair rather than at each call site.
 VIEWPORT = {"width": 1440, "height": 900}
 DEVICE_SCALE_FACTOR = 2
@@ -194,7 +195,10 @@ class World:
             "port": 0,
             "worktreeRoot": self.worktree_root,
             "projects": [
-                {"name": p["name"], "path": self.repo_path(p["name"])}
+                dict(
+                    {"name": p["name"], "path": self.repo_path(p["name"])},
+                    **({"maxAgents": p["maxAgents"]} if "maxAgents" in p else {}),
+                )
                 for p in self.projects
             ],
         }
@@ -492,6 +496,21 @@ def open_drawer(page, title):
     )
 
 
+# What proves each view has painted its fixture data, not its empty state.
+VIEW_READY = {
+    "needs-you": ".needs-you-term-line",
+    "fleet": ".fleet-agent",
+    "timeline": ".tl-seg",
+}
+
+
+def open_view(page, view):
+    page.click('.view-tab[data-view="%s"]' % view)
+    page.wait_for_selector("#view-host .%s" % VIEW_READY[view].lstrip("."))
+    # Let the shared summary bar and Activity feed take their first snapshot.
+    page.wait_for_timeout(400)
+
+
 # ---------------------------------------------------------------------------
 # Shots
 # ---------------------------------------------------------------------------
@@ -502,8 +521,15 @@ def shoot(context_factory, shot, out_dir, expected_cards, Image):
     context = context_factory(shot["theme"])
     try:
         page = context.new_page()
+        if shot.get("height"):
+            # Needs you stacks its cards; a taller frame shows the owner
+            # question under the permission dialog.
+            page.set_viewport_size({"width": VIEWPORT["width"], "height": shot["height"]})
         page.goto(shot["url"], wait_until="domcontentloaded")
         wait_for_board(page, expected_cards)
+
+        if shot["kind"] == "view":
+            open_view(page, shot["view"])
 
         if shot["kind"] in ("drawer", "theater"):
             open_drawer(page, shot["cardTitle"])
@@ -542,6 +568,54 @@ def quantize(path, Image):
 # Entry point
 # ---------------------------------------------------------------------------
 
+class FrozenTime:
+    """`server.time` with `time()` pinned to the fixture's page clock.
+
+    The Fleet, Timeline and Needs you views subtract server-stamped times
+    (state-since, capture time, journal rows) from the browser's frozen
+    `Date.now()`; leaving the server on the real clock would make every
+    age negative. Only `time()` is pinned: monotonic clocks, sleeps and
+    everything else the server uses pass through untouched."""
+
+    def __init__(self, real, now):
+        self._real = real
+        self._now = now
+
+    def time(self):
+        return self._now
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def seed_fleet(server, fixture):
+    """Stand up the fleet journal and the live agents' states from the
+    fixture, with the server clock pinned to the browser's.
+
+    Live states go through the real `record_agent_event` so the badges
+    are what a hook would have produced; their `stateSince` is then set
+    to the fixture's age, and the journal is replaced by one holding only
+    the fixture's rows (the throwaway events above stamped "now")."""
+    import fleet
+
+    now = int(fixture["clock"]["pageNowEpoch"])
+    server.time = FrozenTime(server.time, now)
+    server.fleet_history = fleet.Journal(None, clock=lambda: now)
+    for session in fixture["sessions"]:
+        server.record_agent_event(
+            session["project"], session["task"], session["agentState"],
+            agent_kind=session.get("agentKind"),
+        )
+        key = server._agent_event_key(session["project"], session["task"])
+        server._agent_events[key]["stateSince"] = now - session["stateAgo"]
+    journal = fleet.Journal(None, clock=lambda: now)
+    for row in fixture["fleet"]["history"]:
+        extra = {k: v for k, v in row.items() if k not in ("project", "task", "agent", "state", "ago")}
+        journal.append(row["project"], row["task"], row["agent"], row["state"],
+                       timestamp=now - row["ago"], **extra)
+    server.fleet_history = journal
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="scripts/screenshots.py",
@@ -560,7 +634,8 @@ def build_parser():
     parser.add_argument(
         "--only", action="append", metavar="NAME", default=None,
         help="shoot only this image (repeatable): board-light, board-dark, "
-             "drawer-pane, session-theater.")
+             "drawer-pane, session-theater, view-needs-you-light, "
+             "view-fleet-dark, ... (see the fixture's shots).")
     parser.add_argument(
         "--keep", action="store_true",
         help="leave the temp sandbox in place for inspection.")
@@ -614,11 +689,7 @@ def main(argv=None):
     server.run_tmux = world.run_tmux
     server.which = world.which
 
-    for session in fixture["sessions"]:
-        server.record_agent_event(
-            session["project"], session["task"], session["agentState"],
-            agent_kind=session.get("agentKind"),
-        )
+    seed_fleet(server, fixture)
 
     httpd = server.CentraleHTTPServer(("127.0.0.1", 0), server.Handler, config)
     port = httpd.server_address[1]

@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import harvest  # noqa: E402
 import server  # noqa: E402
+from lifecycle_harness import settled_codex_pane
 import spawn  # noqa: E402
 import version  # noqa: E402
 
@@ -1104,6 +1105,7 @@ class BoardAggregationTests(unittest.TestCase):
         self.assertIsNone(my_tool["error"])
         self.assertEqual(len(my_tool["tasks"]), 2)
 
+    @settled_codex_pane()
     def test_agent_state_defaults_to_unknown_and_reflects_recorded_events(self):
         # task-37: every task carries an "agentState" field, "unknown"
         # until its agent's hooks/notify (or a custom agent's own POST)
@@ -1639,7 +1641,12 @@ class BoardAggregationTests(unittest.TestCase):
         self.assertIsNotNone(project["error"])
         self.assertEqual(project["tasks"], [])
 
-    def test_cache_reuses_result_until_force(self):
+    def test_cache_reuses_unchanged_inputs(self):
+        tmp = self.enterContext(tempfile.TemporaryDirectory())
+        os.mkdir(os.path.join(tmp, "backlog"))
+        with open(os.path.join(tmp, "backlog", "config.yml"), "w") as f:
+            f.write("project_name: test\n")
+        self.my_app_dir = tmp
         calls = {"n": 0}
 
         def fake_run_backlog(args, cwd):
@@ -1658,6 +1665,171 @@ class BoardAggregationTests(unittest.TestCase):
 
         self.assertEqual(first_calls, second_calls, "cached result should avoid re-invoking backlog")
 
+
+
+class BoardInputCacheTests(unittest.TestCase):
+    def setUp(self):
+        server._reset_board_cache()
+        self.addCleanup(server._reset_board_cache)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = self.tmp.name
+        os.makedirs(os.path.join(self.root, "backlog", "tasks"))
+        with open(os.path.join(self.root, "backlog", "config.yml"), "w") as f:
+            f.write("project_name: test\n")
+        self.config = make_config([{"name": "app", "path": self.root}])
+        self.data = {"schemaVersion": 1, "tasks": [
+            {"id": "TASK-1", "status": "To Do", "milestone": "m-0"}]}
+        self.cli = self.enterContext(mock.patch.object(server, "run_backlog", return_value=self.data))
+        self.raw = self.enterContext(mock.patch.object(server, "run_backlog_raw", return_value=
+            subprocess.CompletedProcess([], 0, "  m-0: First (0/1 done)\n", "")))
+        self.enterContext(mock.patch.object(server, "run_git", return_value=git_proc([], 0, "", "")))
+
+    def board(self, force=False):
+        return server.get_board(self.config, force=force)["projects"][0]
+
+    def test_unchanged_polls_reuse_cli_but_refresh_lifecycle(self):
+        with mock.patch.object(server, "get_agent_lifecycle", return_value={"agentState": "working"}):
+            first = self.board(True)
+        with mock.patch.object(server, "get_agent_lifecycle", return_value={"agentState": "idle"}):
+            second = self.board(True)
+        self.assertEqual(self.cli.call_count, 2)
+        self.assertEqual(self.raw.call_count, 1)
+        self.assertEqual(first["tasks"][0]["agentState"], "working")
+        self.assertEqual(second["tasks"][0]["agentState"], "idle")
+        second["tasks"][0]["milestone"] = "changed"
+        self.assertEqual(self.board()["tasks"][0]["milestone"], "m-0")
+
+    def test_file_add_edit_rename_delete_invalidates_without_waiting(self):
+        self.board()
+        for relative in ("tasks/task-1.md", "milestones/m-0.md", "drafts/draft-1.md", "config.yml"):
+            path = os.path.join(self.root, "backlog", relative)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            for action in ("add", "edit", "rename", "delete"):
+                with self.subTest(path=relative, action=action):
+                    before = self.cli.call_count
+                    if action in ("add", "edit"):
+                        with open(path, "w") as f:
+                            f.write(action)
+                    elif action == "rename":
+                        os.rename(path, path + ".new")
+                    else:
+                        os.unlink(path + ".new")
+                    self.board()
+                    self.assertEqual(self.cli.call_count, before + 2)
+
+    def test_failed_reload_does_not_serve_old_tasks_or_cache_error(self):
+        self.board()
+        with open(os.path.join(self.root, "backlog", "config.yml"), "w") as f:
+            f.write("changed")
+        self.cli.side_effect = server.BacklogError("offline")
+        failed = self.board()
+        self.assertEqual(failed["tasks"], [])
+        self.assertEqual(failed["error"], "offline")
+        self.cli.side_effect = None
+        self.assertEqual(self.board()["tasks"][0]["id"], "TASK-1")
+
+    def test_milestone_failure_is_retried_without_a_file_change(self):
+        self.raw.return_value = subprocess.CompletedProcess([], 1, "", "failed")
+        self.assertIsNone(self.board(True)["tasks"][0]["milestoneTitle"])
+        self.raw.return_value = subprocess.CompletedProcess([], 0, "  m-0: Recovered (0/1 done)\n", "")
+        self.assertEqual(self.board(True)["tasks"][0]["milestoneTitle"], "Recovered")
+
+    def test_concurrent_requests_share_one_cli_load(self):
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
+            results = list(pool.map(lambda _: self.board(True), range(6)))
+        self.assertTrue(all(r["error"] is None for r in results))
+        self.assertEqual(self.cli.call_count, 2)
+        self.assertEqual(self.raw.call_count, 1)
+
+    def test_root_config_disables_reuse_for_redirected_boards(self):
+        self.board(True)
+        with open(os.path.join(self.root, "backlog.config.yml"), "w") as f:
+            f.write("backlog_directory: .backlog\n")
+        self.data["tasks"][0]["title"] = "Redirected board"
+        self.assertEqual(self.board()["tasks"][0].get("title"), "Redirected board")
+        self.board()
+        self.assertEqual(self.cli.call_count, 6)
+
+    def test_missing_local_config_does_not_cache_parent_board(self):
+        os.unlink(os.path.join(self.root, "backlog", "config.yml"))
+        self.board(True)
+        self.board(True)
+        self.assertEqual(self.cli.call_count, 4)
+
+    def test_legacy_config_disables_reuse(self):
+        self.board(True)
+        with open(os.path.join(self.root, "backlog.json"), "w") as f:
+            f.write("{}")
+        self.board(True)
+        self.assertEqual(self.cli.call_count, 4)
+
+    def test_environment_redirect_disables_reuse(self):
+        self.board(True)
+        with mock.patch.dict(os.environ, {"BACKLOG_CWD": "/some/other/project"}):
+            self.board(True)
+            self.board(True)
+        self.assertEqual(self.cli.call_count, 6)
+
+    def test_unreadable_metadata_retries_cli_instead_of_serving_old_data(self):
+        self.board(True)
+        self.data["tasks"][0]["title"] = "New"
+        with mock.patch.object(server.os, "walk", side_effect=PermissionError("denied")):
+            self.assertEqual(self.board()["tasks"][0].get("title"), "New")
+            self.board()
+        self.assertEqual(self.cli.call_count, 6)
+
+    def test_different_projects_do_not_share_inputs(self):
+        other = os.path.join(self.root, "other")
+        os.makedirs(os.path.join(other, "backlog"))
+        with open(os.path.join(other, "backlog", "config.yml"), "w") as f:
+            f.write("project_name: other\n")
+        self.config["projects"].append({"name": "other", "path": other})
+        first = server.get_board(self.config)
+        self.assertEqual(len(first["projects"]), 2)
+        self.assertEqual(self.cli.call_count, 4)
+        with open(os.path.join(other, "backlog", "task.md"), "w") as f:
+            f.write("changed")
+        server.get_board(self.config)
+        self.assertEqual(self.cli.call_count, 6)
+
+    def test_change_during_load_is_not_cached(self):
+        def read(args, cwd):
+            if "--ready" in args:
+                with open(os.path.join(self.root, "backlog", "config.yml"), "a") as f:
+                    f.write("change")
+            return self.data
+        self.cli.side_effect = read
+        self.board(True)
+        self.cli.side_effect = None
+        self.board(True)
+        self.assertEqual(self.cli.call_count, 4)
+
+
+class BacklogPriorityTests(unittest.TestCase):
+    def test_all_cli_launch_boundaries_use_nice_when_available(self):
+        with mock.patch.object(server, "which", return_value="/usr/bin/nice"), \
+             mock.patch.object(server.subprocess, "run", return_value=
+                 subprocess.CompletedProcess([], 0, "{}", "")) as run, \
+             mock.patch.object(server.subprocess, "Popen") as popen:
+            server.run_backlog(["task", "list", "--json"], cwd="/repo")
+            server.run_backlog_raw(["task", "edit", "TASK-1"], cwd="/repo")
+            server.launch_browser_process(["backlog", "browser"], cwd="/repo")
+        for call in [*run.call_args_list, popen.call_args]:
+            self.assertEqual(call.args[0][:4], ["/usr/bin/nice", "-n", "10", "backlog"])
+            self.assertNotIn("preexec_fn", call.kwargs)
+
+    def test_no_nice_falls_back_to_direct_cli(self):
+        with mock.patch.object(server, "which", return_value=None), \
+             mock.patch.object(server.subprocess, "run", return_value=
+                 subprocess.CompletedProcess([], 0, "{}", "")) as run, \
+             mock.patch.object(server.subprocess, "Popen") as popen:
+            server.run_backlog(["task", "list", "--json"], cwd="/repo")
+            server.run_backlog_raw(["--version"], cwd="/repo")
+            server.launch_browser_process(["backlog", "browser"], cwd="/repo")
+        for call in [*run.call_args_list, popen.call_args]:
+            self.assertEqual(call.args[0][0], "backlog")
 
 def backlog_proc(returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(["backlog"], returncode, stdout, stderr)
@@ -2255,6 +2427,7 @@ class AgentEventStoreTests(unittest.TestCase):
         self.assertEqual(server.get_agent_state("my-app", "TASK-2"), "waiting")
 
 
+    @settled_codex_pane()
     def test_codex_finished_is_exposed_as_honest_idle(self):
         # TASK-58 proved a codex Stop/notify event is indistinguishable
         # between a genuinely complete task and a turn ending on a chat
@@ -2283,6 +2456,7 @@ class AgentEventStoreTests(unittest.TestCase):
         self.assertEqual(server.get_agent_state("my-app", "TASK-2"), "finished")
         self.assertEqual(server.get_agent_kind("my-app", "TASK-2"), "unknown")
 
+    @settled_codex_pane()
     def test_later_event_without_kind_retains_known_kind(self):
         server.record_agent_event("my-app", "TASK-2", "working", agent_kind="codex")
         server.record_agent_event("my-app", "TASK-2", "finished")
@@ -2350,7 +2524,7 @@ class HooksSettingsPayloadTests(unittest.TestCase):
 
         self.assertEqual(command_for("UserPromptSubmit"), f"python3 {notify} working")
         self.assertEqual(command_for("PreToolUse"), f"python3 {notify} working")
-        self.assertEqual(command_for("Notification"), f"python3 {notify} waiting")
+        self.assertEqual(command_for("Notification"), f"python3 {notify} notification")
         self.assertEqual(command_for("Stop"), f"python3 {notify} finished")
 
     def test_payload_suppresses_auto_mode_setup_and_accepts_cross_session_messages(self):
@@ -3657,6 +3831,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(body["sessions"][0]["agentState"], "waiting")
         self.assertEqual(body["sessions"][0]["agentKind"], "unknown")
 
+    @settled_codex_pane()
     def test_api_sessions_maps_codex_finished_to_idle_and_exposes_kind(self):
         server.record_agent_event("my-app", "TASK-9", "finished", agent_kind="codex")
         stdout = "centrale-my-app-task-9\t1690000000\t1\n"
@@ -3670,6 +3845,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(body["sessions"][0]["agentState"], "idle")
         self.assertEqual(body["sessions"][0]["agentKind"], "codex")
 
+    @settled_codex_pane()
     def test_post_agent_event_maps_codex_finished_to_idle_and_records_kind(self):
         status, body = self._post(
             "/api/agent-event?project=my-app&task=TASK-2&agentKind=codex",
@@ -4142,9 +4318,9 @@ class HttpApiTests(unittest.TestCase):
         # tmux sends an UNKNOWN key name as literal text, so an open-ended
         # "key" would be a second text channel with none of the text
         # validation -- and "y", which task-77 removed, stays removed.
-        self.assertEqual(server.SESSION_INPUT_KEYS, ("Escape", "Enter"))
+        self.assertEqual(server.SESSION_INPUT_KEYS, ("Escape", "Enter", "Up", "Down"))
         self._arm()
-        for key in ("y", "escape", "C-c", "Up", "q", "", 42, None):
+        for key in ("y", "escape", "C-c", "up", "Left", "q", "", 42, None):
             with self.subTest(key=key):
                 with mock.patch.object(server, "run_tmux", side_effect=AssertionError("tmux must not run")):
                     status, body = self._reply("/api/session-input", {"project": "my-app", "taskId": "TASK-9", "key": key})
@@ -6698,10 +6874,10 @@ class DrawerPaneReplyContractTests(unittest.TestCase):
         self.assertEqual(
             sum(load_static(name).count("/api/session-input?") for name in FRONTEND_FILES), 0)
         send = self._fn(self.pane, "sendDrawerPaneReply", "closeDrawer")
-        self.assertIn('method: "POST"', send)
+        self.assertIn('method: "POST"', self._fn(self.pane, "postSessionInput", "sendDrawerPaneReply"))
         self.assertIn("project: C.currentDrawer.project", send)
         self.assertIn("taskId: C.currentDrawer.id", send)
-        self.assertIn("body.key = payload.key; else body.text = payload.text;", send)
+        self.assertIn("if (payload.key !== undefined) body.key = payload.key; else body.text = payload.text;", send)
         row = self._fn(self.pane, "renderDrawerPaneReplyRow", "drawerPaneReplyBlockReason")
         self.assertIn("sendDrawerPaneReply({ text: input.value })", row)
         self.assertIn('text: "Send"', row)
@@ -6712,7 +6888,7 @@ class DrawerPaneReplyContractTests(unittest.TestCase):
                       invariant="the reply row's session-key list")
         self.assertEqual(
             re.findall(r'\bkey: "(\w+)"', str(keys)), ["Escape", "Enter"])
-        self.assertEqual(list(server.SESSION_INPUT_KEYS), ["Escape", "Enter"])
+        self.assertEqual(list(server.SESSION_INPUT_KEYS), ["Escape", "Enter", "Up", "Down"])
         self.assertNotIn('"y"', keys)
         self.assertEqual(row.count('C.h("button"'), 2)  # Send + the REPLY_KEYS loop
         self.assertIn("sendDrawerPaneReply({ key: k.key })", row)

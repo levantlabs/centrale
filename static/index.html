@@ -158,6 +158,17 @@
         <span id="code-drift-text"></span>
       </div>
 
+      <!-- task-187: built by views.js from whatever views registered;
+           hidden (not merely empty) when there are none. -->
+      <nav id="view-tabs" aria-label="Views" hidden></nav>
+      <div id="view-stage" hidden>
+        <div id="view-top"></div>
+        <div id="view-cols">
+          <section id="view-host" hidden></section>
+          <aside id="view-side" hidden></aside>
+        </div>
+      </div>
+
       <main id="board-wrap">
         <div id="page-heading-row">
           <h2 id="page-title">Kanban Board</h2>
@@ -241,6 +252,12 @@
         <div class="settings-field-error" id="settings-error-harvestMode" hidden></div>
       </div>
 
+      <div class="settings-section" id="settings-views-section" hidden>
+        <div class="settings-label">Views</div>
+        <div id="settings-views-list"></div>
+        <div class="settings-hint">Untick a view to remove its tab. Applies at once and is remembered in this browser -- it is not part of Save.</div>
+      </div>
+
       <div class="settings-section">
         <label class="toggle-field" for="settings-require-agent-toggle" title="When on, spawning a task whose assignee is missing or isn't a configured agent is refused, and the spawn button offers a picker of agents instead. When off, such a task gets the default agent, with a warning.">
           <span class="switch">
@@ -295,8 +312,7 @@
       <div class="settings-section">
         <div class="settings-label">Per-project settings</div>
         <div class="settings-hint" style="margin-top: 0; margin-bottom: 8px;">
-          Test commands run against the merged tree; blank = no test gate. Max agents limits live sessions; blank = no limit.
-          Links share paths from the main checkout with new worktrees, one path per line.
+          One card per project. Grey italic text in a field is an example, not a saved value.
         </div>
         <div id="settings-check-commands"></div>
       </div>
@@ -322,13 +338,17 @@
         </div>
       </details>
 
-      <div class="settings-section">
-        <div class="settings-label">Projects</div>
-        <div class="settings-hint" style="margin-top: 0; margin-bottom: 8px;">
-          Removing a project only removes it from this dashboard's config -- the repo itself is never touched.
+      <!-- task-185: collapsed like Agents on every open; the summary
+           carries the project count so nothing is lost while closed. -->
+      <details class="settings-section" id="settings-projects-section">
+        <summary id="settings-projects-summary" title="The projects on this dashboard. Click to expand.">Projects</summary>
+        <div class="settings-agents-body">
+          <div class="settings-hint" style="margin-top: 0; margin-bottom: 8px;">
+            Removing a project only removes it from this dashboard's config -- the repo itself is never touched.
+          </div>
+          <div id="settings-projects-list"></div>
         </div>
-        <div id="settings-projects-list"></div>
-      </div>
+      </details>
 
       <div class="settings-section">
         <div class="settings-label">Add a project</div>
@@ -355,7 +375,10 @@
 
   <div id="toast-container"></div>
 
-<!-- The frontend: one plain script tag per concern (task-89), all of
+<!-- task-187: a view is one static/view-*.js with one script tag placed
+     after views.js and before main.js in the block below; nothing else in
+     the tree names a view.
+     The frontend: one plain script tag per concern (task-89), all of
      them here at the end of <body> rather than in <head>, because the
      code queries and wires up the markup above as soon as it runs -- so
      this position (DOM already parsed) is load-bearing and there is no
@@ -383,6 +406,13 @@
 <script src="/static/pane.js"></script>
 <script src="/static/shell.js"></script>
 <script src="/static/settings.js"></script>
+<script src="/static/fleet.js"></script>
+<script src="/static/views.js"></script>
+<script src="/static/shared-pulse.js"></script>
+<script src="/static/shared-feed.js"></script>
+<script src="/static/view-needs-you.js"></script>
+<script src="/static/view-fleet.js"></script>
+<script src="/static/view-timeline.js"></script>
 <script src="/static/main.js"></script>
 </body>
 </html>

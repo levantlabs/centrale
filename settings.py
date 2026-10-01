@@ -806,7 +806,7 @@ def _write_whitelisted_changes(
             if not isinstance(entry, dict) or entry.get("name") not in values:
                 continue
             value = values[entry["name"]]
-            if value is None or value == []:
+            if value is None or value == [] or value == "":
                 entry.pop(key, None)
             else:
                 entry[key] = value

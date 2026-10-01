@@ -18,7 +18,7 @@ Ground rules the architecture doc expands on:
   a vanilla static/index.html document
   shell plus one plain `<script src>` per concern under static/ (state, dom,
   api, tasks, feedback, board, spawn, harvest, sessions, drawer, pane, shell,
-  settings, main -- loaded in that order) and static/styles.css. No build
+  settings, fleet, views, main -- loaded in that order) and static/styles.css. No build
   step, no bundler, no modules; the seam between the JS files is the single
   window.Centrale namespace object documented at the top of static/state.js.
 - All task data access goes through the `backlog` CLI; Centrale stores no

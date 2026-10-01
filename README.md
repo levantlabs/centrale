@@ -41,6 +41,29 @@ entirely and no task data is lost.
 
 ## Screenshots
 
+Three views sit beside the board in the tab strip — what needs you, who is
+running, and what happened. **Needs you**, with a permission dialog you can
+answer in place and an owner question waiting on a decision:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/view-needs-you-dark.png">
+  <img alt="The Needs you view: a permission dialog and an owner question, with the summary bar and Activity feed" src="docs/img/view-needs-you-light.png">
+</picture>
+
+**Fleet**, one card per project with used and maximum agent slots:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/view-fleet-dark.png">
+  <img alt="The Fleet view: a card per project with agent slots used out of the maximum" src="docs/img/view-fleet-light.png">
+</picture>
+
+**Timeline**, every agent's recent states as coloured segments, with merges marked:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/view-timeline-dark.png">
+  <img alt="The Timeline view: agent rows of state segments grouped by project, with a now line" src="docs/img/view-timeline-light.png">
+</picture>
+
 A task's drawer: what the agent has actually committed on its unmerged branch,
 the live tmux pane below it, and a reply box that types straight into the
 session:
@@ -52,7 +75,7 @@ at length:
 
 ![The session theater: the live pane in a large in-page overlay](docs/img/session-theater.png)
 
-(Every screenshot here — the board above included — uses synthetic project and
+(Every screenshot here — the board above and the views included — uses synthetic project and
 task data; no real repository is shown.)
 
 ## Quickstart
@@ -102,6 +125,24 @@ project's own statuses; cards carry a project chip, priority, labels, a green
 or label) and a "Ready to start" filter narrow it down, per-project show/hide
 and that filter persist across reloads, and a project that fails to load
 degrades to an error banner instead of taking the board down. → [docs/board.md](docs/board.md#using-the-board)
+
+**Three views over your running agents.** Tabs above the board open **Needs
+you** (an inbox of what only a person can do: a permission dialog or menu
+you answer in place with arrows and Enter or a click, an agent that went idle
+without a report, a failed delivery, a blocked merge, an owner question, with a
+live count on the tab), **Fleet** (a card per project: agent slots used out of
+`maxAgents`, each agent's state, time in it and a two-hour sparkline) and
+**Timeline** (every recently active agent as a row of state segments, with
+merge markers and a now line). They share a summary bar and an Activity feed,
+read one `GET /api/fleet` poll, and are individually switched off under
+**Settings → Views**. → [docs/board.md](docs/board.md#views)
+
+**Owner questions, by convention.** A task labelled `needs-owner-approval`,
+with the question in a task comment, shows up in Needs you. The label is
+optional: Centrale only reads it, never adds or removes it and enforces no
+approval gate. Spawned agents are told about it in their prompt; whoever
+records the answer removes the label.
+→ [docs/board.md](docs/board.md#owner-questions)
 
 **A drawer that shows the branch, not just `main`.** Clicking a card opens the
 task's description, acceptance criteria, dependencies, plan and notes. When an

@@ -443,7 +443,7 @@ global.wireSettingsShell = function () {
    "settings-agents-section", "settings-agents-summary", "settings-agents-table",
    "settings-add-agent-btn", "settings-error-agents", "settings-default-agent",
    "settings-error-defaultAgent",
-   "settings-projects-list",
+   "settings-projects-section", "settings-projects-summary", "settings-projects-list",
    "settings-add-project-name", "settings-error-addProject.name",
    "settings-add-project-path", "settings-error-addProject.path",
    "settings-add-project-init", "settings-add-project-status",

@@ -447,8 +447,6 @@
         spawnBtn.title = C.TMUX_UNAVAILABLE_TOOLTIP;
       } else if (live) {
         spawnBtn.title = "Session already running: " + live.name;
-      } else if (display.capReason) {
-        spawnBtn.title = display.capReason;
       } else if (display.confirming) {
         spawnBtn.title = display.confirmTitle || "";
       } else if (display.agentTitle) {
@@ -464,9 +462,8 @@
         footer.appendChild(C.renderSpawnAgentPicker(task, project.name, task.id, display.plan));
       }
       footer.appendChild(spawnBtn);
-      if (display.capReason) {
-        footer.appendChild(C.h("div", { className: "spawn-status-line", text: display.capReason }));
-      }
+      // At the project's agent cap the button is disabled and its tooltip
+      // says why; repeating that on every card of the project was noise.
       card.appendChild(footer);
 
       if (state && (state.status === "error" || state.status === "success")) {

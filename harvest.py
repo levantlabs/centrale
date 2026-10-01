@@ -156,6 +156,12 @@ def _record_event(project_name, report, trigger, error=None):
     with _events_lock:
         _events.append(event)
         orchestrator.publish_harvest(event)
+        key = (project_name, str(event["taskId"]).upper())
+        server.fleet_history.append(
+            *key, server.fleet_history.agent(*key),
+            "merged" if event.get("merged") or event.get("alreadyMerged") else "merge blocked",
+            timestamp=event["time"], harvest=event,
+        )
 
 
 def recent_events(project_name=None):

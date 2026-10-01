@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 import shutil
 import subprocess
 import sys
@@ -77,6 +78,15 @@ class ApplySettingsValidationTests(unittest.TestCase):
         tmp.close()
         self.tmp_path = tmp.name
         self.addCleanup(lambda: os.path.exists(self.tmp_path) and os.unlink(self.tmp_path))
+
+    def test_legacy_owner_label_is_ignored_even_when_invalid(self):
+        for value in ("custom-label", True, [], "two\nlabels"):
+            with self.subTest(value=value):
+                Path(self.tmp_path).write_text(json.dumps({"projects": [
+                    {"name": "my-app", "path": "/repo", "ownerLabel": value}]}))
+                loaded = server.load_config(path=self.tmp_path)
+                self.assertNotIn("ownerLabel", loaded["projects"][0])
+                self.assertNotIn("ownerLabel", settings.current_settings(loaded))
 
     def test_rejects_invalid_harvest_mode(self):
         with self.assertRaises(settings.ValidationError) as ctx:

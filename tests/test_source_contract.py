@@ -461,15 +461,25 @@ class AgentsDocQuotesTheCodeTests(unittest.TestCase):
         resume = next(
             node for node in ast.walk(ast.parse(source))
             if isinstance(node, ast.FunctionDef) and node.name == "resume")
+        # task-183: each default now ends in `*agent_cmd[1:]` (the
+        # agent's own arguments); the fixed part is the constants before it.
+        def fixed_part(elts):
+            head = []
+            for e in elts:
+                if isinstance(e, ast.Starred):
+                    break
+                if not (isinstance(e, ast.Constant) and isinstance(e.value, str)):
+                    return None
+                head.append(e.value)
+            return head or None
+
         defaults = [
-            [element.value for element in node.value.elts]
+            fixed_part(node.value.elts)
             for node in ast.walk(resume)
             if isinstance(node, ast.Assign)
             and any(isinstance(t, ast.Name) and t.id == "cmd" for t in node.targets)
             and isinstance(node.value, ast.List)
-            and node.value.elts
-            and all(isinstance(e, ast.Constant) and isinstance(e.value, str)
-                    for e in node.value.elts)
+            and fixed_part(node.value.elts)
         ]
         self.assertGreaterEqual(len(defaults), 2, defaults)  # not vacuous
         missing = [d for d in defaults if json.dumps(d) not in self.text]

@@ -302,8 +302,13 @@ the group rather than from each one.
   (`load-buffer` + `paste-buffer -p`) followed by Enter, so the agent's
   paste heuristic can't swallow the Enter the way a raw keystroke burst
   let it; a key goes as a single `send-keys` carrying the key *name*.
-  Single-line text and those two keys only: no multi-line input, no arrow
-  keys, no interrupt — for anything beyond a short answer, attach.
+  Single-line text and the keys Escape, Enter, Up and Down only: no
+  multi-line input, no interrupt. **Menus:** click the session view to
+  focus it and Up/Down/Enter/Escape go in as real keypresses (Escape
+  cancels the agent's menu rather than closing the drawer); or click a
+  numbered option line and Centrale sends the arrow presses from the
+  highlighted option (`❯` / `›`) to that line, then one Enter. Clicking
+  anywhere that is not a menu option sends nothing.
   Be aware the pane is a *polled capture*,
   so the prompt can move on between the capture and your keystroke; that
   is mitigated, not solved: the capture age sits right next to the input,
@@ -349,6 +354,64 @@ the group rather than from each one.
   the task drawer's **"Open task"** button opens the same web UI on the open
   task's own detail view — see "Opening a project's Backlog.md board" below.
   The drawer also shows the task's assignee (or "unassigned").
+
+## Views
+
+Above the board sits a tab strip: **Board**, **Needs you**, **Fleet** and
+**Timeline**. The Board is everything described above; the other three are
+read-only lenses over your running agents, fed by one shared
+[`GET /api/fleet`](api.md#get-apifleetwindowseconds) poll that runs only
+while one of them is on screen or showing a tab count. Click a tab to open
+a view. Every view but the Board also gets a summary bar (live agents,
+merges in the window, a bar of how many are working, waiting and so on) and an
+**Activity** feed of recent state changes.
+
+![Needs you: a permission dialog and an owner question, with the summary bar and the Activity feed](img/view-needs-you-light.png)
+
+- **Needs you** is an inbox of the things only a person can do, with a live
+  count on its tab: an agent parked on a permission dialog or menu (answer it
+  right there, with arrows and Enter or a click on an option), a spawned
+  agent that went idle without a final report, a delivery that did not
+  arrive, a merge that was last attempted and blocked, and **owner
+  questions** (below). Finished work awaiting review is not listed; it stays
+  with whoever merges.
+- **Fleet** is one card per project: how many agent slots are used out of
+  `maxAgents` ("no limit" when it is unset), and under it each live agent's
+  state, how long it has been in that state, its name and a two-hour
+  sparkline. Click an agent to open its drawer, or **Timeline** to see it
+  there.
+
+![Fleet: one card per project with used and maximum agent slots](img/view-fleet-light.png)
+
+- **Timeline** is every agent that was active in the last two hours as a row
+  of coloured state segments (working, waiting, ready to review, idle, merge
+  blocked), grouped by project, with merge markers and a "now" line. It
+  scrolls forward as time passes; hover a segment for its times.
+
+![Timeline: agent rows of state segments grouped by project, with a now line](img/view-timeline-light.png)
+
+Dark theme screenshots of each:
+[Needs you](img/view-needs-you-dark.png),
+[Fleet](img/view-fleet-dark.png),
+[Timeline](img/view-timeline-dark.png).
+
+Views are optional. **Settings → Views** has a checklist; unchecking one
+removes its tab immediately (the choice is kept in this browser only), and a
+view whose script is removed from `static/` simply never appears. What each
+view derives, and when, is in the [API reference](api.md#get-apifleetwindowseconds);
+the files behind them are in [architecture.md](architecture.md#the-frontend-files).
+
+### Owner questions
+
+A task can carry the fixed label `needs-owner-approval` to ask the owner a
+question: the asker puts the question in a task comment and stops, and the
+person who decides records the answer and removes the label. Using it is
+optional and Centrale only *reads* it: it never adds or removes the label and
+enforces nothing. The latest comment containing a question mark is what Needs
+you shows; a Done task or one with a final summary is excluded. Agents spawned
+from Centrale are told the convention in their prompt
+([agents.md](agents.md#spawning-an-agent)); the full wording is in the
+[agent guide](../static/agent-guide.md#owner-questions-optional-convention).
 
 ## Opening a project's Backlog.md board
 

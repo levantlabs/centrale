@@ -17,6 +17,21 @@ HTTP status and response body. Keep task work on the Backlog CLI: start with
 `backlog instructions overview`, read the task and standing decisions, and
 follow the execution/finalization guides.
 
+## Owner questions (optional convention)
+
+Projects may use the fixed `needs-owner-approval` label when a task needs an
+owner decision, including approval before work starts. Add the label through
+Backlog and state the question in a task comment; the worker stops until the
+owner answers. The latest comment is the question shown in Needs you, with the
+task title as fallback when there are no comments.
+
+Whoever records the owner's decision writes it on the task and removes
+`needs-owner-approval` through Backlog. For a spawned task, send the decision
+and label-removal instruction through `/api/rule` so the worker remains its
+sole writer. Label removal ends the question; Done status or a final summary
+also excludes it. Centrale only reads this convention across configured
+projects: it never adds or removes the label and enforces no approval gate.
+
 ## Spawn and choose an agent
 
 After the owner authorizes work, substitute the actual project, task ID and

@@ -23,6 +23,63 @@ would protect is the shape of `projects.json`, the `/api` endpoints
 documented in [docs/api.md](docs/api.md), and what a spawned agent is
 handed.
 
+## v0.3.0 — views
+
+Three new views over your running agents sit beside the board, and agents
+now have a convention for asking you a question.
+
+Tested against **`backlog` v1.51.0**, the same baseline as v0.2.0.
+
+**New:**
+
+- **Views: Needs you, Fleet, Timeline.** A tab strip above the board opens
+  them. **Needs you** is an inbox of what only a person can do — a
+  permission dialog or menu on a waiting agent, an idle agent with no
+  final report, a failed message delivery, a merge that was last blocked,
+  and owner questions — with a live count on its tab. **Fleet** shows a
+  card per project with used and maximum agent slots (`maxAgents`), each
+  live agent's state, time in that state and a two-hour sparkline; click
+  an agent to open it on the Timeline. **Timeline** draws every agent
+  active in the last two hours as a row of state segments grouped by
+  project, with merge markers and a now line. Each view past the Board
+  shares a summary bar and an Activity feed. **Settings → Views** hides
+  any of them. Screenshots and details: [docs/board.md](docs/board.md#views).
+- **Fleet history and `GET /api/fleet`.** The views read one snapshot of
+  live agents, capacity, recent state changes, merges and attention items.
+  State changes are kept as a journal for 48 hours at
+  `$CENTRALE_FLEET_LOG` (default `~/.local/state/centrale/fleet.jsonl`);
+  see [docs/api.md](docs/api.md#get-apifleetwindowseconds) and
+  [docs/operations.md](docs/operations.md).
+- **Owner questions.** Label a task `needs-owner-approval` and put the
+  question in a comment: it appears in Needs you. Optional, and Centrale
+  only reads the label. The agent guide and the prompt every spawned agent
+  gets now teach it.
+- **Answer an agent's menu from the browser.** In a task's session pane,
+  or right in Needs you, pick an option on a permission dialog or menu
+  with the arrow keys and Enter or a click; it goes to the agent as those
+  keys.
+- **Settings: per-project cards.** Each project's settings are a card, and
+  the cards collapse.
+
+**Changed:**
+
+- **Resume keeps each agent's flags.** A resumed agent is launched with the
+  flags configured for it in `projects.json` instead of its bare command.
+- **Honest stop signals.** A Codex agent that is still working is no longer
+  shown as idle, and Claude's idle reminder no longer shows as "waiting for
+  input", so the badges and Needs you stop reporting things that did not
+  happen.
+- **The board no longer reads the backlog CLI on every poll.** Board
+  results are reused while a project's backlog files are unchanged, and the
+  CLI processes Centrale starts now run at low priority. With the UI open
+  this was about four CLI calls a second, enough load to disturb other
+  work on the machine. This is a deliberate exception to reading fresh on
+  every request, written down in [MANIFESTO.md](MANIFESTO.md#derive-do-not-remember);
+  git, tmux, task details and the merge gates still read fresh.
+- **The browser no longer gates launches on `maxAgents`.** Spawn and
+  Resume stay enabled at the cap and the server refuses with its `409`,
+  which the page shows. The cap is unchanged.
+
 ## v0.2.0 — orchestrating agents
 
 This release is about a second kind of user: an agent that runs other

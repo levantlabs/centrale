@@ -17,6 +17,7 @@ layout behind it.
 |---|---|
 | `server.py` | Backend: config loading, board aggregation, subprocess boundaries, HTTP server + routing |
 | `spawn.py` | Worktree + tmux spawn engine behind `POST /api/spawn` |
+| `fleet.py` | Bounded durable fleet observation journal (task-186), loaded explicitly at startup; never a source of live badges or task status |
 | `orchestrator.py` | Optional condition-backed notification history for `GET /api/orchestrator-wait`, fed by existing hook transitions and harvest attempt results (task-174). No task decisions or subprocesses |
 | `harvest.py` | Gated merge engine behind `POST /api/harvest` (and the live `GET /api/harvest-progress` record) |
 | `settings.py` | Settings read/write behind `/api/settings` — a whitelisted subset of `projects.json`, including (task-78) the whole `agents` map for the modal's Agents editor. Also the opt-in Backlog/pointer setup shared by add-project and `/api/setup-project` (task-175), with commits scoped to changed files |
@@ -29,7 +30,7 @@ layout behind it.
 | `static/favicon.svg` | The tab icon, declared by a `<link rel="icon">` in index.html and also served at `/favicon.ico` (task-90) |
 | `static/agent-guide.md` | Agent operating guide, loaded with the server code at startup and served as plain text at `/api/agent-guide`, with examples using the bound port. Projects receive only its URL in marked instruction blocks (task-175) |
 | `projects.json` | User config: port, worktree root, projects, agents map, browser ports |
-| `tests/` | The default `unittest` suite, one module per concern -- `test_server.py` (config loading, board aggregation, sessions, the agent-event store and hook injection, the HTTP routes and their request gate, and the source-shape contracts over `static/`); `test_spawn.py` (worktree/branch resolution, agent selection, the claim commit, resume and reconcile, the spawn/resume validation refusals); `test_orchestrator.py` (the waiting API: live HTTP wake-up, cursor replay, project isolation, timeout, hook deduplication and harvest notifications); `test_harvest.py` (each merge gate, branch evaluation, the harvest lock and progress record, auto-harvest, `/api/harvest`); `test_settings.py` (the whitelisted read/write of `projects.json`, the Agents editor, `/api/settings`); `test_browser.py` (per-project `backlog browser` launch, reuse, relaunch, the listener-pid registry and its register-time reconciliation, and the board-version comparison); `test_frontend_behaviour.py` (what the frontend DOES, driven under `node`); `test_source_contract.py` (the source-text tier's own machinery, the source-text ceiling, and the three censuses over this chapter -- that every module here is named in this table (task-131), that every top-level `*.py` module has a row of its own in it (task-150), and that [The frontend files](#the-frontend-files) lists the `static/*.js` files in load order (task-141)); `test_doctor.py` (the `--check` doctor's pass/warn/fail verdicts and its CLI wiring); `test_version.py` (the one version constant, how the server resolves it, and the tag `scripts/release.sh` derives from it); `test_centrale_notify.py` (the `centrale_notify.py` hook helper's argv gating and its POST to `/api/agent-event`); `test_delivery.py` (`POST /api/deliver`'s deliver-and-confirm -- the dialog refusal, the echo match and its baseline, each failure outcome -- and the delivery log behind `GET /api/deliveries`, over real claude and codex pane captures in `fixtures/panes/`); `test_scan_release.py` (`scripts/scan_release.py`'s secret and identity scan, including a clean run over this repository); `test_release_snapshot.py` (what `git archive HEAD` ships: source in, `backlog/` out, no generated content); `test_docs_operations.py` (docs/operations.md's hand-kept tool and allowlist enumerations, pinned to release.sh, `tests_integration/` and the scan -- task-145); `test_docs_references.py` (the one rule over every document at once: a path under `tests/` or `tests_integration/` named in the public prose or a top-level module has to resolve to a file, after version.py cited a test that never existed -- task-163); `test_screenshots_script.py` (the one property `scripts/screenshots.py` may not lose: its faked CLI boundaries refuse any directory outside the throwaway sandbox, and no command-line option can aim it at a real board -- hermetic, and Playwright-free like everything else here -- task-153); `test_integration_base.py` (the unit-tier test OF `tests_integration/base.py`: its pure `parse_created_task_id` helper, `require_tools`' skip-or-fail switch on `CENTRALE_REQUIRE_INTEGRATION`, and the per-run tmux socket name and its path -- all decided before any subprocess runs, so it runs no integration test and launches nothing) -- plus recorded JSON fixtures and pane captures in `fixtures/` and two shared helpers: `source_contract.py` (lazy, self-describing slices of `static/`) and `js_harness.py` (the DOM shim the frontend is driven over under node). Every `test_*.py` here must be named in this row: `test_source_contract.py` fails the suite otherwise |
+| `tests/` | The default `unittest` suite, one module per concern -- `test_server.py` (config loading, board aggregation, sessions, the agent-event store and hook injection, the HTTP routes and their request gate, and the source-shape contracts over `static/`); `test_spawn.py` (worktree/branch resolution, agent selection, the claim commit, resume and reconcile, the spawn/resume validation refusals); `test_fleet.py` (durable history, retention, corrupt records, lifecycle observations and fleet HTTP snapshots); `test_orchestrator.py` (the waiting API: live HTTP wake-up, cursor replay, project isolation, timeout, hook deduplication and harvest notifications); `test_harvest.py` (each merge gate, branch evaluation, the harvest lock and progress record, auto-harvest, `/api/harvest`); `test_settings.py` (the whitelisted read/write of `projects.json`, the Agents editor, `/api/settings`); `test_browser.py` (per-project `backlog browser` launch, reuse, relaunch, the listener-pid registry and its register-time reconciliation, and the board-version comparison); `test_frontend_behaviour.py` (what the frontend DOES, driven under `node`); `test_source_contract.py` (the source-text tier's own machinery, the source-text ceiling, and the three censuses over this chapter -- that every module here is named in this table (task-131), that every top-level `*.py` module has a row of its own in it (task-150), and that [The frontend files](#the-frontend-files) lists the `static/*.js` files in load order (task-141)); `test_doctor.py` (the `--check` doctor's pass/warn/fail verdicts and its CLI wiring); `test_version.py` (the one version constant, how the server resolves it, and the tag `scripts/release.sh` derives from it); `test_centrale_notify.py` (the `centrale_notify.py` hook helper's argv gating and its POST to `/api/agent-event`); `test_delivery.py` (`POST /api/deliver`'s deliver-and-confirm -- the dialog refusal, the echo match and its baseline, each failure outcome -- and the delivery log behind `GET /api/deliveries`, over real claude and codex pane captures in `fixtures/panes/`); `test_scan_release.py` (`scripts/scan_release.py`'s secret and identity scan, including a clean run over this repository); `test_release_snapshot.py` (what `git archive HEAD` ships: source in, `backlog/` out, no generated content); `test_docs_operations.py` (docs/operations.md's hand-kept tool and allowlist enumerations, pinned to release.sh, `tests_integration/` and the scan -- task-145); `test_docs_references.py` (the one rule over every document at once: a path under `tests/` or `tests_integration/` named in the public prose or a top-level module has to resolve to a file, after version.py cited a test that never existed -- task-163); `test_screenshots_script.py` (the one property `scripts/screenshots.py` may not lose: its faked CLI boundaries refuse any directory outside the throwaway sandbox, and no command-line option can aim it at a real board -- hermetic, and Playwright-free like everything else here -- task-153); `test_integration_base.py` (the unit-tier test OF `tests_integration/base.py`: its pure `parse_created_task_id` helper, `require_tools`' skip-or-fail switch on `CENTRALE_REQUIRE_INTEGRATION`, and the per-run tmux socket name and its path -- all decided before any subprocess runs, so it runs no integration test and launches nothing) -- plus recorded JSON fixtures and pane captures in `fixtures/` and shared helpers: `source_contract.py` (lazy, self-describing slices of `static/`) and `js_harness.py` (the DOM shim the frontend is driven over under node), and `lifecycle_harness.py` (manual timer and settled-pane boundaries for lifecycle tests). Every `test_*.py` here must be named in this row: `test_source_contract.py` fails the suite otherwise |
 | `tests_integration/` | The opt-in second tier: real `git`/`tmux`/`backlog` processes in sandboxes, never collected by `discover tests`. Its module list lives in [tests_integration/README.md](../tests_integration/README.md) ("What's covered, and where") and nowhere else, so it has one place to drift from; see [Testing](#testing) |
 | `scripts/` | The tooling that is run by hand or by a release rather than by the server: `release.sh` (builds and publishes the curated public snapshot, and runs the release gate over it), `scan_release.py` (the secret/identity scan that gate runs first -- also runnable with no arguments over this repo), `harvest.sh` (a standalone report on, and optional cleanup of, merged Centrale worktrees), and `screenshots.py` (regenerates docs/img's four images from the synthetic world committed beside it in `screenshots_fixture.json` -- run by a maintainer after a UI change, by nothing else, and it cannot be aimed at a real board; task-153). One row for the directory: see [Releasing](operations.md#releasing) for what a release runs, in order |
 
@@ -46,10 +47,18 @@ Everything shared lives here:
   `run_backlog_raw`, `run_git`, `run_tmux`, `which`,
   `launch_browser_process`) are the only places subprocesses run. All calls
   use argument lists (never `shell=True`); tests patch these to stay hermetic.
+  Backlog commands, including the detached browser, are prefixed with
+  `nice -n 10` when `nice` is on PATH, otherwise run directly (task-196).
+  No `preexec_fn` runs in this threaded server.
 - **Board aggregation** — `get_board()` fans out per project on a
   `ThreadPoolExecutor`, merging `task list --json` with `task list --ready
-  --json` to set each task's `ready` flag, with a ~5s in-memory cache. A
-  failing project becomes an `error` field on that project, never a crash.
+  --json` to set each task's `ready` flag. Successful CLI inputs (including
+  milestone titles) are reused per checkout only while recursive `backlog/`
+  file metadata stays unchanged. Per-checkout locks coalesce simultaneous
+  clients; metadata is checked before and after loading, and failures are
+  retried. Lifecycle/git enrichment runs on every request. A failing project
+  becomes an `error` field on that project, never a crash. See the caching
+  exception in the manifesto (task-196).
 - **Sessions** — `list_sessions()` parses `centrale-*` tmux sessions (a
   missing tmux server means an empty list); `enrich_sessions_with_files()`
   maps each session name back to its worktree and attaches the files touched
@@ -208,7 +217,19 @@ hooks whose waiting signal is stale. Without a dialog it checks again in
 ends the candidate. Timer identity is rechecked under the badge lock after
 capture, so a cancelled callback cannot resurrect a wait for a new request
 or session. New Codex spawns also receive `PostToolUse → working` to clear
-permission candidates promptly. Claude's immediate events are unchanged.
+permission candidates promptly.
+
+Codex Stop/notify now arms a separate one-second confirmation timer
+(task-192). It captures the current screen without scrollback: an
+interruptible working footer retries in one second, a dialog publishes
+waiting, and a settled pane publishes idle. Empty/failed captures expose
+unknown and retry; missing sessions stop checking. New activity, clear,
+and reset cancel pending stops, and identity checks after capture exclude
+obsolete callbacks. Duplicate Stop/notify signals preserve the deadline.
+Both timers feed the same lifecycle store and publication path used by
+fleet/Needs-you and orchestrator-wait. Claude's helper consumes Notification
+stdin and only forwards input-request types; idle reminders never reach
+the state store. Genuine Claude prompts and Stop retain their timing.
 `harvest._record_event()` passes the same
 attempt summary it appends to `recent_events()`, including the first failed
 gate. The notification stream suppresses an unchanged line per project/task
@@ -238,6 +259,36 @@ the timer factory is injectable so unit tests never wait or call real tmux.
 See the [API contract](api.md#get-apiorchestrator-waitprojectnameaftercursortimeoutseconds)
 and the [optional orchestration loop](agents.md#waiting-for-orchestrator-events-optional).
 
+### fleet.py
+
+`main()` opens the JSONL journal at `CENTRALE_FLEET_LOG`, falling back to
+`$XDG_STATE_HOME/centrale/fleet.jsonl` (or `~/.local/state/centrale/fleet.jsonl`).
+Imports perform no journal I/O; embedded servers can inject a `Journal`.
+Spawn/resume, public hook transitions, harvest attempts and session endings
+append observations. Records older than 48 hours are removed on startup,
+append or snapshot reads, with atomic replacement in the same directory.
+Invalid lines are counted and skipped; write errors are exposed by the API.
+
+`GET /api/fleet` surveys tmux once, without per-session git enrichment, then
+combines current ephemeral hook states, configured capacity, windowed history
+and delivery failures. The additive `needsYou` field derives permission
+dialogs from fresh captures of waiting workers (unless preview is off), reads
+idle workers' branch reports through Backlog, and reuses `get_board(config)`'s
+cached tasks across every configured project for the fixed `needs-owner-approval`
+label. Labelled tasks and tasks with spawn branches get detail reads (workers can
+add the label on their own branch), preferring branch reports and
+otherwise reading the project task through Backlog, for the latest comment and
+completion/label-removal checks. It also selects recent unsuperseded delivery failures and
+labels failed merge attempts as historical signals, never current gate verdicts.
+See [the fleet API](api.md#get-apifleetwindowseconds) for the filtering rules.
+`GET /api/sessions` shares disappearance observation.
+A failed tmux survey never becomes evidence of an ended session; survey start
+times prevent an older concurrent poll from clearing a newly spawned badge.
+Restored observations can establish that a previously seen session has now
+ended, but cannot restore a current badge: restart leaves it unknown until a
+fresh hook arrives. History is evidence of past events, never task state,
+merge authority or evidence that a session is live. No polling thread is added.
+
 ### browser.py
 
 `launch_or_reuse()` starts a detached `backlog browser` process per project on
@@ -250,7 +301,7 @@ reported, never acted on.
 
 ### The frontend files
 
-Fourteen plain `<script src>` files, loaded in this order at the end of
+Twenty-one plain `<script src>` files, loaded in this order at the end of
 index.html's body — no build step, no bundler, no modules:
 
 | File | Concern |
@@ -268,6 +319,13 @@ index.html's body — no build step, no bundler, no modules:
 | `pane.js` | The live tmux pane preview, its reply row, the theater, and drawer close |
 | `shell.js` | The header/search/keyboard wiring, the theme toggle, the sidebar collapse |
 | `settings.js` | The settings modal, including the agents editor |
+| `fleet.js` | The one shared poller of `GET /api/fleet`: views subscribe and are handed each snapshot; one timer, running only while someone is subscribed (task-187) |
+| `views.js` | The view registry (`C.views.register({id, label, render[, focus, badge]})`; an optional `badge(snapshot)` puts a live value on the tab, through the registry's own fleet subscription held only while a visible view has one), the tab strip built only from registered, un-hidden views, cross-view `open()` that no-ops on an absent or hidden target, and Settings' Views checklist, persisted in localStorage as hidden ids. Each view is its own `static/view-*.js` with one script tag between `views.js` and `main.js`; nothing else names a view (task-187) |
+| `shared-pulse.js` | The fleet-at-a-glance bar above every view but the Board: live agents, merges, and a stacked state bar whose working segment shimmers and waiting segment marches. Registers with `C.views.registerShared({id, slot: "top", render})`; deleting the file and its tag removes it (task-194) |
+| `shared-feed.js` | The Activity feed beside every view but the Board (`slot: "side"`, stacking below at narrow widths), drawn from `snapshot.history`, newest first; removable the same way (task-194) |
+| `view-needs-you.js` | Optional Needs you inbox: derived attention signals, inline permission answers through the shared pane key sender, and a live tab count (task-188) |
+| `view-fleet.js` | The Fleet view: one card per project with used/max agent slots ("no limit" when `maxAgents` is unset), each live agent's state, time in state, name and a two-hour sparkline; clicking an agent asks the registry to open it on the Timeline, a no-op when that view is absent or hidden (task-189) |
+| `view-timeline.js` | The Timeline view: every agent active in the window as a row of state segments grouped by project, merge markers, a now line and a hover tooltip; it scrolls forward because each snapshot carries a newer `now`. Segment derivation is `C.fleetModel` in `fleet.js`, shared so neither view file needs the other (task-189) |
 | `main.js` | The top-level render orchestration and the boot call |
 
 **The seam.** Each file is one IIFE taking `window.Centrale` as `C`, and that

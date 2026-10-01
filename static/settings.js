@@ -36,6 +36,11 @@
     clearSettingsFieldErrors();
     // task-78: the Agents section starts collapsed on every open.
     C.byId("settings-agents-section").open = false;
+    // task-185: the Projects section and every project card start
+    // collapsed too; dropping the old cards means populate's
+    // keep-what-was-open-across-a-save rule has nothing to carry over.
+    C.byId("settings-projects-section").open = false;
+    C.clearChildren(C.byId("settings-check-commands"));
 
     fetch("/api/settings").then(function (res) {
       return res.json().catch(function () { return null; }).then(function (data) {
@@ -94,6 +99,11 @@
     C.byId("settings-refresh-interval").value = data.refreshIntervalSeconds;
 
     var container = C.byId("settings-check-commands");
+    // task-185: a save re-renders the cards; keep the ones left open open.
+    var openCards = {};
+    Array.prototype.forEach.call(container.querySelectorAll("details.settings-project-card"), function (d) {
+      if (d.open) openCards[d.getAttribute("data-project-card")] = true;
+    });
     C.clearChildren(container);
     var checkCommands = data.checkCommands || {};
     var maxAgents = data.maxAgents || {};
@@ -108,60 +118,77 @@
     // no fetch and waits on no board refresh.
     (data.projects || []).forEach(function (project) {
       var name = project.name;
-      var row = C.h("div", { className: "settings-check-command-row" });
-      row.appendChild(C.h("span", { className: "settings-check-command-name", text: name, title: name }));
+      // task-182: one card per project, its name the heading, then three
+      // fully labeled fields each with one line of help. The inputs keep
+      // their data-setting / data-project attributes, which is all the
+      // save and error-routing code reads.
+      // task-185: a <details> collapsed on open; its summary is the name
+      // plus the current values, refreshed as the fields are edited.
+      var card = document.createElement("details");
+      card.className = "settings-project-card";
+      card.setAttribute("data-project-card", name);
+      card.open = !!openCards[name];
+      var cardSummary = document.createElement("summary");
+      card.appendChild(cardSummary);
+      var fieldSeq = 0;
+      function addField(label, help, input, setting) {
+        var id = "settings-field-" + name.replace(/[^A-Za-z0-9_-]/g, "_") + "-" + (fieldSeq++);
+        input.id = id;
+        input.className = "settings-input";
+        input.setAttribute("data-project", name);
+        input.setAttribute("data-setting", setting);
+        var field = C.h("div", { className: "settings-project-field" });
+        field.appendChild(C.h("label", { className: "settings-project-field-label", text: label, attrs: { "for": id } }));
+        field.appendChild(input);
+        field.appendChild(C.h("div", { className: "settings-hint", text: help }));
+        var err = C.h("div", { className: "settings-field-error" });
+        err.hidden = true;
+        err.setAttribute("data-project-error", name);
+        err.setAttribute("data-setting-error", setting);
+        field.appendChild(err);
+        card.appendChild(field);
+      }
+
       var input = document.createElement("input");
       input.type = "text";
-      input.className = "settings-input";
-      input.setAttribute("data-project", name);
-      input.setAttribute("data-setting", "checkCommand");
       input.placeholder = "e.g. python3 -m unittest discover tests";
       input.value = checkCommands[name] || "";
-      row.appendChild(input);
-      var err = C.h("div", { className: "settings-field-error" });
-      err.hidden = true;
-      err.setAttribute("data-project-error", name);
-      err.setAttribute("data-setting-error", "checkCommand");
-      row.appendChild(err);
-      container.appendChild(row);
+      addField("Test command", "Runs on the merged result before a merge. Blank = no test gate.", input, "checkCommand");
 
       // task-177: these are project config beside checkCommand. The
       // textarea holds literal repo-relative paths, one per line.
-      var capRow = C.h("div", { className: "settings-check-command-row" });
-      capRow.appendChild(C.h("span", { className: "settings-check-command-name", text: name + " · max agents" }));
       var capInput = document.createElement("input");
       capInput.type = "number";
       capInput.min = "1";
       capInput.step = "1";
-      capInput.className = "settings-input";
-      capInput.setAttribute("data-project", name);
-      capInput.setAttribute("data-setting", "maxAgents");
-      capInput.placeholder = "No limit";
+      capInput.placeholder = "e.g. 3";
       capInput.value = maxAgents[name] == null ? "" : String(maxAgents[name]);
-      capRow.appendChild(capInput);
-      var capError = C.h("div", { className: "settings-field-error" });
-      capError.hidden = true;
-      capError.setAttribute("data-project-error", name);
-      capError.setAttribute("data-setting-error", "maxAgents");
-      capRow.appendChild(capError);
-      container.appendChild(capRow);
+      addField("Max agents", "Counts this project's live sessions. Blank = no limit.", capInput, "maxAgents");
 
-      var linksRow = C.h("div", { className: "settings-check-command-row" });
-      linksRow.appendChild(C.h("span", { className: "settings-check-command-name", text: name + " · links" }));
       var linksInput = document.createElement("textarea");
-      linksInput.className = "settings-input";
       linksInput.rows = 2;
-      linksInput.setAttribute("data-project", name);
-      linksInput.setAttribute("data-setting", "worktreeLinks");
-      linksInput.placeholder = ".venv (one repo-relative path per line)";
+      linksInput.placeholder = "e.g. .venv";
       linksInput.value = (worktreeLinks[name] || []).join("\n");
-      linksRow.appendChild(linksInput);
-      var linksError = C.h("div", { className: "settings-field-error" });
-      linksError.hidden = true;
-      linksError.setAttribute("data-project-error", name);
-      linksError.setAttribute("data-setting-error", "worktreeLinks");
-      linksRow.appendChild(linksError);
-      container.appendChild(linksRow);
+      addField("Worktree links", "Linked from the main checkout into each new worktree. One repo-relative path per line.", linksInput, "worktreeLinks");
+
+      function updateCardSummary() {
+        var parts = [];
+        var cap = capInput.value.trim();
+        if (cap) parts.push("max agents " + cap);
+        var links = linksInput.value.split("\n").filter(function (l) { return l.trim(); }).length;
+        if (links) parts.push(links + (links === 1 ? " link" : " links"));
+        if (input.value.trim()) parts.push("test command set");
+        C.clearChildren(cardSummary);
+        cardSummary.appendChild(C.h("span", { className: "settings-project-card-name", text: name, title: name }));
+        cardSummary.appendChild(C.h("span", {
+          className: "settings-agents-summary-detail",
+          text: parts.length ? parts.join(", ") : "nothing set"
+        }));
+      }
+      [input, capInput, linksInput].forEach(function (el) { el.addEventListener("input", updateCardSummary); });
+      updateCardSummary();
+
+      container.appendChild(card);
     });
 
     settingsAgentRows = (data.agentEntries || []).map(function (e) {
@@ -434,6 +461,8 @@
   // buttons use for their own confirm-arm state.
   function renderProjectsList(projects) {
     var container = C.byId("settings-projects-list");
+    C.byId("settings-projects-summary").textContent =
+      "Projects (" + projects.length + ")";
     C.clearChildren(container);
     projects.forEach(function (p) {
       var row = C.h("div", { className: "settings-project-row" });
@@ -622,6 +651,9 @@
       if (rowErr) {
         rowErr.hidden = false;
         rowErr.textContent = message;
+        // task-185: a collapsed card must not swallow its own error.
+        var errCard = rowErr.parentNode && rowErr.parentNode.parentNode;
+        if (errCard && errCard.tagName === "DETAILS") errCard.open = true;
         return true;
       }
     }

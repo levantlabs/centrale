@@ -276,8 +276,10 @@ Fields:
     Launches in the same server process are serialized per project so two
     requests cannot both take the last slot. Agent lifecycle badges do not
     affect the count: an idle or finished agent still occupies its session.
-    The launch controls stay visible but disabled with the reason. Other
-    projects have independent caps. Settings applies a changed cap to the
+    The browser does not pre-check the cap: the launch controls stay enabled
+    and a launch at the cap is refused by the server with that 409, shown as
+    the error. The [Fleet view](board.md#views) shows used/max slots per
+    project. Other projects have independent caps. Settings applies a changed cap to the
     next launch; lowering it does not stop existing sessions.
   - `worktreeLinks` (optional) — an array of literal repo-relative paths,
     e.g. `[".venv", "local/data"]`. Omitted, `null` or `[]` means no links.
@@ -352,6 +354,15 @@ something Centrale can't parse for that repo, that single project degrades to
 an error banner in the UI (and an `"error"` field in `/api/board`) — the
 other configured projects still load and render normally.
 
+## Owner questions
+
+Needs you reads tasks labelled `needs-owner-approval` across all configured
+projects; no setting is needed. Using the convention is optional. Put the
+question in a task comment and stop work until the owner answers. Whoever
+records the decision removes the label. Done tasks and tasks with a final
+summary are excluded. Centrale reads the label without changing it or enforcing
+an approval gate. See the [agent guide](../static/agent-guide.md#owner-questions-optional-convention).
+
 ## Settings
 
 The gear icon at the bottom of the sidebar opens a Settings view over the
@@ -362,7 +373,7 @@ subset of `projects.json`:
    labeled "Automatically merge branches when all safety gates pass." Read
    live by the auto-merge thread, so this takes effect on its next cycle —
    no restart.
-2. **Per-project settings** — each project's `checkCommand`, `maxAgents`
+2. **Per-project settings** — each project's `checkCommand`, `maxAgents`,
    and `worktreeLinks` (see above). Empty test command means no test gate;
    blank max agents means no cap; links are one repo-relative path per
    line, with an empty field meaning no links. Changes apply to future

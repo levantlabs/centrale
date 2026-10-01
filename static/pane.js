@@ -209,7 +209,9 @@
     }));
     header.appendChild(right);
     area.appendChild(header);
-    var pre = C.h("pre", { className: "drawer-pane-pre empty", attrs: { id: "drawer-pane-pre" }, text: "Waiting for the first capture…" });
+    var pre = C.h("pre", { className: "drawer-pane-pre empty", attrs: { id: "drawer-pane-pre", tabindex: "0" }, text: "Waiting for the first capture…" });
+    pre.addEventListener("keydown", onPaneKeydown);
+    pre.addEventListener("click", onPaneClick);
     area.appendChild(pre);
     area.appendChild(C.h("div", { className: "drawer-pane-error", attrs: { id: "drawer-pane-error" } }));
     applyDrawerWidth(); // task-68: the section exists now, so a stored wide preference applies
@@ -517,6 +519,9 @@
     { key: "Escape", label: "Esc", title: "Press Escape in the session (dismiss / cancel)" },
     { key: "Enter", label: "Enter", title: "Press Enter in the session (accept whatever it has focused)" }
   ];
+  // task-184: keys the focused session view forwards (the buttons stay
+  // Esc/Enter; arrows only make sense as a keyboard or click gesture).
+  var PANE_KEYBOARD_KEYS = { ArrowUp: "Up", ArrowDown: "Down", Enter: "Enter", Escape: "Escape" };
   var paneReply = {
     inFlight: false,
     message: null,        // last send result shown below the input
@@ -657,28 +662,13 @@
   // What the status line calls a sent payload: the key's own label, or
   // the text quoted so a reply of "Enter" can't read as the key.
   function describeReplyPayload(payload) {
+    if (payload.keys !== undefined) return payload.keys.join(" ");
     if (payload.key !== undefined) return payload.key === "Escape" ? "Esc" : payload.key;
     return JSON.stringify(payload.text);
   }
 
-  // `payload` is exactly one of { text: "<one line>" } or { key: "Escape" |
-  // "Enter" } -- the same exactly-one-of the server validates.
-  function sendDrawerPaneReply(payload) {
-    if (!C.currentDrawer || !panePoll.key || paneReply.inFlight || !replyTierEnabled()) return;
-    var reason = drawerPaneReplyBlockReason();
-    if (reason) { setDrawerPaneReplyMessage("not sent: " + reason, "error"); return; }
-    if (payload.text !== undefined) {
-      if (!payload.text.trim()) { setDrawerPaneReplyMessage("type a reply first", "error"); return; }
-      if (/[\r\n]/.test(payload.text)) { setDrawerPaneReplyMessage("single-line replies only", "error"); return; }
-    }
-    // task-99: identity goes in the JSON body, not the query string --
-    // the server no longer reads ?project=&task= here, so that a bare
-    // cross-origin form POST cannot reach this endpoint fully populated.
-    var body = { project: C.currentDrawer.project, taskId: C.currentDrawer.id };
-    if (payload.key !== undefined) body.key = payload.key; else body.text = payload.text;
-    paneReply.inFlight = true;
-    updateDrawerPaneReplyGate();
-    fetch("/api/session-input", {
+  function postSessionInput(body) {
+    return fetch("/api/session-input", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body)
@@ -691,7 +681,53 @@
         }
         return data;
       });
-    }).then(function () {
+    });
+  }
+
+  // Shared with registry views: one ordered chain, aborting before Enter
+  // if any arrow fails. The caller supplies fresh, reviewed pane evidence.
+  function sendSessionInputs(bodies) {
+    return bodies.reduce(function (chain, body) {
+      return chain.then(function () { return postSessionInput(body); });
+    }, Promise.resolve());
+  }
+
+  function sendSessionKeys(project, taskId, keys) {
+    return sendSessionInputs(keys.map(function (key) {
+      return { project: project, taskId: taskId, key: key };
+    }));
+  }
+
+  // `payload` is exactly one of { text: "<one line>" }, { key: "Escape" |
+  // "Enter" | "Up" | "Down" } -- the same exactly-one-of the server
+  // validates -- or { keys: [...] }, several keys sent in order (task-184).
+  function sendDrawerPaneReply(payload) {
+    if (!C.currentDrawer || !panePoll.key || paneReply.inFlight || !replyTierEnabled()) return;
+    var reason = drawerPaneReplyBlockReason();
+    if (reason) { setDrawerPaneReplyMessage("not sent: " + reason, "error"); return; }
+    if (payload.text !== undefined) {
+      if (!payload.text.trim()) { setDrawerPaneReplyMessage("type a reply first", "error"); return; }
+      if (/[\r\n]/.test(payload.text)) { setDrawerPaneReplyMessage("single-line replies only", "error"); return; }
+    }
+    // task-99: identity goes in the JSON body, not the query string --
+    // the server no longer reads ?project=&task= here, so that a bare
+    // cross-origin form POST cannot reach this endpoint fully populated.
+    var base = { project: C.currentDrawer.project, taskId: C.currentDrawer.id };
+    var bodies;
+    if (payload.keys !== undefined) {
+      bodies = payload.keys.map(function (k) { return Object.assign({ key: k }, base); });
+    } else {
+      var body = Object.assign({}, base);
+      if (payload.key !== undefined) body.key = payload.key; else body.text = payload.text;
+      bodies = [body];
+    }
+    paneReply.inFlight = true;
+    updateDrawerPaneReplyGate();
+    // task-184: a click on a menu option is N arrows then ONE Enter, sent
+    // strictly in order and stopping at the first failure (a half-moved
+    // highlight with no Enter is harmless; an Enter after a lost arrow
+    // would confirm the wrong option).
+    sendSessionInputs(bodies).then(function () {
       paneReply.inFlight = false;
       if (!C.byId("drawer-pane-reply")) return; // drawer moved on while sending
       var input = C.byId("drawer-pane-reply-input");
@@ -722,6 +758,63 @@
       setDrawerPaneReplyMessage(msg, "error");
       refreshDrawerPaneNow();
     });
+  }
+
+  // task-184: answer a menu like a terminal. With the session view
+  // focused, arrows/Enter/Escape are real keypresses (the paste path
+  // ignores a menu). Escape is consumed here so it cancels the AGENT's
+  // menu rather than closing the drawer; Escape elsewhere is unchanged.
+  function onPaneKeydown(e) {
+    var name = PANE_KEYBOARD_KEYS[e.key];
+    if (!name || e.ctrlKey || e.metaKey || e.altKey || e.shiftKey) return;
+    if (!replyTierEnabled()) return;
+    e.preventDefault();
+    e.stopPropagation();
+    sendDrawerPaneReply({ key: name });
+  }
+
+  // A numbered option line, with or without the highlight marker
+  // (Claude marks the selection with "❯", Codex with "›").
+  var MENU_OPTION_RE = /^\s*(?:[❯›]\s*)?\d+[.)]\s+\S/;
+  var MENU_MARKED_RE = /^\s*[❯›]\s*\d+[.)]\s+\S/;
+
+  // Pure: given the pane's lines and the clicked line index, the list of
+  // arrow keys to reach it and confirm, or null when the click is not on
+  // an option of a menu with a highlighted option.
+  function menuKeysForClick(lines, clicked) {
+    if (clicked < 0 || clicked >= lines.length || !MENU_OPTION_RE.test(lines[clicked])) return null;
+    // The menu is the run of consecutive option lines around the click
+    // (a wrapped option's continuation lines are not options and break
+    // the run only if blank; indented continuations are skipped).
+    function isContinuation(l) { return /^\s{3,}\S/.test(l) && !MENU_OPTION_RE.test(l); }
+    var opts = [];
+    var i = clicked;
+    while (i > 0 && (MENU_OPTION_RE.test(lines[i - 1]) || isContinuation(lines[i - 1]))) i--;
+    for (; i < lines.length && (MENU_OPTION_RE.test(lines[i]) || isContinuation(lines[i])); i++) {
+      if (MENU_OPTION_RE.test(lines[i])) opts.push(i);
+    }
+    if (opts.length < 2) return null;
+    var from = -1;
+    opts.forEach(function (idx, n) { if (MENU_MARKED_RE.test(lines[idx])) from = n; });
+    var to = opts.indexOf(clicked);
+    if (from < 0 || to < 0) return null;
+    var keys = [];
+    for (var n = 0; n < Math.abs(to - from); n++) keys.push(to > from ? "Down" : "Up");
+    keys.push("Enter");
+    return keys;
+  }
+
+  function onPaneClick(e) {
+    if (!replyTierEnabled() || !panePoll.lastText) return;
+    var pre = e.currentTarget;
+    if (window.getSelection && String(window.getSelection())) return; // a text selection, not an answer
+    var style = window.getComputedStyle(pre);
+    var lineHeight = parseFloat(style.lineHeight);
+    if (!(lineHeight > 0)) return;
+    var rect = pre.getBoundingClientRect();
+    var y = e.clientY - rect.top - (parseFloat(style.paddingTop) || 0) - (parseFloat(style.borderTopWidth) || 0) + pre.scrollTop;
+    var keys = menuKeysForClick(panePoll.lastText.split("\n"), Math.floor(y / lineHeight));
+    if (keys) sendDrawerPaneReply({ keys: keys });
   }
 
   function closeDrawer() {
@@ -978,6 +1071,8 @@
   // Seam: what the other files reach for through window.Centrale.
   // ------------------------------------------------------------------
 
+  C.menuKeysForClick = menuKeysForClick;
+  C.sendSessionKeys = sendSessionKeys;
   C.refreshTheaterRail = refreshTheaterRail;
   C.syncDrawerPanePolling = syncDrawerPanePolling;
   C.updateDrawerPaneAge = updateDrawerPaneAge;

@@ -241,6 +241,17 @@ or wherever `CENTRALE_DELIVERY_LOG` points). Truncate or delete it whenever
 you like; that loses the history and nothing else. See
 [`GET /api/deliveries`](api.md#get-apideliveriesprojectnametasktaskidlimitn).
 
+The fleet observation journal (task-186) is a second state file:
+`$CENTRALE_FLEET_LOG`, otherwise `$XDG_STATE_HOME/centrale/fleet.jsonl`, otherwise
+`~/.local/state/centrale/fleet.jsonl`. It retains 48 hours, pruned on startup,
+append and snapshot reads. Compaction creates a temporary file beside the
+journal and atomically replaces it. Give separate server instances separate
+paths (or separate `XDG_STATE_HOME` values); one process owns each journal.
+The journal survives restart, but live badges are still unknown until fresh
+hooks arrive. Deleting the journal while the server is stopped loses only
+observations, never task state. I/O failures appear as `historyError` in
+[`GET /api/fleet`](api.md#get-apifleetwindowseconds).
+
 ## Troubleshooting
 
 Run `python3 server.py --check` first (see "Running it" above) — it catches
@@ -567,6 +578,29 @@ sandbox (`TMPDIR`), one ephemeral `127.0.0.1` port chosen by the OS,
 reach a real `~/.cache/centrale`, and `CENTRALE_SCREENSHOT_CHROMIUM` for
 an explicit browser executable when you would rather not let Playwright
 download its own.
+
+## Idle board cost and CPU priority
+
+Board polls reuse successful Backlog CLI lists until recursive `backlog/`
+file metadata changes (task-196). Multiple open pages share those inputs,
+while git and lifecycle fields remain freshly derived. An unchanged board
+therefore starts no task-list or milestone-list CLI processes after its first
+successful load. Task details and fleet attention details still perform their
+own reads. Failed reads are retried on the next poll.
+
+Every Backlog CLI child Centrale launches, including writes, version probes
+and `backlog browser`, uses `nice -n 10` when `nice` is available on PATH.
+Children inherit that reduced CPU priority; the server's own priority does
+not change. Platforms without `nice` run commands directly without failing.
+This is generic resource sharing: Centrale does not inspect another project's
+lock files, pause polling during its tests, or introduce a machine-specific
+path. Caching avoids repeated idle CLI work and reduced priority lets needed
+CLI work yield to foreground processes. It is not a hard CPU limit.
+
+The cache lives only in server memory and creates no new file, port, socket,
+or background watcher. Restart after changing the installed Backlog CLI or
+inputs outside `backlog/` to discard cached lists. See the
+[API caching contract](api.md#get-apiboard) for invalidation and failure rules.
 
 ## Limitations / out of scope for v1
 

@@ -37,6 +37,26 @@
 
   function byId(id) { return document.getElementById(id); }
 
+  // Makes `parent`'s children exactly `nodes`, in order, touching only what
+  // is out of place. A view that redraws on each poll uses this instead of
+  // clearChildren so the elements it keeps are never detached: a detached
+  // element restarts its CSS animation and loses its transition (task-190).
+  function syncChildren(parent, nodes) {
+    nodes.forEach(function (node, i) {
+      if (parent.childNodes[i] === node) return;
+      if (node.parentNode === parent) parent.removeChild(node);
+      parent.insertBefore(node, parent.childNodes[i] || null);
+    });
+    while (parent.childNodes.length > nodes.length) parent.removeChild(parent.childNodes[parent.childNodes.length - 1]);
+  }
+
+  // Plays a one-shot animation class again even if it is already on `el`.
+  function replayClass(el, cls) {
+    el.classList.remove(cls);
+    void el.offsetWidth;
+    el.classList.add(cls);
+  }
+
   // ------------------------------------------------------------------
   // Hashing / color helpers
   // ------------------------------------------------------------------
@@ -91,6 +111,9 @@
   C.byId = byId;
   C.clearChildren = clearChildren;
   C.h = h;
+  C.replayClass = replayClass;
+  C.syncChildren = syncChildren;
   C.isDarkTheme = isDarkTheme;
   C.projectChipStyle = projectChipStyle;
+  C.projectHue = projectHue;
 })(window.Centrale = window.Centrale || {});

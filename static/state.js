@@ -41,7 +41,8 @@
     sidebarCollapsed: "centrale-sidebar-collapsed",
     drawerWide: "centrale-drawer-wide",
     theaterRailCollapsed: "centrale-theater-rail-collapsed",
-    drawerSections: "centrale-drawer-sections"
+    drawerSections: "centrale-drawer-sections",
+    hiddenViews: "centrale-hidden-views"
   };
 
   // Array of project names to start active, or null if nothing usable is
@@ -85,6 +86,26 @@
     try {
       window.localStorage.setItem(VIEW_STATE_KEYS.readyOnly, value ? "1" : "0");
     } catch (e) { /* storage unavailable: filter still applied in-memory */ }
+  }
+
+  // task-187: the ids of the views the owner has switched off in Settings.
+  // Hidden rather than shown ids are stored, so a view that ships later
+  // (or one never seen before) is on by default -- "all on" is the empty
+  // list, which is also what a first visit or a corrupt value reads as.
+  function readStoredHiddenViews() {
+    try {
+      var raw = window.localStorage.getItem(VIEW_STATE_KEYS.hiddenViews);
+      var parsed = raw ? JSON.parse(raw) : [];
+      return Array.isArray(parsed) ? parsed.filter(function (id) { return typeof id === "string"; }) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function persistHiddenViews(ids) {
+    try {
+      window.localStorage.setItem(VIEW_STATE_KEYS.hiddenViews, JSON.stringify(ids));
+    } catch (e) { /* storage unavailable: the choice holds in-memory */ }
   }
 
   // task-86: the selected milestone, or "" for the "All milestones"
@@ -339,7 +360,9 @@
   C.persistDrawerWide = persistDrawerWide;
   C.persistTheaterRailCollapsed = persistTheaterRailCollapsed;
   C.persistMilestoneFilter = persistMilestoneFilter;
+  C.persistHiddenViews = persistHiddenViews;
   C.persistReadyOnly = persistReadyOnly;
+  C.readStoredHiddenViews = readStoredHiddenViews;
   C.persistSidebarCollapsed = persistSidebarCollapsed;
   C.readStoredSidebarCollapsed = readStoredSidebarCollapsed;
   C.reconcileConfirmPending = reconcileConfirmPending;

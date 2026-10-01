@@ -169,9 +169,9 @@ alongside `"error"` (see that section below).
 
 The aggregated kanban board across every configured project.
 
-**Params:** `force` (query, optional) — any of `1`/`true`/`yes` bypasses the
-~5 second in-memory cache (see "Caching" below) and re-reads every project
-fresh.
+**Params:** `force` (query, optional) — retained for compatibility with
+manual refresh. Every request now validates board files and derives lifecycle
+state afresh; even `force=1` reuses unchanged successful CLI inputs.
 
 ```bash
 curl -s 'http://127.0.0.1:7420/api/board' | python3 -m json.tool
@@ -353,17 +353,26 @@ the top of the board shows, and what `python3 server.py --check` relays
 from a running server — see
 [Restarting after a change](operations.md#restarting-after-a-change).
 
-**Caching:** `get_board()` caches its result in memory for `CACHE_TTL_SECONDS`
-(5 seconds) across *all* callers, keyed on nothing but time — not
-per-project, not per-client. `capabilities`, `harvestMode`, `spawnAgents`,
-`refreshIntervalSeconds`, and `sessionPreviewMode` are computed fresh on every request and layered onto
-the cached (or freshly fetched) board data, so they're never stale even when
-the board itself is served from cache. `version` is layered on the same
-way but read from the value captured at startup, deliberately not
-recomputed — see above; `codeDrift` is computed fresh on every request
-like the others (it is `HEAD` that moves, and a cached answer would miss
-it). `?force=1` bypasses the cache for that
-one request only; it doesn't clear or extend it for anyone else.
+**Caching:** Successful task-list, ready-list and milestone-title CLI inputs
+are cached in memory per canonical project path, shared across clients.
+Every request checks recursive `backlog/` metadata (names, nanosecond
+modification/change times, size, inode and mode), so task, draft, milestone,
+archive and config edits, additions, renames and deletions invalidate the
+inputs immediately. Concurrent requests for one project share a single load.
+Metadata is checked again after the reads; a changing tree is not cached.
+Reuse requires a local `backlog/config.yml` or `config.yaml`. Unreadable or
+missing trees, symlinks, root `backlog.config.yml` or legacy `backlog.json`
+overrides, and an inherited `BACKLOG_CWD` disable reuse: these discovery modes
+can redirect the CLI to a different directory. CLI errors are retried on
+the next request; failed task reads show the project error with no old tasks,
+and failed milestone reads retain the bare-ID fallback without caching it.
+No cache file or watcher is created. Restart drops all cached inputs.
+
+Git, lifecycle enrichment, statuses, capabilities and runtime settings are
+computed fresh; `version` remains the boot-time value and `codeDrift` checks
+HEAD afresh. `force=1` follows the same file-validation path. Task details and
+merge gates do not use this cache. Board lists use local CLI inputs; remote branches are not an input. Changing
+the installed CLI requires a server restart to discard cached inputs.
 
 ## `GET /api/task?project=<name>&id=<taskId>`
 
@@ -585,9 +594,17 @@ running at all). 500 if `tmux capture-pane` fails for any other reason.
 
 Types a single-line reply — or presses one of two keys — in one live agent
 session's tmux pane: the drawer and session theater's "reply to a waiting
-agent" row. Single-line text plus `Escape` and `Enter`; multi-line input
-and general TUI menu navigation stay out of scope (that road ends at an
+agent" row. Single-line text plus the keys `Escape`, `Enter`, `Up` and
+`Down`; multi-line input stays out of scope (that road ends at an
 embedded terminal, which this is not).
+
+A menu is answered like a terminal (task-184): with the session view
+focused in the browser, Up/Down/Enter/Escape are sent as real keypresses,
+and clicking a numbered option line sends one `Up`/`Down` per step from the
+highlighted option (Claude's `❯`, Codex's `›`) to the clicked line, then one
+`Enter` — as separate requests, in order, stopping at the first failure. A
+click outside a menu sends nothing. Never send `Enter` after a key the menu
+already consumed: it would answer the next prompt.
 
 **Body:** a JSON object carrying the identity and **exactly one** of the
 two inputs — `{"project", "taskId", "text"}` or `{"project", "taskId",
@@ -599,7 +616,7 @@ entirely (see "Request requirements"). The endpoint never accepts a session
 or other control characters. It is delivered literally, then followed by
 Enter.
 
-`"key"` is one of exactly `"Escape"` or `"Enter"`, sent as a tmux key
+`"key"` is one of exactly `"Escape"`, `"Enter"`, `"Up"` or `"Down"`, sent as a tmux key
 *name*. Allowlisted rather than free-form because tmux silently sends an
 unknown key name as literal text — an open-ended `"key"` would be a second
 text channel with none of the text validation above.
@@ -712,7 +729,7 @@ to the input.
 **Errors:** 403 when `sessionPreview.mode` is not `"interact"`. 400 for a
 missing `project`, an invalid/missing `task`, a missing/malformed body,
 neither or both of `text` and `key`, an unknown field, a `key` outside
-`["Escape", "Enter"]`, or an empty/multi-line/over-long/control-character
+`["Escape", "Enter", "Up", "Down"]`, or an empty/multi-line/over-long/control-character
 `text`. 404 for an unknown
 project, a session name that doesn't resolve to a known board task, or no
 live session for that project+task (the session ended between the capture
@@ -856,6 +873,135 @@ missing `project`, an invalid/missing `taskId`, a missing/over-long/multi-
 line `sender`, a missing/empty/multi-line/over-long `text`, or an unknown
 field; 404 for an unknown project. These touch no tmux and are **not**
 logged; everything else is.
+
+## `GET /api/fleet[?window=<seconds>]`
+
+One snapshot across all configured projects for fleet/timeline views. `window`
+is finite seconds greater than zero and at most 172800 (48 hours), default
+7200 (2 hours). Invalid, empty or out-of-range values return **400**.
+
+```sh
+curl -s 'http://127.0.0.1:7420/api/fleet?window=7200'
+```
+
+```json
+{
+  "timestamp": 1790784000.0,
+  "window": 7200.0,
+  "retention": 172800,
+  "projects": [{"name": "my-app", "maxAgents": 3, "agentCount": 1}],
+  "agents": [{
+    "project": "my-app", "taskId": "TASK-2", "agent": "codex",
+    "agentKind": "codex", "session": "centrale-my-app-task-2",
+    "created": "1790783000", "attached": false,
+    "state": "working", "stateSince": 1790783100.0
+  }],
+  "history": [{
+    "project": "my-app", "taskId": "TASK-2", "agent": "codex",
+    "state": "working", "timestamp": 1790783100.0
+  }],
+  "merges": [],
+  "messages": [],
+  "skippedLines": 0,
+  "historyError": null,
+  "deliverySkippedLines": 0,
+  "deliveryError": null,
+  "sessionPreviewMode": "interact",
+  "needsYou": [],
+  "needsYouErrors": []
+}
+```
+
+- `projects` includes empty projects; `maxAgents: null` means no configured
+  limit. `agentCount` counts fresh live tmux sessions, independent of badges.
+- `agents` includes configured-project sessions only. `state` and `stateSince`
+  come from this process's hook observations; duplicate hooks do not reset
+  the start time. After restart these are `unknown` and `null` until a hook
+  arrives. Agent names are configured names, distinct from `agentKind`;
+  an unavailable name is `unknown`. New spawn/resume hook URLs include the
+  optional `agentName` query parameter so custom names survive restart.
+- `history` is oldest first within the requested window, with Unix-second
+  timestamps, uppercase task ids and states `spawn`, `working`, `waiting`,
+  `idle`, `finished`, `unknown`, `merge blocked`, `merged`, `session ended`.
+  Codex turn-end stays `idle`; it is not a claim that the task is complete.
+  Spawn records cover resume too. End records come from successful explicit
+  end requests or the first successful fleet/sessions survey that notices
+  disappearance; their timestamp is observation time, not an inferred exit
+  time. Events while the server is stopped cannot be reconstructed.
+- `merges` selects the `merged` and `merge blocked` history rows, including
+  their `harvest` attempt details (`time`, `project`, `taskId`, `branch`,
+  `trigger`, `merged`, and optional `reason`, `error`, `baseBranch` or
+  `alreadyMerged`). These are historical outcomes, never current merge gates.
+- `needsYou` contains derived inbox items with `kind` (`permission`, `idle`,
+  `merge`, `message`, `owner`), `project`, `taskId`, `agent`, `since`
+  (Unix seconds or null when unknown), and a human-readable `signal`.
+  `needsYouErrors` lists unavailable checks; a partial inbox is not an all-clear.
+  Master sessions are not worker sessions and are excluded.
+  - Permission items require a live waiting hook and a freshly captured dialog.
+    They include `lines` and `capturedAt` (Unix seconds). Capture arms the existing
+    ten-second input gate. Preview `off` disables these captures; `view` displays
+    them without input. `sessionPreviewMode` reports the tier. The view refreshes
+    and compares the screen before sending ordered arrows followed by Enter;
+    a failed arrow aborts the chain. Items disappear when a fresh capture no
+    longer shows the dialog, without changing the agent's hook state.
+  - Idle items require a live idle hook and a readable worker-branch task with
+    neither Done status nor a nonempty `finalSummary`. An unreadable report is
+    an error, not evidence that the worker needs attention. Finished hooks and
+    finished reports do not become review items.
+  - Merge items require the latest retained observation (up to 48 hours,
+    independently of the requested timeline window) to be `merge blocked`.
+    Later activity or merge success supersedes it.
+    The signal names the **last attempt's** failing gate; the current verdict is
+    explicitly unknown. Open task to rerun the existing gates.
+  - Message items select only the latest attempt per project and case-insensitive
+    task id, within **two hours**, independent of the requested timeline window.
+    A later delivered attempt to that target clears earlier failures regardless
+    of text or sender. At most one item is shown per target; invalid timestamps,
+    old attempts and unconfigured targets are excluded. Includes message `text`.
+  - Owner items select open tasks carrying the exact `needs-owner-approval`
+    label in every configured project, from `get_board(config)`'s cached task
+    lists, with no separate task-list command on each fleet poll. Labelled tasks and tasks with a spawn branch
+    need detail reads: prefer the branch report, including after a worker
+    ends, otherwise read the project task through Backlog. Branch reads also
+    discover labels added by workers before main carries them; a finished hook
+    alone does not suppress an unanswered owner question. The latest comment's
+    body is returned as `text`, falling back to the title; `title` is also included.
+    A removed label, Done status or nonempty `finalSummary` in that detail
+    excludes the item. Unreadable details are reported in `needsYouErrors`.
+    This convention is optional; Centrale never writes labels or enforces approval.
+    Whoever records the owner decision removes the label. `since` is the board
+    task update time (creation time as fallback), explicitly identified as such
+    because label-added time is unavailable.
+- Needs you is an optional registered view (`static/view-needs-you.js`); removing
+  its script tag leaves Board and other views working. Its badge counts items
+  (multiple signals for a task can produce multiple items), adds `+` when checks
+  are incomplete, and shows `?` on a failed poll. No new external resource is used.
+- `messages` contains non-`delivered` delivery attempts for configured
+  projects, in log order, with the same shape as `/api/deliveries`. It is
+  independent of `window` and preserves raw historical failures; the inbox uses
+  the filtered `needsYou` items instead.
+  The delivery log has no acknowledgement or retry linkage; a later success
+  does not erase an earlier attempt. `dialog` means delivery was held.
+- Corrupt history lines are skipped (`skippedLines` counts them since
+  startup). Journal failures appear as `historyError`; the process continues
+  recording in memory and attempts to persist it on the next append.
+  Delivery read failures appear as `deliveryError`, with an empty `messages`
+  array, without hiding the rest of the fleet. `deliverySkippedLines` has
+  the same meaning as `/api/deliveries`'s `skippedLines`.
+
+The journal lives at `$CENTRALE_FLEET_LOG` if set, else
+`$XDG_STATE_HOME/centrale/fleet.jsonl`, else
+`~/.local/state/centrale/fleet.jsonl`. Startup reads it back; startup, writes
+and snapshots prune observations older than 48 hours. Compaction uses a
+temporary file in the journal directory and atomic replacement. Separate
+server instances must use separate paths. The journal never restores task
+status, current badges or live-session counts.
+
+Each request performs one existing-style tmux session listing, no git or
+Backlog calls and no per-agent subprocess work. History is already in memory;
+delivery attempts are read through the existing delivery-log reader. A failed
+session survey returns **502** instead of declaring sessions ended. The usual
+loopback request checks apply (**403**).
 
 ## `GET /api/deliveries[?project=<name>&task=<taskId>&limit=N]`
 
@@ -1111,7 +1257,8 @@ These illustrate five separate calls, not five lines from one call.
 `finished` is a hook observation inviting review, never proof of Done or
 permission to merge. Duplicate consecutive hooks for the same public state
 produce one notification; a new turn can produce another. Codex turn-end
-produces an `idle (turn ended, may need input)` notification, preserving
+produces an `idle (turn ended, may need input)` notification after pane
+confirmation (one-second checks while its working footer persists), preserving
 its ambiguity. It can even arrive during ongoing work; read the current
 screen before acting on a Codex idle event. A Codex `waiting` hook only
 produces a notification after persisting for 30 seconds and a pane capture
@@ -1501,7 +1648,8 @@ Same validation, session naming, project cap and 409-on-duplicate as `/api/spawn
 never claims/commits the task or creates a new branch — it only reuses the
 worktree that's already there, starting a fresh tmux session running the
 resolved agent's *resume* command (its configured `resumeCmd`, else `claude
---continue` / `codex resume --last` for a claude-/codex-family agent, else a
+--continue` / `codex resume --last` for a claude-/codex-family agent, followed
+by the agent's own `cmd` arguments such as `--model`, else a
 fresh prompt noting prior work already exists). See "Resuming an interrupted agent" in
 [docs/agents.md](agents.md#resuming-an-interrupted-agent).
 
@@ -2290,7 +2438,7 @@ Centrale wires this up automatically, with no config required, for the two
 built-in agent families:
 
 - **claude** — Claude Code hooks settings
-  (`UserPromptSubmit`/`PreToolUse` → `working`, `Notification` → `waiting`,
+  (`UserPromptSubmit`/`PreToolUse` → `working`, input-request `Notification` → `waiting`,
   `Stop` → `finished`) passed inline as JSON via `--settings '<json>'` on
   the launched command, never a shared file. Each hook shells out to `centrale_notify.py`.
 - **codex** (≥ 0.150.0, feature-probed) — equivalent raw transitions as
@@ -2309,7 +2457,15 @@ built-in agent families:
   stream only expose waiting after a pane capture confirms a dialog, using
   delivery's menu/footer signatures. Without a dialog, confirmation retries
   every 30 seconds. Capture failure exposes unknown and retries, except a
-  gone session ends the candidate. No persistent state is added.
+  gone session ends the candidate. Codex `finished` similarly becomes a
+  stop candidate: after one second, the current screen must no longer show
+  an interruptible working footer before idle is published. A dialog
+  publishes waiting; working/empty/failed captures retry each second
+  (empty/failure exposes unknown). New activity cancels the candidate.
+  Claude idle reminders are filtered by notification type in the injected
+  helper and never publish waiting; actual prompts retain their timing.
+  These checks feed both Needs-you and orchestrator-wait through the same
+  lifecycle store. No persistent state is added.
 
 Any other agent — a fully custom `cmd` in `projects.json`, or the
 `CENTRALE_SPAWN_CMD` test override — gets `CENTRALE_EVENT_URL` in its

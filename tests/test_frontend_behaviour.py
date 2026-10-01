@@ -420,6 +420,48 @@ function sessionKeysGoAsKeysNotText() {
   });
 }
 
+// task-184: the focused session view sends arrows/Enter/Escape as keys,
+// and a click on a menu option maps to arrows-then-one-Enter.
+function menuKeyboardAndClick() {
+  reset();
+  board();
+  C.syncDrawerPanePolling();
+  return settle().then(function () {
+    var pre = C.byId("drawer-pane-pre");
+    out.preFocusable = pre.getAttribute("tabindex");
+    var before = bodies.length;
+    var ev = pre.dispatch("keydown", { key: "ArrowDown" });
+    out.arrowPrevented = !!ev;
+    return settle().then(function () {
+      out.arrowDown = bodies.slice(before);
+      before = bodies.length;
+      pre.dispatch("keydown", { key: "a" });
+      pre.dispatch("keydown", { key: "ArrowUp", ctrlKey: true });
+      return settle().then(function () { out.otherKeys = bodies.length - before; });
+    });
+  }).then(function () {
+    var menu = [
+      "Do you want to proceed?",
+      "\u276f 1. Yes",
+      "  2. Yes, and switch to auto mode",
+      "  3. No, and tell Claude what to do differently",
+      "",
+      "\u276f typing here"
+    ];
+    out.menu = {
+      down2: C.menuKeysForClick(menu, 3),
+      same: C.menuKeysForClick(menu, 1),
+      question: C.menuKeysForClick(menu, 0),
+      blank: C.menuKeysForClick(menu, 4),
+      prompt: C.menuKeysForClick(menu, 5),
+      outside: C.menuKeysForClick(menu, 99),
+      up: C.menuKeysForClick(["  1. Yes", "\u203a 2. No", "  3. Cancel"], 0),
+      noMarker: C.menuKeysForClick(["  1. Yes", "  2. No"], 0),
+      loneItem: C.menuKeysForClick(["\u276f 1. Only item"], 0)
+    };
+  });
+}
+
 // 6. The two gates: the feature off, and no live session. Neither ever
 //    starts a poll or renders a pane section.
 function gates() {
@@ -536,6 +578,7 @@ pollLifecycle()
   .then(burstEndsWithTheTheaterAnd403DropsTheTier)
   .then(staleCaptureBlocksTheSend)
   .then(sessionKeysGoAsKeysNotText)
+  .then(menuKeyboardAndClick)
   .then(gates)
   .then(wideMode)
   .then(function () { process.stdout.write(JSON.stringify(out)); })
@@ -766,6 +809,22 @@ class LivePaneBehaviourTests(unittest.TestCase):
         self.assertEqual(self.out["staleKey"]["newRequests"], 0)
         self.assertEqual(self.out["staleKey"]["status"],
                          "sending blocked: capture is 15s old")
+
+    # -- task-184: answering a menu like a terminal --
+
+    def test_the_focused_view_sends_arrows_as_keys_and_ignores_the_rest(self):
+        self.assertEqual(self.out["preFocusable"], "0")
+        self.assertEqual(self.out["arrowDown"],
+                         [{"project": "my-tool", "taskId": "TASK-77", "key": "Down"}])
+        self.assertEqual(self.out["otherKeys"], 0)
+
+    def test_a_click_maps_to_arrows_from_the_highlight_then_one_enter(self):
+        menu = self.out["menu"]
+        self.assertEqual(menu["down2"], ["Down", "Down", "Enter"])
+        self.assertEqual(menu["same"], ["Enter"])
+        self.assertEqual(menu["up"], ["Up", "Enter"])   # Codex's marker
+        for outside in ("question", "blank", "prompt", "outside", "noMarker", "loneItem"):
+            self.assertIsNone(menu[outside], outside)
 
     # -- the two gates on starting at all --
 
@@ -7238,6 +7297,7 @@ var out = {};
 document.getElementById("settings-open").click();
 settle().then(function () {
   out.loaded = {cap: field("maxAgents").value, links: field("worktreeLinks").value};
+  out.ownerFieldAbsent = !field("ownerLabel");
   field("maxAgents").value = "2";
   field("worktreeLinks").value = ".venv\n\n tools/cache \n";
   return save();
@@ -7291,6 +7351,11 @@ class SettingsProjectSpawnBehaviourTests(unittest.TestCase):
         self.assertEqual(self.out["cleared"]["maxAgents"], {"alpha": None})
         self.assertEqual(self.out["cleared"]["worktreeLinks"], {"alpha": []})
         self.assertEqual(self.out["afterClear"], {"cap": "", "links": ""})
+
+    def test_owner_label_has_no_setting_or_save_payload(self):
+        self.assertTrue(self.out["ownerFieldAbsent"])
+        self.assertNotIn("ownerLabel", self.out["edited"])
+        self.assertNotIn("ownerLabel", self.out["cleared"])
 
     def test_invalid_cap_shows_the_server_error_beside_its_field(self):
         self.assertEqual(self.out["invalid"]["body"]["maxAgents"], {"alpha": 0})
@@ -7374,7 +7439,6 @@ function clearState() {
 var out = {};
 C.sessionsData = [live("alpha-extra-TASK-9")];
 out.prefixCard = read(cardButton("TASK-1"));
-out.prefixCount = C.projectSpawnCapReason("alpha");
 
 clearState();
 C.sessionsData = [live("alpha-TASK-9")];
@@ -7382,8 +7446,8 @@ out.cappedCard = read(cardButton("TASK-1"));
 out.cappedDrawer = drawerButtons(fresh, false);
 out.cappedBranch = drawerButtons(branch, true);
 out.cappedReconcile = C.reconcileButtonDisplay("alpha", "TASK-2", {baseBranch: "main", count: 1});
-// A previously armed confirmation must lose to the live cap, including
-// the reconcile path and direct calls to the POST helpers.
+// The board no longer gates on maxAgents (the server refuses at the cap
+// and says why): armed confirmations and direct calls reach the server.
 C.spawnConfirmPending[C.spawnKey("alpha", "TASK-1")] =
   {action: "spawn", expires: Date.now() + 10000, count: 1};
 C.spawnConfirmPending[C.spawnKey("alpha", "TASK-2")] =
@@ -7417,8 +7481,11 @@ out.unsetRequests = requests.slice();
 
 clearState();
 C.sessionsData = [];
-C.resumeTask("alpha", "TASK-2", false);
 settle().then(function () {
+  toasts.length = 0;  // earlier phases' resumes also toast their warnings
+  C.resumeTask("alpha", "TASK-2", false);
+  return settle();
+}).then(function () {
   out.resumeWarnings = toasts;
   process.stdout.write(JSON.stringify(out));
 });
@@ -7427,35 +7494,31 @@ settle().then(function () {
 
 @js_harness.requires_node
 class SpawnCapBehaviourTests(unittest.TestCase):
+    """maxAgents is enforced by the server (POST /api/spawn and /api/resume
+    refuse at the cap with the reason); the board and drawer no longer
+    disable buttons or print the cap note on every card of the project."""
     @property
     def out(self):
         return js_harness.cached_driver(self, SPAWN_CAP_DRIVER_JS)
 
-    def test_cap_counts_exact_project_and_disables_card_and_drawer(self):
-        self.assertIsNone(self.out["prefixCount"])
+    def test_cards_and_drawer_stay_enabled_and_quiet_at_the_cap(self):
         self.assertFalse(self.out["prefixCard"]["disabled"])
         card = self.out["cappedCard"]
-        self.assertTrue(card["disabled"])
-        self.assertIn("maxAgents: 1", card["title"])
-        self.assertIn("1 live agent session", card["title"])
-        self.assertIn("centrale-alpha-TASK-9", card["title"])
-        self.assertTrue(self.out["cappedDrawer"]["buttons"][0]["disabled"])
-        self.assertIn("centrale-alpha-TASK-9", self.out["cappedDrawer"]["text"])
+        self.assertFalse(card["disabled"])
+        self.assertNotIn("maxAgents", card["title"])
+        self.assertFalse(self.out["cappedDrawer"]["buttons"][0]["disabled"])
+        self.assertNotIn("maxAgents", self.out["cappedDrawer"]["text"])
 
-    def test_cap_disables_all_branch_launches_and_guards_direct_calls(self):
-        branch = self.out["cappedBranch"]
-        buttons = {b["text"]: b for b in branch["buttons"]}
+    def test_branch_launches_stay_enabled_and_reach_the_server_at_the_cap(self):
+        buttons = {b["text"]: b for b in self.out["cappedBranch"]["buttons"]}
         for label in ("Resume agent", "Re-spawn agent"):
-            self.assertTrue(buttons[label]["disabled"])
-            self.assertIn("maxAgents: 1", buttons[label]["title"])
-        self.assertTrue(self.out["cappedReconcile"]["disabled"])
-        self.assertIn("maxAgents: 1", self.out["cappedReconcile"]["title"])
-        self.assertFalse(self.out["armedCardAtCap"]["confirming"])
-        armed = {b["text"]: b for b in self.out["armedBranchAtCap"]["buttons"]}
-        self.assertTrue(armed["Resume agent"]["disabled"])
-        self.assertTrue(armed["Re-spawn agent"]["disabled"])
-        self.assertFalse(armed["Resume agent"]["confirming"])
-        self.assertEqual(self.out["cappedRequests"], [])
+            self.assertFalse(buttons[label]["disabled"])
+            self.assertNotIn("maxAgents", buttons[label]["title"])
+        self.assertFalse(self.out["cappedReconcile"]["disabled"])
+        self.assertNotIn("maxAgents", self.out["cappedReconcile"]["title"])
+        self.assertTrue(self.out["armedCardAtCap"]["confirming"])
+        self.assertIn("POST /api/spawn", self.out["cappedRequests"])
+        self.assertIn("POST /api/resume", self.out["cappedRequests"])
 
     def test_ending_session_reenables_and_unset_preserves_confirmation(self):
         self.assertFalse(self.out["afterEndCard"]["disabled"])
@@ -7472,5 +7535,857 @@ class SpawnCapBehaviourTests(unittest.TestCase):
                          [{"message": "Skipped missing worktree link .venv", "kind": "error"}])
 
 
+# ---------------------------------------------------------------------
+# Views foundation (task-187)
+# ---------------------------------------------------------------------
+
+# The registry is proven with two throwaway views defined HERE, in the
+# driver -- never in static/ -- so the shipped tree names no view, which
+# is the property the foundation exists to keep. The timers and fetches
+# are the driver's, so "one poll, one timer" is an observation.
+VIEWS_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js"]);
+var timers = [];
+global.setTimeout = function (fn, ms) { var t = { fn: fn, ms: ms, dead: false }; timers.push(t); return t; };
+global.clearTimeout = function (t) { if (t) t.dead = true; };
+function armed() { return timers.filter(function (t) { return !t.dead; }); }
+function fireTimers() {
+  var due = armed(); due.forEach(function (t) { t.dead = true; });
+  due.forEach(function (t) { t.fn(); });
+  return settle();
+}
+var requests = [];
+global.fetch = function (url) {
+  requests.push(url);
+  return Promise.resolve({ ok: true, status: 200,
+    json: function () { return Promise.resolve({ agents: [], n: requests.length }); } });
+};
+C = loadFrontend(["fleet.js", "views.js"]);
+
+function tabText(b) { return b.childNodes.map(function (c) { return c.textContent; }).join(" "); }
+function tabButtons() { return C.byId("view-tabs").childNodes.filter(function (b) { return b.tagName === "button"; }); }
+function tabs() { return tabButtons().map(tabText); }
+function checkbox(id) {
+  var labels = C.byId("settings-views-list").childNodes;
+  for (var i = 0; i < labels.length; i++) if (labels[i].childNodes[0].attrs["data-view"] === id) return labels[i].childNodes[0];
+  return null;
+}
+function untick(id, on) {
+  var box = checkbox(id); box.checked = on;
+  box.listeners.change.forEach(function (fn) { fn(makeEvent({})); });
+}
+function clickTab(label) {
+  var b = tabButtons().filter(function (x) { return tabText(x) === label; })[0];
+  b.listeners.click.forEach(function (fn) { fn(makeEvent({})); });
+  return settle();
+}
+function page() {
+  return { tabs: tabs(), stripHidden: C.byId("view-tabs").hidden, boardHidden: C.byId("board-wrap").hidden,
+           hostHidden: C.byId("view-host").hidden, settingsHidden: C.byId("settings-views-section").hidden,
+           current: C.views.current(), subscribers: C.fleetData.subscriberCount(),
+           timers: armed().length, requests: requests.length, stored: window.localStorage.getItem("centrale-hidden-views") };
+}
+
+var out = {};
+var drawn = { alpha: [], beta: [] };
+var focused = [];
+(async function () {
+  out.empty = page();
+  out.emptyOpen = C.views.open("alpha");
+
+  C.views.register({ id: "alpha", label: "Alpha", render: function (host, snap, err) {
+    drawn.alpha.push(snap && snap.n); host.textContent = "alpha " + (snap && snap.n); } });
+  C.views.register({ id: "beta", label: "Beta",
+    render: function (host, snap) { drawn.beta.push(snap && snap.n); throw new Error("beta blew up"); },
+    focus: function (arg) { focused.push(arg); } });
+  out.duplicate = C.views.register({ id: "alpha", label: "Again", render: function () {} });
+  out.registered = page();
+
+  await clickTab("Alpha");
+  out.onAlpha = page();
+  out.alphaText = C.byId("view-host").textContent;
+
+  out.openBeta = C.views.open("beta", "TASK-9");
+  await settle();
+  out.onBeta = page();
+  out.betaText = C.byId("view-host").textContent;
+  out.focused = focused.slice();
+
+  await fireTimers();
+  out.afterTick = page();
+  out.drawn = JSON.parse(JSON.stringify(drawn));
+
+  untick("beta", false);
+  out.betaOff = page();
+  out.openHidden = C.views.open("beta");
+  out.openUnknown = C.views.open("gamma");
+  out.readBack = C.readStoredHiddenViews();
+
+  untick("alpha", false);
+  out.allOff = page();
+  untick("alpha", true);
+  out.alphaBack = page();
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+@js_harness.requires_node
+class ViewRegistryBehaviourTests(unittest.TestCase):
+    """The Views foundation, observed: registration, hiding, links, polling."""
+
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, VIEWS_DRIVER_JS)
+
+    def test_zero_views_shows_no_strip_no_setting_and_polls_nothing(self):
+        empty = self.out["empty"]
+        self.assertTrue(empty["stripHidden"])
+        self.assertEqual(empty["tabs"], [])
+        self.assertTrue(empty["settingsHidden"])
+        self.assertFalse(empty["boardHidden"])
+        self.assertEqual((empty["requests"], empty["timers"]), (0, 0))
+        self.assertFalse(self.out["emptyOpen"])
+
+    def test_the_strip_and_checklist_come_from_what_registered(self):
+        reg = self.out["registered"]
+        self.assertEqual(reg["tabs"], ["Board", "Alpha", "Beta"])
+        self.assertFalse(reg["stripHidden"])
+        self.assertFalse(reg["settingsHidden"])
+        self.assertFalse(self.out["duplicate"])
+        # Registering alone opens nothing and polls nothing.
+        self.assertEqual((reg["requests"], reg["timers"], reg["current"]), (0, 0, None))
+
+    def test_a_view_is_handed_the_snapshot_and_the_board_steps_aside(self):
+        on = self.out["onAlpha"]
+        self.assertEqual(on["current"], "alpha")
+        self.assertTrue(on["boardHidden"])
+        self.assertFalse(on["hostHidden"])
+        self.assertEqual(self.out["alphaText"], "alpha 1")
+
+    def test_one_poll_and_one_timer_however_many_views_are_visited(self):
+        self.assertEqual(self.out["onAlpha"]["requests"], 1)
+        self.assertEqual(self.out["onAlpha"]["timers"], 1)
+        self.assertEqual(self.out["onBeta"]["subscribers"], 1)
+        self.assertEqual(self.out["onBeta"]["timers"], 1)
+        tick = self.out["afterTick"]
+        # Opening a view refreshes once; the tick is the third request.
+        self.assertEqual((tick["requests"], tick["timers"]), (3, 1))
+        # Only the view on screen was handed updates: Beta drew the held
+        # snapshot at once, then each later poll.
+        self.assertEqual(self.out["drawn"]["alpha"], [1])
+        self.assertEqual(self.out["drawn"]["beta"], [1, 2, 3])
+
+    def test_a_link_opens_the_target_and_carries_its_argument(self):
+        self.assertTrue(self.out["openBeta"])
+        self.assertEqual(self.out["onBeta"]["current"], "beta")
+        self.assertEqual(self.out["focused"], ["TASK-9"])
+
+    def test_a_view_that_throws_is_contained(self):
+        self.assertIn("Beta view failed to draw", self.out["betaText"])
+
+    def test_unticking_removes_the_tab_at_once_and_falls_back_to_the_board(self):
+        off = self.out["betaOff"]
+        self.assertEqual(off["tabs"], ["Board", "Alpha"])
+        self.assertIsNone(off["current"])
+        self.assertFalse(off["boardHidden"])
+        self.assertTrue(off["hostHidden"])
+        # Nothing is subscribed, so nothing polls.
+        self.assertEqual((off["subscribers"], off["timers"]), (0, 0))
+
+    def test_a_link_to_a_hidden_or_absent_view_does_nothing(self):
+        self.assertFalse(self.out["openHidden"])
+        self.assertFalse(self.out["openUnknown"])
+        self.assertIsNone(self.out["betaOff"]["current"])
+
+    def test_the_choice_is_persisted_as_hidden_ids_and_read_back(self):
+        self.assertEqual(self.out["betaOff"]["stored"], '["beta"]')
+        self.assertEqual(self.out["readBack"], ["beta"])
+
+    def test_all_hidden_leaves_no_strip_and_ticking_one_brings_it_back(self):
+        gone = self.out["allOff"]
+        self.assertTrue(gone["stripHidden"])
+        self.assertEqual(gone["tabs"], [])
+        self.assertFalse(gone["settingsHidden"])  # the checklist stays: it is how they come back
+        self.assertEqual(self.out["alphaBack"]["tabs"], ["Board", "Alpha"])
+
+
+# Tab badges: a separate driver so the counts in the one above stay about
+# the registry's own polling.
+BADGE_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js"]);
+var timers = [];
+global.setTimeout = function (fn, ms) { var t = { fn: fn, dead: false }; timers.push(t); return t; };
+global.clearTimeout = function (t) { if (t) t.dead = true; };
+function armed() { return timers.filter(function (t) { return !t.dead; }); }
+function fireTimers() {
+  var due = armed(); due.forEach(function (t) { t.dead = true; });
+  due.forEach(function (t) { t.fn(); });
+  return settle();
+}
+var requests = 0;
+global.fetch = function () {
+  requests++;
+  var n = requests;
+  return Promise.resolve({ ok: true, status: 200,
+    json: function () { return Promise.resolve({ agents: new Array(n) }); } });
+};
+C = loadFrontend(["fleet.js", "views.js"]);
+function tabText(b) { return b.childNodes.map(function (c) { return c.textContent; }).join(" "); }
+function tabButtons() { return C.byId("view-tabs").childNodes.filter(function (b) { return b.tagName === "button"; }); }
+function tabs() { return tabButtons().map(tabText); }
+function untick(id, on) {
+  var labels = C.byId("settings-views-list").childNodes;
+  for (var i = 0; i < labels.length; i++) {
+    var box = labels[i].childNodes[0];
+    if (box.attrs["data-view"] === id) { box.checked = on; box.listeners.change.forEach(function (fn) { fn(makeEvent({})); }); }
+  }
+}
+function state() { return { tabs: tabs(), subscribers: C.fleetData.subscriberCount(), timers: armed().length, requests: requests }; }
+var out = {};
+(async function () {
+  C.views.register({ id: "plain", label: "Plain", render: function () {} });
+  out.noBadge = state();
+  C.views.register({ id: "inbox", label: "Inbox", render: function () {},
+    badge: function (snap) { var n = snap.agents.length; return n > 2 ? null : n; } });
+  await settle();
+  out.first = state();              // Board on screen, badge already live
+  await fireTimers();
+  out.second = state();             // each poll updates it
+  await fireTimers();
+  out.nullHides = state();          // null -> no badge text
+  C.views.register({ id: "broken", label: "Broken", render: function () {},
+    badge: function () { throw new Error("nope"); } });
+  await settle();
+  out.broken = state();
+  untick("inbox", false);
+  untick("broken", false);
+  out.allOff = state();             // no badged view left: polling stops
+  untick("inbox", true);
+  await settle();
+  out.back = state();
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+@js_harness.requires_node
+class ViewBadgeBehaviourTests(unittest.TestCase):
+    """A view's optional badge(snapshot), shown on its tab while it is off screen."""
+
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, BADGE_DRIVER_JS)
+
+    def test_no_badge_means_no_subscription_and_no_polling(self):
+        self.assertEqual(self.out["noBadge"],
+                         {"tabs": ["Board", "Plain"], "subscribers": 0, "timers": 0, "requests": 0})
+
+    def test_the_badge_appears_on_the_tab_while_the_board_is_showing(self):
+        first = self.out["first"]
+        self.assertEqual(first["tabs"], ["Board", "Plain", "Inbox 1"])
+        self.assertEqual((first["subscribers"], first["timers"]), (1, 1))
+
+    def test_each_poll_updates_it_and_null_removes_it(self):
+        self.assertEqual(self.out["second"]["tabs"][-1], "Inbox 2")
+        self.assertEqual(self.out["nullHides"]["tabs"][-1], "Inbox")
+
+    def test_a_throwing_badge_shows_nothing_and_breaks_nothing(self):
+        self.assertEqual(self.out["broken"]["tabs"], ["Board", "Plain", "Inbox", "Broken"])
+
+    def test_hiding_the_last_badged_view_stops_polling(self):
+        off = self.out["allOff"]
+        self.assertEqual((off["subscribers"], off["timers"]), (0, 0))
+        self.assertEqual(off["tabs"], ["Board", "Plain"])
+        self.assertEqual(self.out["back"]["subscribers"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+# Needs you drives the real registry, shared poller and ordered input path.
+NEEDS_YOU_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "spawn.js", "harvest.js", "drawer.js", "pane.js"]);
+global.setTimeout = function () { return 1; };
+global.clearTimeout = function () {};
+wireDrawerShell();
+C.boardData = {projects:[{name:"app",tasks:[{id:"TASK-1",title:"A real task",status:"In Progress",labels:[],assignees:[]}]}]};
+C.sessionsData = [];
+var mode = process.argv[2] || "success";
+var posts = [], polls = 0, answered = false;
+var now = Date.now() / 1000;
+var permission = {kind:"permission", project:"app", taskId:"TASK-1", agent:"helper",
+  since:now-120, signal:"Waiting hook + pane dialog", capturedAt:now,
+  lines:["Run command?", "› 1. Yes", "  2. No"]};
+var others = [
+  {kind:"merge",project:"app",taskId:"TASK-2",agent:"codex",since:now-60,signal:"Last merge attempt failed: clean: dirty"},
+  {kind:"message",project:"app",taskId:"TASK-3",agent:"helper",since:now-90,signal:"Latest delivery attempt: dialog",text:"Please continue"},
+  {kind:"idle",project:"app",taskId:"TASK-4",agent:"codex",since:now-10,signal:"Idle hook; no final report"},
+  {kind:"owner",project:"app",taskId:"TASK-5",agent:"unassigned",since:null,signal:"Task label: needs-owner-approval",text:"Ship Friday?"}
+];
+global.fetch = function (url, opts) {
+  if (opts && opts.method === "POST") {
+    var body = JSON.parse(opts.body); posts.push(body);
+    if (mode === "failure") return Promise.resolve({ok:false,status:409,json: function(){return Promise.resolve({error:"capture went stale"});}});
+    if (body.key === "Enter") answered = true;
+    return Promise.resolve({ok:true,json:function(){return Promise.resolve({ok:true});}});
+  }
+  if (url.indexOf("/api/task?") === 0) return Promise.resolve({ok:true,json:function(){
+    return Promise.resolve({task:C.boardData.projects[0].tasks[0]});}});
+  polls++;
+  var item = JSON.parse(JSON.stringify(permission));
+  if (mode === "changed" && polls > 1) item.lines[0] = "Different command?";
+  var items = answered ? [] : [item].concat(mode === "all" ? others : []);
+  if (mode === "empty") items = [];
+  if (mode === "stale") item.capturedAt = now-30;
+  if (mode === "error") return Promise.reject(new Error("offline"));
+  return Promise.resolve({ok:true,json:function(){return Promise.resolve({
+    timestamp:now, needsYou:items, needsYouErrors:[], sessionPreviewMode:mode === "view" ? "view" : "interact"
+  });}});
+};
+C = loadFrontend(["fleet.js", "views.js"]);
+C.views.register({id:"other",label:"Other",render:function(host){host.textContent="Other works";}});
+var out = {absent:C.views.open("needs-you")};
+if (fs.existsSync(path.join(STATIC, "view-needs-you.js"))) loadFrontend(["view-needs-you.js"]);
+(async function(){
+  await settle();
+  out.opened = C.views.open("needs-you");
+  await settle();
+  var host = C.byId("view-host");
+  out.before = host.textContent;
+  function findCls(node, cls, acc) { acc = acc || [];
+    if (node.className && String(node.className).split(" ").indexOf(cls) !== -1) acc.push(node);
+    node.childNodes.forEach(function (c) { findCls(c, cls, acc); }); return acc; }
+  out.cardShape = { kinds: findCls(host, "needs-you-kind").map(function (n) { return n.textContent; }),
+    titles: findCls(host, "needs-you-title").length, chips: findCls(host, "needs-you-chip").map(function (n) { return n.textContent; }),
+    opts: findCls(host, "needs-you-opt").map(function (n) { return n.tagName + ":" + n.textContent; }),
+    urgency: findCls(host, "needs-you-urgency").map(function (n) { return n.childNodes[0].style.width; }),
+    empty: findCls(host, "needs-you-empty").length, check: findCls(host, "needs-you-check").length,
+    headings: host.querySelectorAll("h2").length, edge: findCls(host, "needs-you-item").map(function (n) { return n.className; }) };
+  out.tabs = C.byId("view-tabs").childNodes.filter(function (b) { return b.tagName === "button"; }).map(function (b) { return b.childNodes.map(function (c) { return c.textContent; }).join(" "); }).join("|");
+  var button = host.querySelectorAll("button").filter(function(b){return b.textContent.indexOf("2. No") !== -1;})[0];
+  out.disabled = button ? button.disabled : null;
+  if (mode === "open") {
+    host.querySelectorAll("button").filter(function(b){return b.textContent === "Open task";})[0].dispatch("click");
+    out.drawer = C.currentDrawer;
+    button = null;
+    await settle();
+  }
+  if (mode === "card" || mode === "cardmissing") {
+    var toasts = []; C.showToast = function (m, t) { toasts.push({msg: m, type: t}); };
+    if (mode === "cardmissing") C.boardData.projects[0].tasks = [];
+    var card = host.querySelectorAll("article")[0];
+    // A click that lands on the card's own option button is that button's, not the card's.
+    card.dispatch("click", {target: button});
+    out.onButton = C.currentDrawer ? C.currentDrawer.id : null;
+    card.dispatch("click", {target: card});
+    await settle();
+    out.drawer = C.currentDrawer; out.toasts = toasts; out.cardClass = card.className;
+    button = null;
+  }
+  if (button && !button.disabled) { button.dispatch("click"); await settle(); }
+  out.posts = posts; out.after = host.textContent; out.afterTabs = C.byId("view-tabs").childNodes.filter(function (b) { return b.tagName === "button"; }).map(function (b) { return b.childNodes.map(function (c) { return c.textContent; }).join(" "); }).join("|");
+  C.views.open("other");
+  out.other = host.textContent;
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+@js_harness.requires_node
+class NeedsYouBehaviourTests(unittest.TestCase):
+    def test_open_task_passes_board_identity_to_the_real_drawer(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "open")
+        self.assertEqual(out["drawer"].get("project"), "app")
+        self.assertEqual(out["drawer"]["id"], "TASK-1")
+
+    def test_clicking_the_card_opens_the_task_but_not_via_its_own_buttons(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "card")
+        self.assertIsNone(out["onButton"])
+        self.assertEqual(out["drawer"]["id"], "TASK-1")
+        self.assertEqual(out["posts"], [])
+
+    def test_a_card_whose_task_is_off_the_board_toasts_instead_of_nothing(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "cardmissing")
+        self.assertIsNone(out["drawer"])
+        self.assertEqual(len(out["toasts"]), 1)
+        self.assertIn("TASK-1", out["toasts"][0]["msg"])
+
+    def test_inbox_identity_signals_count_and_optional_registration(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "all")
+        self.assertTrue(out["opened"])
+        self.assertFalse(out["absent"])
+        self.assertIn("Needs you 5", out["tabs"])
+        for text in ("app", "TASK-1", "helper", "2m", "Last merge", "delivery", "Idle hook", "Task label", "Ship Friday?"):
+            self.assertIn(text, out["before"])
+        self.assertEqual(out["other"], "Other works")
+
+    def test_cards_follow_the_mockup_structure(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "all")
+        shape = out["cardShape"]
+        self.assertEqual(shape["headings"], 0)  # the large page heading is gone
+        self.assertEqual(len(shape["kinds"]), 5)
+        self.assertEqual(shape["titles"], 5)
+        self.assertIn("Waiting hook", shape["chips"])
+        self.assertIn("pane dialog", shape["chips"])
+        # The menu's options are themselves the clickable rows, inside the terminal block.
+        self.assertEqual(shape["opts"], ["button:\u203a 1. Yes", "button:2. No"])
+        self.assertIn("needs-you-item ny-k-permission", shape["edge"])
+        # 120 s waited of the 30 min cap is 7%; unknown wait is an empty bar.
+        self.assertEqual(shape["urgency"][0], "7%")
+        self.assertEqual(shape["urgency"][-1], "0%")
+
+    def test_the_empty_inbox_is_a_check_mark_card(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "empty")
+        self.assertEqual((out["cardShape"]["empty"], out["cardShape"]["check"]), (1, 1))
+
+    def test_menu_answer_orders_keys_then_refreshes_item_and_count_away(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "success")
+        self.assertEqual(out["posts"], [
+            {"project": "app", "taskId": "TASK-1", "key": "Down"},
+            {"project": "app", "taskId": "TASK-1", "key": "Enter"}])
+        self.assertIn("Nothing needs you", out["after"])
+        # An empty inbox shows no badge at all rather than a "0".
+        self.assertIn("Needs you", out["afterTabs"])
+        self.assertNotIn("Needs you 0", out["afterTabs"])
+
+    def test_failed_arrow_never_sends_enter_and_keeps_item_visible(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "failure")
+        self.assertEqual([b["key"] for b in out["posts"]], ["Down"])
+        self.assertIn("capture went stale", out["after"])
+        self.assertIn("TASK-1", out["after"])
+
+    def test_changed_dialog_requires_review_before_sending(self):
+        out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "changed")
+        self.assertEqual(out["posts"], [])
+        self.assertIn("changed", out["after"].lower())
+
+    def test_read_only_and_stale_captures_disable_menu_buttons(self):
+        for mode in ("view", "stale"):
+            out = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, mode)
+            self.assertTrue(out["disabled"])
+            self.assertEqual(out["posts"], [])
+
+    def test_empty_and_failed_snapshot_are_distinct(self):
+        empty = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "empty")
+        self.assertIn("Nothing needs you", empty["before"])
+        error = js_harness.run_driver(self, NEEDS_YOU_DRIVER_JS, "error")
+        self.assertIn("offline", error["before"])
+        self.assertNotIn("Nothing needs you", error["before"])
+
+FLEET_JOIN_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js"]);
+global.setTimeout = function () { return 1; };
+var release, calls = 0, resolved = false;
+global.fetch = function () {
+  calls++;
+  return new Promise(function (resolve) { release = function () {
+    resolve({ok:true,json:function(){return Promise.resolve({needsYou:[]});}});
+  };});
+};
+loadFrontend(["fleet.js"]);
+(async function(){
+  C.fleetData.subscribe(function(){});
+  var refresh = C.fleetData.refresh().then(function(){resolved=true;});
+  await settle();
+  var early = resolved;
+  release(); await refresh;
+  console.log(JSON.stringify({early:early,calls:calls,snapshot:C.fleetSnapshot}));
+})();
+"""
+
+
+@js_harness.requires_node
+class FleetRefreshJoinTests(unittest.TestCase):
+    def test_explicit_refresh_waits_for_the_existing_poll(self):
+        out = js_harness.run_driver(self, FLEET_JOIN_DRIVER_JS)
+        self.assertFalse(out["early"])
+        self.assertEqual(out["calls"], 1)
+        self.assertEqual(out["snapshot"], {"needsYou": []})
+
+
+# ---------------------------------------------------------------------
+# Fleet and Timeline views (task-189)
+# ---------------------------------------------------------------------
+
+FLEET_VIEWS_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var NOW = 1790784000;
+var SNAP = {
+  timestamp: NOW, window: 7200,
+  projects: [{ name: "atlas", maxAgents: 3, agentCount: 2 }, { name: "orbit", maxAgents: null, agentCount: 0 }],
+  agents: [
+    { project: "atlas", taskId: "TASK-1", agent: "codex", state: "waiting", stateSince: NOW - 600 },
+    { project: "atlas", taskId: "TASK-2", agent: "sonnet", state: "working", stateSince: NOW - 60 }
+  ],
+  history: [
+    { project: "atlas", taskId: "TASK-1", agent: "codex", state: "working", timestamp: NOW - 3000 },
+    { project: "atlas", taskId: "TASK-1", agent: "codex", state: "waiting", timestamp: NOW - 600 },
+    { project: "atlas", taskId: "TASK-2", agent: "sonnet", state: "working", timestamp: NOW - 60 },
+    { project: "orbit", taskId: "TASK-9", agent: "claude", state: "working", timestamp: NOW - 5000 },
+    { project: "orbit", taskId: "TASK-9", agent: "claude", state: "finished", timestamp: NOW - 4000 },
+    { project: "orbit", taskId: "TASK-9", agent: "claude", state: "merged", timestamp: NOW - 3500 }
+  ]
+};
+function find(node, cls, out) {
+  out = out || [];
+  if (node.className && String(node.className).split(" ").indexOf(cls) !== -1) out.push(node);
+  node.childNodes.forEach(function (c) { find(c, cls, out); });
+  return out;
+}
+function text(node) { return node.textContent; }
+var timers = [];
+global.setTimeout = function (fn, ms) { var t = { fn: fn, ms: ms, dead: false }; timers.push(t); return t; };
+global.clearTimeout = function (t) { if (t) t.dead = true; };
+global.fetch = function () {
+  return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(SNAP); } });
+};
+var C = loadFrontend(["state.js", "dom.js"]);
+C.boardData = { projects: [{ name: "atlas", tasks: [{ id: "TASK-1", title: "Export run history" }] }] };
+var which = process.argv[2].split(",");
+// task-194: the summary bar and the feed are shared pieces loaded on their own.
+var shared = which.indexOf("no-shared") !== -1 ? [] : ["shared-pulse.js", "shared-feed.js"];
+C = loadFrontend(["fleet.js", "views.js"].concat(shared, which));
+var out = {};
+var opened = [], toasts = [];
+C.findTask = function (project, id) {
+  var p = C.boardData.projects.filter(function (x) { return x.name === project; })[0];
+  return p && p.tasks.filter(function (t) { return t.id === id; })[0] || null;
+};
+C.openDrawer = function (project, task) { opened.push(project.name + "/" + task.id); };
+C.showToast = function (msg, type) { toasts.push({ msg: msg, type: type }); };
+function click(el, target) { el.listeners.click.forEach(function (fn) { fn(makeEvent({ target: target })); }); }
+(async function () {
+  var host = C.byId("view-host");
+  if (which.indexOf("view-fleet.js") !== -1) {
+    C.views.open("fleet"); await settle();
+    var cards = find(host, "fleet-card");
+    out.cards = cards.map(function (c) { return c.attrs["data-project"]; });
+    out.capacity = find(host, "fleet-capacity").map(text);
+    out.rows = find(host, "fleet-agent").map(function (r) {
+      return { task: r.attrs["data-task"], text: text(r), sparks: find(r, "fleet-spark-seg").length };
+    });
+    out.titles = find(host, "fleet-agent-title").map(text);
+    out.quiet = find(host, "fleet-quiet").map(text);
+    out.tlAvailable = C.views.isAvailable("timeline");
+    var first = find(host, "fleet-agent")[0];
+    var second = find(host, "fleet-agent")[1];
+    // task-193: the summary bar, ring, free slots, feed and the 1 s count-up.
+    var top = C.byId("view-top"), side = C.byId("view-side");
+    out.pulse = { live: text(find(top, "fleet-pulse-num")[0]), merges: text(find(top, "fleet-pulse-num")[1]),
+      legend: find(top, "fleet-legend-item").map(text),
+      widths: find(top, "fleet-stack-seg").map(function (s) { return s.style.width; }) };
+    out.fleetOwnCopies = find(host, "fleet-pulse").length + find(host, "fleet-feed").length;
+    out.sideHidden = side.hidden;
+    out.ring = { text: text(find(host, "fleet-ring-count")[0]), fill: find(host, "fleet-ring")[0].style["--ring"],
+      tile: text(find(host, "fleet-tile")[0]), hue: find(host, "fleet-card")[0].style["--p"] };
+    out.free = find(host, "fleet-free").map(text);
+    out.feed = find(side, "fleet-feed-item").map(function (li) { return li.attrs["data-task"] + ":" + text(li); });
+    out.feedClasses = find(side, "fleet-feed-item").map(function (li) { return li.className; });
+    var sinceBefore = text(find(first, "fleet-agent-since")[0]);
+    var realNow = Date.now;
+    Date.now = function () { return realNow() + 120000; };
+    // Only the 1 s ticker: a poll would bring a fresh snapshot clock and hide the count-up.
+    timers.filter(function (t) { return !t.dead && t.ms === 1000; }).forEach(function (t) { t.dead = true; t.fn(); });
+    Date.now = realNow;
+    out.sinceBefore = sinceBefore;
+    out.sinceAfter = text(find(first, "fleet-agent-since")[0]);
+    // A click on the row body opens the task; its own buttons are their own business.
+    click(first);
+    out.opened = opened.slice();
+    click(first, find(first, "fleet-agent-tl")[0]);
+    out.openedAfterTl = opened.slice();
+    out.tlButton = text(find(first, "fleet-agent-tl")[0]);
+    out.keyboardTarget = find(first, "fleet-agent-open")[0].tagName;
+    // TASK-2 is not on the board (only TASK-1 is): a toast, not silence.
+    click(second);
+    out.toasts = toasts.slice();
+    out.stillFleet = C.views.current();
+    // A later poll updates the rows in place: same elements, so the dot keeps
+    // breathing and the meter eases instead of restarting.
+    SNAP.timestamp = NOW + 30;
+    await fireAll();
+    out.sameRowsAfterPoll = find(host, "fleet-agent")[0] === first && find(host, "fleet-agent")[1] === second;
+    find(first, "fleet-agent-tl")[0].listeners.click.forEach(function (fn) { fn(makeEvent({})); });
+    await settle();
+    out.afterClick = C.views.current();
+  }
+  if (which.indexOf("view-timeline.js") !== -1) {
+    C.views.open("timeline", { project: "atlas", taskId: "TASK-2" }); await settle();
+    out.current = C.views.current();
+    out.groups = find(host, "tl-group").map(text);
+    out.groupHue = find(host, "tl-group-sq").length;
+    out.mergeHue = find(host, "tl-row").filter(function (r) { return r.attrs["data-task"] === "TASK-9"; }).map(function (r) { return r.style["--p"]; });
+    var kids = find(host, "tl-root")[0].childNodes.map(function (c) { return c.className; });
+    out.legendBeforeChart = kids.indexOf("tl-legend") !== -1 && kids.indexOf("tl-legend") < kids.indexOf("tl-card");
+    out.rowIds = find(host, "tl-row").filter(function (r) { return r.attrs["data-task"]; }).map(function (r) { return r.attrs["data-task"]; });
+    out.highlighted = find(host, "hl").map(function (r) { return r.attrs["data-task"]; });
+    out.merges = find(host, "tl-merge").length;
+    out.now = find(host, "tl-now").length;
+    var segs = find(host, "tl-seg").filter(function (s) { return s.attrs["data-state"]; });
+    out.segStates = segs.map(function (s) { return s.attrs["data-state"]; });
+    out.openSegs = find(host, "open").length;
+    var tip = find(host, "tl-tip")[0];
+    segs[1].listeners.mousemove.forEach(function (fn) { fn(makeEvent({ clientX: 10, clientY: 10 })); });
+    out.tipShown = String(tip.className).indexOf("show") !== -1;
+    out.tipText = text(tip);
+    segs[0].listeners.mousemove.forEach(function (fn) { fn(makeEvent({ clientX: 10, clientY: 10 })); });
+    out.tipTitled = text(tip);
+    // A later snapshot scrolls the same segment left.
+    var before = segs[0].style.left;
+    SNAP.timestamp = NOW + 600;
+    await fireAll();
+    out.scrolled = parseFloat(find(host, "tl-seg").filter(function (s) { return s.attrs["data-state"]; })[0].style.left) < parseFloat(before);
+  }
+  console.log(JSON.stringify(out));
+})();
+async function fireAll() {
+  var due = timers.filter(function (t) { return !t.dead; }); due.forEach(function (t) { t.dead = true; });
+  due.forEach(function (t) { t.fn(); });
+  await settle();
+}
+"""
+
+
+@js_harness.requires_node
+class FleetAndTimelineViewTests(unittest.TestCase):
+    """Fleet and Timeline, each alone and together, over a fixed snapshot."""
+
+    def _run(self, files):
+        return js_harness.cached_driver(self, FLEET_VIEWS_DRIVER_JS, files)
+
+    @property
+    def both(self):
+        return self._run("view-fleet.js,view-timeline.js")
+
+    @property
+    def fleet_only(self):
+        return self._run("view-fleet.js")
+
+    @property
+    def timeline_only(self):
+        return self._run("view-timeline.js")
+
+    def test_fleet_has_a_card_per_project_with_capacity(self):
+        self.assertEqual(self.both["cards"], ["atlas"])
+        self.assertEqual(self.both["capacity"], ["2 / 3 agents"])
+
+    def test_fleet_lists_live_agents_with_state_time_name_and_sparkline(self):
+        rows = {r["task"]: r for r in self.both["rows"]}
+        self.assertEqual(set(rows), {"TASK-1", "TASK-2"})
+        self.assertIn("waiting", rows["TASK-1"]["text"])
+        self.assertIn("10m", rows["TASK-1"]["text"])
+        self.assertIn("codex", rows["TASK-1"]["text"])
+        self.assertEqual(rows["TASK-1"]["sparks"], 2)
+        # TASK-1's title comes from the board data; TASK-2's is unknown, so
+        # its row shows the id alone.
+        self.assertEqual(self.both["titles"], ["Export run history"])
+        self.assertNotIn("Export", rows["TASK-2"]["text"])
+
+    def test_projects_with_no_agents_are_one_quiet_line_not_cards(self):
+        self.assertEqual(self.both["cards"], ["atlas"])
+        self.assertEqual(self.both["quiet"], ["No agents: orbit"])
+        self.assertEqual(self.both["capacity"], ["2 / 3 agents"])
+
+    def test_the_timeline_tooltip_names_the_task(self):
+        self.assertIn("Export run history", self.timeline_only["tipTitled"])
+
+    def test_clicking_an_agent_opens_its_task_in_the_drawer(self):
+        b = self.both
+        self.assertEqual(b["opened"], ["atlas/TASK-1"])
+        # the row's own Timeline button is not also a click on the row
+        self.assertEqual(b["openedAfterTl"], ["atlas/TASK-1"])
+        self.assertEqual(b["keyboardTarget"], "button")
+        self.assertEqual(b["stillFleet"], "fleet")
+
+    def test_an_agent_whose_task_is_not_on_the_board_toasts(self):
+        toasts = self.both["toasts"]
+        self.assertEqual(len(toasts), 1)
+        self.assertIn("TASK-2", toasts[0]["msg"])
+        self.assertEqual(toasts[0]["type"], "error")
+
+    def test_the_timeline_control_opens_the_agent_on_the_timeline(self):
+        self.assertEqual(self.both["tlButton"], "Timeline")
+        self.assertEqual(self.both["afterClick"], "timeline")
+
+    def test_the_summary_bar_counts_live_agents_merges_and_states(self):
+        pulse = self.both["pulse"]
+        self.assertEqual((pulse["live"], pulse["merges"]), ("2", "1"))
+        self.assertEqual(pulse["legend"], ["1 working", "1 waiting", "0 idle",
+                                           "0 ready to review", "0 merge blocked", "0 unknown"])
+        self.assertEqual(pulse["widths"][:2], ["50%", "50%"])
+
+    def test_the_card_ring_shows_agents_over_the_limit_with_a_project_tile(self):
+        ring = self.both["ring"]
+        self.assertEqual((ring["text"], ring["fill"], ring["tile"]), ("2/3", "67%", "A"))
+        self.assertRegex(ring["hue"], r"^hsl\(\d+, ")
+        self.assertEqual(self.both["free"], [])  # the ring and the bar carry capacity (task-194)
+
+    def test_the_bar_and_feed_are_shared_pieces_fleet_no_longer_draws(self):
+        b = self.both
+        self.assertEqual(b["fleetOwnCopies"], 0)
+        self.assertFalse(b["sideHidden"])
+
+    def test_the_activity_feed_is_newest_first_with_state_colours(self):
+        feed = self.both["feed"]
+        self.assertEqual(len(feed), 6)
+        self.assertTrue(feed[0].startswith("TASK-2:") and "working" in feed[0])
+        self.assertIn("merged", feed[-3] + feed[-2] + feed[-1])
+        self.assertTrue(all(" new" not in c for c in self.both["feedClasses"]))  # first paint doesn't animate
+
+    def test_time_in_state_counts_up_between_polls(self):
+        b = self.both
+        self.assertNotEqual(b["sinceBefore"], b["sinceAfter"])
+        self.assertEqual(b["sinceAfter"], "12m")
+
+    def test_a_poll_updates_fleet_rows_in_place(self):
+        self.assertTrue(self.both["sameRowsAfterPoll"])
+
+    def test_with_the_timeline_absent_the_click_does_nothing_harmful(self):
+        self.assertFalse(self.fleet_only["tlAvailable"])
+        self.assertEqual(self.fleet_only["afterClick"], "fleet")
+        self.assertEqual(self.fleet_only["cards"], ["atlas"])
+        self.assertEqual(self.fleet_only["opened"], ["atlas/TASK-1"])
+
+    def test_timeline_alone_works_and_groups_by_project(self):
+        t = self.timeline_only
+        self.assertEqual(t["current"], "timeline")
+        self.assertEqual(t["groups"], ["atlas", "orbit"])
+        self.assertEqual(t["rowIds"], ["TASK-1", "TASK-2", "TASK-9"])
+        self.assertEqual(t["highlighted"], ["TASK-2"])
+
+    def test_timeline_has_its_legend_above_the_chart_and_hue_squares_per_project(self):
+        t = self.timeline_only
+        self.assertTrue(t["legendBeforeChart"])
+        self.assertEqual(t["groupHue"], 2)
+        self.assertRegex(t["mergeHue"][0], r"^hsl\(\d+, ")
+
+    def test_timeline_draws_segments_merge_marker_and_now_line(self):
+        t = self.timeline_only
+        self.assertEqual(t["segStates"],
+                         ["working", "waiting", "working", "working", "ready to review"])
+        self.assertEqual((t["merges"], t["now"], t["openSegs"]), (1, 1, 2))
+
+    def test_hovering_a_segment_shows_state_start_end_and_duration(self):
+        t = self.timeline_only
+        self.assertTrue(t["tipShown"])
+        self.assertIn("waiting", t["tipText"])
+        self.assertRegex(t["tipText"], r"\d\d:\d\d \u2192 now \u00b7 10m")
+
+    def test_the_timeline_scrolls_forward_with_each_snapshot(self):
+        self.assertTrue(self.timeline_only["scrolled"])
+
+
+@js_harness.requires_node
+class SharedPiecesTests(unittest.TestCase):
+    """task-194: pieces drawn around every view but the Board."""
+
+    DRIVER = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js"]);
+global.setTimeout = function () { return 1; };
+global.fetch = function () { return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({ n: 1 }); } }); };
+C = loadFrontend(["fleet.js", "views.js"]);
+var drawn = [];
+C.views.registerShared({ id: "bar", slot: "top", render: function (host, snap) { drawn.push("bar:" + (snap && snap.n)); host.textContent = "BAR"; } });
+C.views.registerShared({ id: "broken", slot: "top", render: function () { throw new Error("boom"); } });
+var out = { dupe: C.views.registerShared({ id: "bar", slot: "top", render: function () {} }) };
+try { C.views.registerShared({ id: "x", slot: "middle", render: function () {} }); out.badSlot = "accepted"; } catch (e) { out.badSlot = "rejected"; }
+out.sideHiddenWithoutFeed = C.byId("view-side").hidden;
+(async function () {
+  C.views.register({ id: "alpha", label: "Alpha", render: function (host) { host.textContent = "alpha"; } });
+  out.before = drawn.slice();
+  C.views.open("alpha"); await settle();
+  out.onView = { stageHidden: C.byId("view-stage").hidden, top: C.byId("view-top").textContent, drawn: drawn.slice() };
+  C.byId("view-tabs").childNodes.filter(function (b) { return b.tagName === "button"; })[0].listeners.click.forEach(function (fn) { fn(makeEvent({})); });
+  out.onBoard = { stageHidden: C.byId("view-stage").hidden, boardHidden: C.byId("board-wrap").hidden };
+  C.views.registerShared({ id: "side", slot: "side", render: function (host) { host.textContent = "SIDE"; } });
+  out.sideShown = !C.byId("view-side").hidden;
+  console.log(JSON.stringify(out));
+})();
+"""
+
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, self.DRIVER)
+
+    def test_shared_pieces_draw_on_a_view_and_not_on_the_board(self):
+        self.assertEqual(self.out["before"], [])
+        self.assertTrue(self.out["onBoard"]["stageHidden"])
+        self.assertFalse(self.out["onBoard"]["boardHidden"])
+        self.assertFalse(self.out["onView"]["stageHidden"])
+        self.assertIn("BAR", self.out["onView"]["top"])
+        self.assertEqual(self.out["onView"]["drawn"], ["bar:1"])
+
+    def test_a_broken_piece_does_not_take_the_others_down(self):
+        self.assertIn("broken panel failed to draw: boom", self.out["onView"]["top"])
+
+    def test_registration_is_validated_and_the_side_column_appears_with_a_piece(self):
+        self.assertFalse(self.out["dupe"])
+        self.assertEqual(self.out["badSlot"], "rejected")
+        self.assertTrue(self.out["sideHiddenWithoutFeed"])
+        self.assertTrue(self.out["sideShown"])
+
+
+@js_harness.requires_node
+class ViewTabStripBehaviourTests(unittest.TestCase):
+    """task-190: one persistent segmented control with a sliding highlight."""
+
+    DRIVER = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js"]);
+global.setTimeout = function () { return 1; };
+global.fetch = function () { return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } }); };
+C = loadFrontend(["fleet.js", "views.js"]);
+var n = 0;
+C.views.register({ id: "a", label: "Alpha", render: function (h) { h.textContent = "a"; }, badge: function () { return ++n; } });
+C.views.register({ id: "b", label: "Beta", render: function (h) { h.textContent = "b"; } });
+var nav = C.byId("view-tabs");
+function buttons() { return nav.childNodes.filter(function (x) { return x.tagName === "button"; }); }
+var before = buttons(), ind = nav.childNodes[0];
+// Give the tabs a layout so the highlight has somewhere to go.
+before.forEach(function (b, i) { b.offsetLeft = 10 + i * 100; b.offsetWidth = 90; });
+(async function () {
+await settle();
+C.views.open("b");
+var out = {};
+out.indicatorFirst = String(ind.className);
+out.left = ind.style.left; out.width = ind.style.width;
+out.sameIndicator = nav.childNodes[0] === ind;
+out.sameButtons = buttons().every(function (b, i) { return b === before[i]; });
+out.active = buttons().filter(function (b) { return String(b.className).indexOf("active") !== -1; }).map(function (b) { return b.attrs["data-view"]; });
+out.badge = buttons()[1].childNodes.map(function (c) { return String(c.className); });
+console.log(JSON.stringify(out));
+})();
+"""
+
+    def test_highlight_moves_to_the_selected_tab_and_tabs_are_kept(self):
+        out = js_harness.run_driver(self, self.DRIVER)
+        self.assertIn("view-tab-ind", out["indicatorFirst"])
+        self.assertTrue(out["sameIndicator"])
+        self.assertTrue(out["sameButtons"])
+        self.assertEqual(out["active"], ["b"])
+        self.assertEqual(out["left"], "210px")
+        self.assertEqual(out["width"], "90px")
+
+    def test_the_count_is_a_badge_element_not_text_in_the_label(self):
+        out = js_harness.run_driver(self, self.DRIVER)
+        self.assertEqual(out["badge"], ["view-tab-label", "view-tab-badge"])
+
+
+class ViewMotionStylesheetTests(unittest.TestCase):
+    """prefers-reduced-motion switches every view animation and transition off."""
+
+    def test_reduced_motion_turns_off_animation_and_transition_for_strip_and_views(self):
+        with open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                               "static", "styles.css"), encoding="utf-8") as f:
+            css = f.read()
+        start = css.index("@media (prefers-reduced-motion: reduce) {\n    #view-tabs")
+        block = css[start:css.index("\n  }\n", start)]
+        for selector in ("#view-tabs *", "#view-host *", "#view-host *::before", "#view-host *::after"):
+            self.assertIn(selector, block)
+        self.assertIn("animation: none !important", block)
+        self.assertIn("transition: none !important", block)
+        # the animations themselves exist for it to switch off
+        for name in ("view-breathe", "view-shimmer", "view-cardin", "view-flash"):
+            self.assertIn("@keyframes " + name, css)
+        # waiting is solid in the summary bar and its stripes are still
+        # elsewhere: the marching motion was distracting (owner, 2026-09-30)
+        self.assertNotIn("view-march", css)

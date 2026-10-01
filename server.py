@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import copy
 import datetime
 import http.server
 import json
@@ -27,7 +28,11 @@ import urllib.parse
 import uuid
 
 import orchestrator
+import fleet
 import version  # the one place the version number is written down
+
+# Persistence is explicitly enabled by main, never by importing a test subject.
+fleet_history = fleet.Journal()
 
 # ---------------------------------------------------------------------------
 # Paths / constants
@@ -67,8 +72,6 @@ _STATUSES_LINE_RE = re.compile(r'^\s*statuses:\s*(\[.*\])\s*$', re.MULTILINE)
 # greedily off the END of the line, so a title containing parentheses
 # stays intact.
 _MILESTONE_LINE_RE = re.compile(r'^\s+([^\s:]+):\s+(.*)\s+\(\d+/\d+ done\)\s*$')
-
-CACHE_TTL_SECONDS = 5.0
 
 DEFAULT_BROWSER_PORT_BASE = 6421
 DEFAULT_AGENTS = {"claude": ["claude"], "codex": ["codex"]}
@@ -272,13 +275,18 @@ MAX_SESSION_INPUT_TEXT_CHARS = 1000
 #
 # "y" stays gone: task-77's reason for it holds -- bare "y" answers a prompt
 # style the current TUIs barely use -- and nothing since has argued otherwise.
-# Arrow keys and Ctrl-C are out of scope for the same discipline.
+# Ctrl-C is out of scope for the same discipline.
+#
+# task-184: Up and Down join them. A menu is answered like a terminal --
+# arrows move the highlight, Enter confirms -- and a pasted digit is
+# ignored by a menu, so the browser needs real arrow keypresses (its click
+# on an option line sends the right number of them, then one Enter).
 #
 # Allowlisted rather than open-ended on purpose: tmux silently sends an
 # UNKNOWN key name as literal text (verified empirically), so a free-form
 # "key" field would be a second text channel with none of the text
 # validation.
-SESSION_INPUT_KEYS = ("Escape", "Enter")
+SESSION_INPUT_KEYS = ("Escape", "Enter", "Up", "Down")
 
 
 def normalize_session_preview_config(raw):
@@ -592,7 +600,7 @@ def load_config(path=None):
 # configure_subprocess_timeout, called once from main() with the loaded
 # config's subprocessTimeoutSeconds. Deliberately a plain module global
 # (matching browser.py's _atexit_registered / this module's own
-# _board_cache) rather than a side effect of load_config() itself, so
+# _project_board_inputs) rather than a side effect of load_config() itself, so
 # calling load_config() in a test never quietly changes this process's
 # shared timeout for unrelated tests.
 _subprocess_timeout_seconds = DEFAULT_SUBPROCESS_TIMEOUT_SECONDS
@@ -629,6 +637,14 @@ def _run(cmd, cwd=None, timeout=15, input=None):
         return subprocess.CompletedProcess(cmd, 124, "", str(exc))
 
 
+def _low_priority_command(cmd):
+    """Nice in the child, never preexec_fn in this threaded server (task-196).
+    Platforms without nice retain direct execution.
+    """
+    nice = which("nice")
+    return [nice, "-n", "10", *cmd] if nice else cmd
+
+
 def run_backlog(args, cwd):
     """Run `backlog <args>` in cwd and return the parsed JSON dict.
 
@@ -637,7 +653,7 @@ def run_backlog(args, cwd):
     the same synthesized returncode=124 _run() gives any other failure,
     so this raises the same BacklogError style either way).
     """
-    proc = _run(["backlog", *args], cwd=cwd, timeout=_subprocess_timeout_seconds)
+    proc = _run(_low_priority_command(["backlog", *args]), cwd=cwd, timeout=_subprocess_timeout_seconds)
     if proc.returncode != 0:
         message = (proc.stderr or proc.stdout or "backlog command failed").strip()
         raise BacklogError(message or f"backlog {' '.join(args)} failed")
@@ -656,7 +672,7 @@ def run_backlog_raw(args, cwd):
     parsed payload — unlike run_backlog, which is for the read commands
     (`task list`, `task view`) whose `--json` output this app depends on.
     """
-    return _run(["backlog", *args], cwd=cwd, timeout=_subprocess_timeout_seconds)
+    return _run(_low_priority_command(["backlog", *args]), cwd=cwd, timeout=_subprocess_timeout_seconds)
 
 
 def run_git(args, cwd=None):
@@ -1081,7 +1097,7 @@ def launch_browser_process(cmd, cwd):
     Raises OSError (e.g. FileNotFoundError) if the binary can't be started.
     """
     return subprocess.Popen(
-        cmd,
+        _low_priority_command(cmd),
         cwd=cwd,
         start_new_session=True,
         stdout=subprocess.DEVNULL,
@@ -1327,7 +1343,7 @@ def _hooks_settings_hook(state):
 
 def hooks_settings_payload():
     """The Claude Code hooks settings JSON: UserPromptSubmit/PreToolUse
-    -> working, Notification -> waiting, Stop -> finished. Agent-generic
+    -> working, input-request Notification -> waiting, Stop -> finished. Agent-generic
     and identical for every claude-family spawn -- identity travels via
     CENTRALE_EVENT_URL in the session's own environment (see
     spawn.event_url), not anything encoded here, so this one generated
@@ -1352,7 +1368,9 @@ def hooks_settings_payload():
         "hooks": {
             "UserPromptSubmit": [_hooks_settings_hook("working")],
             "PreToolUse": [_hooks_settings_hook("working")],
-            "Notification": [_hooks_settings_hook("waiting")],
+            # Idle reminders are notifications too, not requests for input
+            # (task-192). Keep real permission/elicitation/menu signals.
+            "Notification": [_hooks_settings_hook("notification")],
             "Stop": [_hooks_settings_hook("finished")],
         },
         "skillOverrides": {"auto-mode-setup": "off"},
@@ -1422,7 +1440,7 @@ def codex_hooks_overrides():
 # and one from /api/sessions (parsed lowercase out of a tmux session
 # name -- see _parse_session_project_and_task) always agree.
 _agent_events = {}
-_agent_events_lock = threading.Lock()
+_agent_events_lock = threading.RLock()
 # PermissionRequest precedes automatic review, not just human approval.
 # Six real codex 0.157.1 approvals took 2.816–3.761s including tool return;
 # 30s leaves headroom. PostToolUse clears the wait even without a next tool.
@@ -1430,6 +1448,52 @@ _agent_events_lock = threading.Lock()
 CODEX_WAIT_SECONDS = 30.0
 _agent_wait_timer = threading.Timer  # injectable time boundary
 _pending_codex_waits = {}
+# Stop hooks run before the TUI settles, and nested turns can stop while
+# the worker continues. Confirm outside the hook request (task-192).
+CODEX_STOP_SECONDS = 1.0
+_pending_codex_stops = {}
+
+
+def _cancel_codex_stop_locked(key):
+    timer = _pending_codex_stops.pop(key, None)
+    if timer is not None:
+        timer.cancel()
+
+
+def _schedule_codex_stop_locked(key):
+    def confirm_stop():
+        with _agent_events_lock:
+            if _pending_codex_stops.get(key) is not timer:
+                return
+        import spawn
+        state, retry = "finished", False
+        try:
+            # Only the current screen, never scrollback containing an old
+            # status line. A dialog is stronger evidence than a turn end.
+            lines = capture_session_pane(spawn.session_name(*key), 0)
+            region = [line.strip() for line in lines if line.strip()][-DELIVERY_DIALOG_REGION_LINES:]
+            if not region:
+                state, retry = "unknown", True
+            elif detect_pane_dialog(lines) is not None:
+                state = "waiting"
+            elif any(re.search(r"\(\d[^\n]*\besc to interrupt\)", line, re.I)
+                     for line in region):
+                state, retry = "working", True
+        except PaneCaptureError as exc:
+            state, retry = "unknown", exc.status != 404
+        with _agent_events_lock:
+            # A newer hook/clear can arrive while capture is in flight.
+            if _pending_codex_stops.get(key) is not timer:
+                return
+            _pending_codex_stops.pop(key)
+            _set_agent_event_locked(key, state, "codex")
+            if retry:
+                _schedule_codex_stop_locked(key)
+
+    timer = _agent_wait_timer(CODEX_STOP_SECONDS, confirm_stop)
+    timer.daemon = True
+    _pending_codex_stops[key] = timer
+    timer.start()
 
 
 def _agent_event_key(project, task_id):
@@ -1441,12 +1505,17 @@ def _set_agent_event_locked(key, state, kind):
     previous = _agent_events.get(key) or {}
     _agent_events[key] = {
         "state": state, "agentKind": kind, "lastEventAt": time.time(),
+        "agent": previous.get("agent") or kind or "unknown",
     }
     public_state = "idle" if kind == "codex" and state == "finished" else state
     previous_state = previous.get("state")
     if previous.get("agentKind") == "codex" and previous_state == "finished":
         previous_state = "idle"
-    if public_state != previous_state:
+    changed = public_state != previous_state
+    _agent_events[key]["stateSince"] = (time.time() if changed else previous.get("stateSince"))
+    if changed:
+        fleet_history.append(*key, _agent_events[key]["agent"], public_state,
+                             timestamp=_agent_events[key]["stateSince"])
         message = {
             "finished": "finished (ready to review)",
             "waiting": "waiting for input",
@@ -1496,7 +1565,7 @@ def _schedule_codex_wait_locked(key):
     timer.start()
 
 
-def record_agent_event(project, task_id, state, agent_kind=None):
+def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None):
     """Records an agent lifecycle event for (project, taskId). Raises
     ValueError for a state not in AGENT_STATES or a non-null agent kind
     not in AGENT_KINDS -- Handler._handle_agent_event turns that into a
@@ -1515,7 +1584,25 @@ def record_agent_event(project, task_id, state, agent_kind=None):
     with _agent_events_lock:
         key = _agent_event_key(project, task_id)
         previous = _agent_events.get(key) or {}
+        if agent_name is not None:
+            previous["agent"] = agent_name
+            _agent_events[key] = previous
+        elif not previous.get("agent"):
+            name = fleet_history.agent(*key)
+            if name != "unknown":
+                previous["agent"] = name
+                _agent_events[key] = previous
         kind = agent_kind or previous.get("agentKind")
+        if kind == "codex" and state == "finished":
+            _cancel_codex_wait_locked(key)
+            if key not in _pending_codex_stops:
+                # Preserve a corroborated idle/waiting state across duplicate
+                # Stop + notify signals; first candidates stay working.
+                if previous.get("state") not in ("finished", "waiting"):
+                    _set_agent_event_locked(key, "working", kind)
+                _schedule_codex_stop_locked(key)
+            return
+        _cancel_codex_stop_locked(key)
         if kind == "codex" and state == "waiting":
             if key in _pending_codex_waits or (
                 previous.get("agentKind") == "codex" and previous.get("state") == "waiting"
@@ -1545,10 +1632,21 @@ def get_agent_lifecycle(project, task_id):
     if not entry:
         return {"agentState": "unknown", "agentKind": "unknown"}
     agent_kind = entry.get("agentKind") or "unknown"
-    state = entry["state"]
+    state = entry.get("state", "unknown")
     if agent_kind == "codex" and state == "finished":
         state = "idle"
     return {"agentState": state, "agentKind": agent_kind}
+
+
+def get_fleet_lifecycle(project, task_id):
+    with _agent_events_lock:
+        entry = dict(_agent_events.get(_agent_event_key(project, task_id)) or {})
+    state = entry.get("state", "unknown")
+    if state == "finished" and entry.get("agentKind") == "codex":
+        state = "idle"
+    return {"state": state, "stateSince": entry.get("stateSince"),
+            "agent": entry.get("agent") or fleet_history.agent(project, task_id),
+            "agentKind": entry.get("agentKind") or "unknown"}
 
 
 def get_agent_state(project, task_id):
@@ -1561,7 +1659,7 @@ def get_agent_kind(project, task_id):
     return get_agent_lifecycle(project, task_id)["agentKind"]
 
 
-def clear_agent_event(project, task_id):
+def clear_agent_event(project, task_id, agent_name=None):
     """Forget the last event produced by an earlier session for this
     task. Spawn/resume call this immediately before creating the next tmux
     session, so events emitted by the new process can only arrive after the
@@ -1570,6 +1668,16 @@ def clear_agent_event(project, task_id):
         key = _agent_event_key(project, task_id)
         _cancel_codex_wait_locked(key)
         _agent_events.pop(key, None)
+        _cancel_codex_stop_locked(key)
+        if agent_name is not None:
+            # Spawn/resume already established that the previous session
+            # is absent. Retire its observation before launching: a poll
+            # during new-session must not clear the new process's first hook.
+            with fleet_history.lock:
+                if key in fleet_history.sessions:
+                    record_session_ended(*key)
+                fleet_history.last_survey = time.monotonic()
+            _agent_events[key] = {"agent": agent_name}
 
 
 def _reset_agent_events():
@@ -1578,6 +1686,8 @@ def _reset_agent_events():
     with _agent_events_lock:
         for key in list(_pending_codex_waits):
             _cancel_codex_wait_locked(key)
+        for key in list(_pending_codex_stops):
+            _cancel_codex_stop_locked(key)
         _agent_events.clear()
 
 
@@ -1638,15 +1748,86 @@ def task_lifecycle_lock(project_name, task_id):
 # Board aggregation
 # ---------------------------------------------------------------------------
 
-_board_cache = {"time": 0.0, "data": None}
+# Only CLI inputs are memoized; git/tmux/hooks and gates remain live.
+_project_board_inputs = {}
+_project_board_locks = {}
 _board_lock = threading.Lock()
 
 
 def _reset_board_cache():
-    """Test helper: clear the in-memory board cache."""
+    """Test helper: clear the in-memory board inputs (with no active readers)."""
     with _board_lock:
-        _board_cache["time"] = 0.0
-        _board_cache["data"] = None
+        _project_board_inputs.clear()
+        _project_board_locks.clear()
+
+
+def _backlog_signature(repo_path):
+    """Metadata only: task contents are still read exclusively by the CLI.
+
+    Include directory entries, ns timestamps, inode, size and mode to catch
+    edits, replacements, renames, deletes and permission changes. Unknown
+    trees (including symlinked directories) disable reuse, never certify an
+    old answer. No persistent file or watcher is needed (task-196).
+    """
+    # Backlog root config can redirect its data directory. Do not guess at
+    # YAML or cache a tree that the CLI might not be reading.
+    if (os.environ.get("BACKLOG_CWD", "").strip()
+            or any(os.path.lexists(os.path.join(repo_path, name))
+                   for name in ("backlog.config.yml", "backlog.json"))):
+        return None
+    root = os.path.join(repo_path, "backlog")
+    if not any(os.path.isfile(os.path.join(root, name))
+               for name in ("config.yml", "config.yaml")):
+        # Otherwise the CLI can discover .backlog/ or a parent project.
+        return None
+    entries = []
+
+    def fail(exc):
+        raise exc
+
+    try:
+        for directory, dirs, files in os.walk(root, onerror=fail):
+            for path in [directory, *(os.path.join(directory, n) for n in sorted(dirs + files))]:
+                if os.path.islink(path):
+                    return None
+                st = os.stat(path)
+                entries.append((os.path.relpath(path, root), st.st_mtime_ns,
+                                st.st_ctime_ns, st.st_size, st.st_ino, st.st_mode))
+        return tuple(sorted(entries)) if entries else None
+    except OSError:
+        return None
+
+
+def _load_board_inputs(path):
+    """Coalesce concurrent readers per checkout; cache only stable successes."""
+    key = os.path.realpath(path)
+    with _board_lock:
+        lock = _project_board_locks.setdefault(key, threading.Lock())
+    with lock:
+        signature = _backlog_signature(key)
+        cached = _project_board_inputs.get(key)
+        if signature is not None and cached is not None and cached[0] == signature:
+            return copy.deepcopy(cached[1])
+        _project_board_inputs.pop(key, None)
+        list_data = run_backlog(["task", "list", "--json"], cwd=path)
+        ready_data = run_backlog(["task", "list", "--ready", "--json"], cwd=path)
+        for data, command in ((list_data, "task list --json"),
+                              (ready_data, "task list --ready --json")):
+            if not isinstance(data, dict) or data.get("schemaVersion") != 1:
+                raise BacklogError(f"unsupported or missing schemaVersion from `{command}`")
+        tasks = list_data.get("tasks") or []
+        cacheable = True
+        titles = {}
+        if any(str(t.get("milestone") or "").strip() for t in tasks):
+            try:
+                titles = _load_project_milestones(path, strict=True)
+            except BacklogError:
+                # Preserve best-effort milestone display, but retry next poll.
+                cacheable = False
+        value = (list_data, ready_data, titles)
+        if cacheable and signature is not None and signature == _backlog_signature(key):
+            _project_board_inputs[key] = (signature, copy.deepcopy(value))
+        return value
 
 
 def _read_statuses(repo_path):
@@ -1671,7 +1852,7 @@ def _read_statuses(repo_path):
     return None
 
 
-def _load_project_milestones(repo_path):
+def _load_project_milestones(repo_path, strict=False):
     """Best-effort ``{milestone id: title}`` for one repo, read through the
     backlog CLI.
 
@@ -1696,6 +1877,8 @@ def _load_project_milestones(repo_path):
         ["milestone", "list", "--plain", "--show-completed"], cwd=repo_path
     )
     if proc.returncode != 0:
+        if strict:
+            raise BacklogError((proc.stderr or "milestone list failed").strip())
         return {}
     titles = {}
     for line in (proc.stdout or "").splitlines():
@@ -2045,17 +2228,9 @@ def _load_project_board(config, project):
         return result
 
     try:
-        list_data = run_backlog(["task", "list", "--json"], cwd=path)
-        ready_data = run_backlog(["task", "list", "--ready", "--json"], cwd=path)
+        list_data, ready_data, milestone_titles = _load_board_inputs(path)
     except BacklogError as exc:
         result["error"] = str(exc)
-        return result
-
-    if not isinstance(list_data, dict) or list_data.get("schemaVersion") != 1:
-        result["error"] = "unsupported or missing schemaVersion from `task list --json`"
-        return result
-    if not isinstance(ready_data, dict) or ready_data.get("schemaVersion") != 1:
-        result["error"] = "unsupported or missing schemaVersion from `task list --ready --json`"
         return result
 
     tasks = list_data.get("tasks") or []
@@ -2096,18 +2271,6 @@ def _load_project_board(config, project):
     # while their task is spawned -- see spawn.py). Read from the files'
     # own modes on every load: one listdir, one stat per task file.
     locked_files = spawn.locked_task_files(path)
-
-    # task-91: milestone ids are assigned per repo and sequentially, so
-    # every repo has an "m-0" and the id alone says nothing about which
-    # milestone -- or whose. Resolve id -> title ONCE per project here
-    # (never per task: the lookup below is a dict hit) and skip the call
-    # entirely for a project where no task carries a milestone, which is
-    # every project on a board that doesn't use them.
-    milestone_titles = (
-        _load_project_milestones(path)
-        if any(str(t.get("milestone") or "").strip() for t in tasks)
-        else {}
-    )
 
     merged_tasks = []
     observed_statuses = []
@@ -2179,15 +2342,11 @@ def _load_project_board(config, project):
 
 
 def get_board(config, force=False):
-    """Aggregate the board across all configured projects, concurrently.
-    Results are cached in-memory for CACHE_TTL_SECONDS unless force=True."""
-    now = time.time()
-    if not force:
-        with _board_lock:
-            cached = _board_cache["data"]
-            if cached is not None and (now - _board_cache["time"]) < CACHE_TTL_SECONDS:
-                return cached
+    """Aggregate live project state with file-validated CLI inputs.
 
+    force is retained for API compatibility: every request now checks files
+    and refreshes lifecycle state, including a manually forced refresh.
+    """
     projects = config.get("projects") or []
     results_by_name = {}
     if projects:
@@ -2212,10 +2371,6 @@ def get_board(config, force=False):
     ordered = [results_by_name[p["name"]] for p in projects]
     board = {"projects": ordered}
 
-    with _board_lock:
-        _board_cache["data"] = board
-        _board_cache["time"] = now
-
     return board
 
 
@@ -2223,7 +2378,7 @@ def get_board(config, force=False):
 # tmux sessions
 # ---------------------------------------------------------------------------
 
-def list_sessions():
+def list_sessions(strict=False):
     """Return centrale-* tmux sessions (see SESSION_PREFIX) as a list of
     {"name", "created", "attached"} dicts. A tmux server that isn't
     running yields an empty list rather than an error."""
@@ -2236,7 +2391,7 @@ def list_sessions():
         stderr = (proc.stderr or "").lower()
         if "no server running" in stderr or "no such file or directory" in stderr:
             return []
-        if not (proc.stdout or "").strip():
+        if not strict and not (proc.stdout or "").strip():
             # Treat any other empty-output non-zero exit as "no sessions"
             # too, so a missing/unavailable tmux never surfaces as a 500.
             return []
@@ -2259,6 +2414,252 @@ def list_sessions():
             "attached": attached == "1",
         })
     return sessions
+
+
+def record_session_started(project, task_id, agent, timestamp=None):
+    key = _agent_event_key(project, task_id)
+    with _agent_events_lock, fleet_history.lock:
+        fleet_history.last_survey = time.monotonic()
+        fleet_history.sessions[key] = {"created": None, "observedAt": time.monotonic()}
+        fleet_history.append(*key, agent, "spawn", timestamp=timestamp)
+
+
+def record_session_ended(project, task_id):
+    key = _agent_event_key(project, task_id)
+    with _agent_events_lock, fleet_history.lock:
+        # A survey begun before this end cannot put the old session back
+        # in the observation set and produce a duplicate end on its next poll.
+        fleet_history.last_survey = time.monotonic()
+        tracked = key in fleet_history.sessions
+        fleet_history.sessions.pop(key, None)
+        # A poll may observe the successful kill before its HTTP handler
+        # returns. Both producers describe the same end, not two transitions.
+        if tracked or fleet_history.latest(*key).get("state") != "session ended":
+            fleet_history.append(*key, fleet_history.agent(*key), "session ended")
+        clear_agent_event(*key)
+
+
+def observe_fleet_sessions(sessions, config, surveyed_at=None):
+    """Notice disappeared sessions using a survey already needed by a view.
+
+    The journal tracks observations only. It never supplies live sessions;
+    the response and project counts always come from this fresh tmux survey.
+    """
+    surveyed_at = time.monotonic() if surveyed_at is None else surveyed_at
+    live = {}
+    for session in sessions:
+        project, task_id = _parse_session_project_and_task(session.get("name", ""), config)
+        if project is not None:
+            live[_agent_event_key(project["name"], task_id)] = session.get("created")
+    with _agent_events_lock, fleet_history.lock:
+        if surveyed_at < fleet_history.last_survey:
+            return
+        fleet_history.last_survey = surveyed_at
+        for key, previous in list(fleet_history.sessions.items()):
+            if previous["observedAt"] > surveyed_at:
+                live.pop(key, None)
+                continue
+            if key not in live:
+                record_session_ended(*key)
+            elif previous["created"] is not None and previous["created"] != live[key]:
+                # tmux can reuse a name between polls; the badge belongs
+                # to the old session, even when no empty survey intervenes.
+                record_session_ended(*key)
+                fleet_history.append(*key, fleet_history.agent(*key), "spawn")
+        for key, created in live.items():
+            fleet_history.sessions[key] = {"created": created, "observedAt": surveyed_at}
+
+
+def get_fleet(config, window=fleet.DEFAULT_WINDOW):
+    surveyed_at = time.monotonic()
+    sessions = list_sessions(strict=True)
+    observe_fleet_sessions(sessions, config, surveyed_at)
+    projects = [{"name": p["name"], "maxAgents": p.get("maxAgents"), "agentCount": 0}
+                for p in config.get("projects", [])]
+    by_name = {p["name"]: p for p in projects}
+    agents = []
+    for session in sessions:
+        project, task_id = _parse_session_project_and_task(session.get("name", ""), config)
+        if project is None:
+            continue
+        by_name[project["name"]]["agentCount"] += 1
+        agents.append({"project": project["name"], "taskId": task_id.upper(),
+                       "session": session["name"], "created": session.get("created"),
+                       "attached": session.get("attached", False),
+                       **get_fleet_lifecycle(project["name"], task_id)})
+    snapshot = fleet_history.snapshot(window)
+    snapshot["history"] = [r for r in snapshot["history"] if r["project"] in by_name]
+    snapshot.update(projects=projects, agents=agents,
+                    merges=[r for r in snapshot["history"]
+                            if r["state"] in {"merged", "merge blocked"}])
+    entries = []
+    try:
+        # Delivery attempts have no acknowledgement lifecycle. Expose all
+        # failed attempts, including ones older than the timeline window.
+        entries, skipped = read_delivery_log(limit=None)
+        snapshot.update(messages=[e for e in entries if e.get("project") in by_name
+                                  and e.get("outcome") != "delivered"],
+                        deliverySkippedLines=skipped, deliveryError=None)
+    except (OSError, UnicodeError) as exc:
+        snapshot.update(messages=[], deliverySkippedLines=0, deliveryError=str(exc))
+    snapshot["sessionPreviewMode"] = session_preview_mode(config)
+    snapshot["needsYou"], snapshot["needsYouErrors"] = fleet_inbox(config, snapshot, entries)
+    return snapshot
+
+
+def _inbox_timestamp(value):
+    if isinstance(value, (int, float)):
+        return value
+    try:
+        return datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+OWNER_QUESTIONS_TTL = 30.0
+_owner_cache = {"at": None, "items": [], "errors": []}
+_owner_cache_lock = threading.Lock()
+
+
+def fleet_inbox(config, snapshot, deliveries):
+    """Derive attention signals afresh; historical failures are never live verdicts."""
+    import spawn
+    items, errors = [], []
+    projects = {p["name"]: p for p in config.get("projects", [])}
+    agents = {(a["project"], a["taskId"]): a for a in snapshot["agents"]}
+    reports = {}
+
+    def add(kind, project, task_id, agent, since, signal, **details):
+        items.append(dict(kind=kind, project=project, taskId=task_id, agent=agent or "unknown",
+                          since=since, signal=signal, **details))
+
+    for a in snapshot["agents"]:
+        project, task_id = a["project"], a["taskId"]
+        if a["state"] == "waiting" and session_preview_mode(config) != "off":
+            try:
+                lines = capture_session_pane(a["session"], MAX_SESSION_PANE_LINES)
+                dialog = detect_pane_dialog(lines)
+                if dialog:
+                    record_pane_capture(a["session"])
+                    add("permission", project, task_id, a["agent"], a["stateSince"],
+                        "Waiting hook + pane dialog: " + dialog, lines=lines,
+                        capturedAt=time.time())
+            except PaneCaptureError as exc:
+                errors.append(f"{project}/{task_id}: {exc}")
+        elif a["state"] == "idle":
+            # A live Centrale worker writes its report on its own worktree,
+            # not main. Never restore a finished badge from durable history.
+            cwd = spawn.worktree_dir(config, project, task_id)
+            data = _task_view_or_none(cwd, task_id)
+            task = (data or {}).get("task")
+            reports[(project, task_id)] = task
+            if not isinstance(task, dict):
+                errors.append(f"{project}/{task_id}: completion report unavailable")
+            elif task.get("status") != "Done" and not (task.get("finalSummary") or "").strip():
+                add("idle", project, task_id, a["agent"], a["stateSince"],
+                    "Idle hook; no final report or Done status on the agent branch")
+
+    # The most recent observation must itself be a failed merge. Resuming,
+    # working, finishing or merging supersedes it. This names a historical
+    # attempt, never asserts that an old gate result is still true.
+    latest = {}
+    for row in fleet_history.snapshot(fleet.RETENTION)["history"]:
+        if row["project"] in projects:
+            latest[(row["project"], row["taskId"])] = row
+    for (project, task_id), row in latest.items():
+        if row["state"] == "merge blocked":
+            result = row.get("harvest") or {}
+            add("merge", project, task_id, row["agent"], row["timestamp"],
+                "Last merge attempt failed: " + (result.get("reason") or result.get("error") or "gate unavailable")
+                + ". Current gate outcome unknown; open task to recheck.")
+
+    # One item per target, only the latest attempt, at most two hours old.
+    # A later success to that target clears earlier failures regardless of
+    # message text or sender (task-188 reviewer rule).
+    latest = {}
+    for row in deliveries:
+        project, task_id = row.get("project"), str(row.get("task", "")).upper()
+        stamp = _inbox_timestamp(row.get("time"))
+        if project not in projects or not TASK_ID_RE.fullmatch(task_id) or stamp is None:
+            continue
+        if not snapshot["timestamp"] - fleet.DEFAULT_WINDOW <= stamp <= snapshot["timestamp"]:
+            continue
+        key = (project, task_id)
+        if key not in latest or stamp >= latest[key][0]:
+            latest[key] = (stamp, row)
+    for (project, task_id), (stamp, row) in latest.items():
+        if row.get("outcome") != "delivered":
+            agent = agents.get((project, task_id), {}).get("agent") or fleet_history.agent(project, task_id)
+            add("message", project, task_id, agent, stamp,
+                "Latest delivery attempt: " + str(row.get("outcome")) + " — " + (row.get("reason") or "not confirmed"),
+                text=row.get("text") or "")
+
+    # Owner questions change at human speed, but finding them reads the
+    # board and each live worker's branch. Recompute at most every
+    # OWNER_QUESTIONS_TTL seconds rather than on every few-second poll.
+    now = time.monotonic()
+    with _owner_cache_lock:
+        if _owner_cache["at"] is not None and now - _owner_cache["at"] < OWNER_QUESTIONS_TTL:
+            items.extend(_owner_cache["items"])
+            errors.extend(_owner_cache["errors"])
+            return items, errors
+    first_item, first_error = len(items), len(errors)
+
+    # The tab badge polls even on Board: share its cached task listing
+    # instead of spawning another list command per labelled project.
+    owner_projects = {p["name"]: p for p in get_board(config)["projects"]} if projects else {}
+    for project, p in projects.items():
+        label = "needs-owner-approval"
+        try:
+            data = owner_projects.get(project)
+            if data is None:
+                raise BacklogError("project unavailable on the board")
+            if data.get("error"):
+                raise BacklogError(data["error"])
+            for task in data.get("tasks") or []:
+                task_id = str(task.get("id", "")).upper()
+                if not TASK_ID_RE.fullmatch(task_id):
+                    continue
+                # Workers add questions on their branches, before main can
+                # carry the label. A turn-end hook is not task completion.
+                # Only a live worker can be asking now: reading every spawn
+                # branch on each poll cost a git and backlog run per branch.
+                if (project, task_id) not in agents and (
+                        task.get("status") == "Done" or label not in (task.get("labels") or [])):
+                    continue
+                a = agents.get((project, task_id), {})
+                if (project, task_id) in reports:
+                    report = reports[(project, task_id)]
+                else:
+                    branch = _branch_task_view(config, p, task_id)
+                    # List rows omit comments and finalSummary. Read detail only
+                    # for labelled or branch-bearing tasks, preferring the
+                    # worker branch where new questions are written (task-191).
+                    detail = branch or _task_view_or_none(p["path"], task_id)
+                    report = (detail or {}).get("task")
+                    if not isinstance(report, dict):
+                        errors.append(f"{project}/{task_id}: owner question unavailable")
+                if not isinstance(report, dict):
+                    continue  # the failed idle-report check already exposed an error
+                if (label not in (report.get("labels") or [])
+                        or report.get("status") == "Done"
+                        or (report.get("finalSummary") or "").strip()):
+                    continue
+                comments = [c.get("body") or "" for c in report.get("comments") or []]
+                # Replies (an orchestrator's partial ruling, say) often follow
+                # the question; show the latest comment that asks something.
+                asking = [c for c in comments if "?" in c]
+                question = (asking or comments or [None])[-1]
+                title = report.get("title") or task.get("title") or ""
+                add("owner", project, task_id, a.get("agent") or ", ".join(task.get("assignees") or []) or "unassigned",
+                    _inbox_timestamp(task.get("updatedAt") or task.get("createdAt")),
+                    "Task label: " + label + " (age is task update age)",
+                    title=title, text=question or title)
+        except BacklogError as exc:
+            errors.append(f"{project}: owner questions unavailable: {exc}")
+    with _owner_cache_lock:
+        _owner_cache.update(at=now, items=items[first_item:], errors=errors[first_error:])
+    return items, errors
 
 
 TOUCHED_FILES_CAP = 20
@@ -2358,6 +2759,9 @@ def capture_session_pane(name, max_lines=DEFAULT_SESSION_PANE_LINES):
     empirically -- a bare "=name" is read as an exact PANE name and
     fails with "can't find pane"), so "centrale-app-task-1" can never
     resolve to "centrale-app-task-10" the way a prefix match could.
+
+    Passing zero captures the current screen without scrollback, used to
+    corroborate lifecycle stops against the current status line.
 
     Raises PaneCaptureError(status=404) when the session doesn't exist or
     no tmux server is running, PaneCaptureError(status=500) otherwise.
@@ -2705,7 +3109,7 @@ def read_delivery_log(project=None, task=None, limit=DEFAULT_DELIVERY_LOG_LIMIT)
         if task is not None and str(entry.get("task", "")).lower() != task.lower():
             continue
         entries.append(entry)
-    return entries[-limit:], skipped
+    return (entries if limit is None else entries[-limit:]), skipped
 
 
 def detect_pane_dialog(lines):
@@ -3459,12 +3863,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self._send_json(200, response)
 
-    def _handle_sessions(self):
+    def _handle_fleet(self, query):
         try:
-            sessions = list_sessions()
+            window = fleet.parse_window((query.get("window") or [fleet.DEFAULT_WINDOW])[0])
+            self._send_json(200, get_fleet(self.config, window))
+        except ValueError as exc:
+            self._send_error_json(400, str(exc))
+        except BacklogError as exc:
+            self._send_error_json(502, str(exc))
+
+    def _handle_sessions(self):
+        surveyed_at = time.monotonic()
+        try:
+            sessions = list_sessions(strict=True)
         except BacklogError as exc:
             self._send_error_json(502, str(exc))
             return
+        observe_fleet_sessions(sessions, self.config, surveyed_at)
         enrich_sessions_with_files(sessions, self.config)
         self._send_json(200, {"sessions": sessions})
 
@@ -3558,6 +3973,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_board(query)
             elif path == "/api/task":
                 self._handle_task(query)
+            elif path == "/api/fleet":
+                self._handle_fleet(urllib.parse.parse_qs(parsed.query, keep_blank_values=True))
             elif path == "/api/sessions":
                 self._handle_sessions()
             elif path == "/api/session-pane":
@@ -3823,6 +4240,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         project_name = (query.get("project") or [None])[0]
         task_id = (query.get("task") or [None])[0]
         agent_kind = (query.get("agentKind") or [None])[0]
+        agent_name = (query.get("agentName") or [None])[0]
+        if agent_name is not None and (not agent_name.strip() or len(agent_name) > 200):
+            self._send_error_json(400, "invalid agent name")
+            return
 
         if not project_name:
             self._send_error_json(400, "missing required query param: project")
@@ -3848,7 +4269,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         state = body.get("state")
 
         try:
-            record_agent_event(project_name, task_id, state, agent_kind=agent_kind)
+            record_agent_event(project_name, task_id, state, agent_kind=agent_kind,
+                               agent_name=agent_name)
         except ValueError as exc:
             self._send_error_json(400, str(exc))
             return
@@ -3923,6 +4345,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_error_json(500, f"tmux kill-session failed: {stderr}")
             return
 
+        record_session_ended(project_name, task_id)
         wt_dir = spawn.worktree_dir(self.config, project_name, task_id)
         killed_orphans = kill_pids_with_cwd_under(wt_dir)
 
@@ -5430,6 +5853,8 @@ def main():
             "point at repos on this machine.",
             file=sys.stderr,
         )
+    global fleet_history
+    fleet_history = fleet.Journal(fleet.history_path())
     configure_subprocess_timeout(config["subprocessTimeoutSeconds"])
     config["capabilities"] = detect_capabilities()
     # task-107: resolved HERE, once, and then only read back -- what the

@@ -164,7 +164,9 @@ class SpawnHelperTests(unittest.TestCase):
             "`[ruling from <sender>] <text>`) is a ruling on this task: first "
             "record it on your task as a comment authored by the sender "
             "(`backlog task edit TASK-2 --comment \"<text>\" --comment-author "
-            "<sender>`), then act on it."
+            "<sender>`), then act on it. "
+            "When you need the owner to decide, add the needs-owner-approval label "
+            "with your question as a task comment and stop until answered."
         )
         self.assertEqual(spawn.prompt_for("TASK-2"), expected)
 
@@ -733,7 +735,7 @@ class SpawnAgentSelectionIntegrationTests(unittest.TestCase):
         self.assertEqual(tmux_args[tmux_args.index("-e") + 1], "CENTRALE_AGENT=codex")
         self.assertEqual(tmux_args[-1], spawn.prompt_for("TASK-2"))
         self.assertIn(
-            f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2', agent_kind='codex')}",
+            f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2', agent_kind='codex', agent_name='codex')}",
             tmux_args,
         )
 
@@ -747,7 +749,7 @@ class SpawnAgentSelectionIntegrationTests(unittest.TestCase):
         self.assertIn("claude", tmux_args)
         self.assertEqual(tmux_args[tmux_args.index("-e") + 1], "CENTRALE_AGENT=claude")
         self.assertIn(
-            f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2', agent_kind='claude')}",
+            f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2', agent_kind='claude', agent_name='claude')}",
             tmux_args,
         )
 
@@ -962,7 +964,7 @@ class SpawnAgentSelectionIntegrationTests(unittest.TestCase):
             [
                 "new-session", "-d", "-s", "centrale-my-app-task-2",
                 "-c", "/worktrees/my-app-task-2", *geometry_args(),
-                "-e", f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2')}",
+                "-e", f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2', agent_name='custom')}",
                 "sleep", "300", spawn.prompt_for("TASK-2"),
             ],
         )
@@ -1431,7 +1433,7 @@ class SpawnHappyPathTests(unittest.TestCase):
             [
                 "new-session", "-d", "-s", "centrale-my-app-task-2",
                 "-c", expected_wt_dir, *geometry_args(),
-                "-e", f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2')}",
+                "-e", f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2', agent_name='custom')}",
                 "sleep", "300", spawn.prompt_for("TASK-2"),
             ],
         )
@@ -2465,7 +2467,8 @@ class ResumeIntegrationTests(unittest.TestCase):
     def test_claude_family_agent_without_resume_cmd_defaults_to_continue(self):
         # "claude-sonnet": ["claude", "--model", "sonnet"] -- a
         # differently-named agent whose underlying command is still
-        # literally `claude`, so it still counts as claude-family.
+        # literally `claude`, so it still counts as claude-family, and
+        # (task-183) its own arguments ride along after --continue.
         config = make_config("/worktrees", [{"name": "my-app", "path": "/repos/my-app"}])
         config["agents"] = server.normalize_agents_map({
             "claude-sonnet": ["claude", "--model", "sonnet"],
@@ -2475,10 +2478,10 @@ class ResumeIntegrationTests(unittest.TestCase):
 
         self.assertEqual(result["agent"], "claude-sonnet")
         tmux_args = new_session_argv(run_tmux)
-        self.assertEqual(tmux_args[-4:-2], ["claude", "--continue"])
+        self.assertEqual(tmux_args[-6:-2], ["claude", "--continue", "--model", "sonnet"])
         self.assertEqual(tmux_args[-2:], spawn._inject_agent_hooks(["claude"]))
         self.assertIn(
-            f"CENTRALE_EVENT_URL={spawn.event_url(config, 'my-app', 'TASK-2', agent_kind='claude')}",
+            f"CENTRALE_EVENT_URL={spawn.event_url(config, 'my-app', 'TASK-2', agent_kind='claude', agent_name='claude-sonnet')}",
             tmux_args,
         )
 
@@ -2500,7 +2503,7 @@ class ResumeIntegrationTests(unittest.TestCase):
             "CENTRALE_EVENT_URL="
             + spawn.event_url(
                 config, "my-app", "TASK-2",
-                agent_kind=spawn.agent_kind_for_command(["aider"]),
+                agent_kind=spawn.agent_kind_for_command(["aider"]), agent_name="aider",
             ),
             tmux_args,
         )
@@ -2537,6 +2540,24 @@ class ResumeIntegrationTests(unittest.TestCase):
         tmux_args = new_session_argv(run_tmux)
         self.assertTrue(tmux_args[-1].endswith("Prefer small commits."))
 
+    def test_codex_agent_arguments_ride_along_on_resume(self):
+        # task-183: resume uses the agent's own arguments from
+        # projects.json -- right after `resume --last`, before the hook
+        # overrides -- so a resumed agent keeps its model and config.
+        config = make_config("/worktrees", [{"name": "my-app", "path": "/repos/my-app"}])
+        config["agents"] = server.normalize_agents_map({
+            "codex-high": ["codex", "--model", "m-1", "-c", 'model_reasoning_effort="high"'],
+        })
+        config["defaultAgent"] = "codex-high"
+        result, run_tmux, _, _ = self._run_resume(config, [])
+
+        tmux_args = new_session_argv(run_tmux)
+        cmd_start = tmux_args.index("codex")
+        self.assertEqual(
+            tmux_args[cmd_start:cmd_start + 7],
+            ["codex", "resume", "--last", "--model", "m-1", "-c", 'model_reasoning_effort="high"'],
+        )
+
     def test_codex_family_agent_without_resume_cmd_defaults_to_resume_last(self):
         # task-115: the codex equivalent of `claude --continue`. Both the
         # picker and --last filter by working directory unless --all is
@@ -2557,7 +2578,7 @@ class ResumeIntegrationTests(unittest.TestCase):
         # resume` accepts -c exactly as the top-level command does.
         self.assertIn("-c", tmux_args[cmd_start + 3:])
         self.assertIn(
-            f"CENTRALE_EVENT_URL={spawn.event_url(config, 'my-app', 'TASK-2', agent_kind='codex')}",
+            f"CENTRALE_EVENT_URL={spawn.event_url(config, 'my-app', 'TASK-2', agent_kind='codex', agent_name='codex')}",
             tmux_args,
         )
 
@@ -2639,7 +2660,7 @@ class ResumeIntegrationTests(unittest.TestCase):
             tmux_args,
             ["new-session", "-d", "-s", "centrale-my-app-task-2", "-c", "/worktrees/my-app-task-2",
              *geometry_args(),
-             "-e", f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2')}",
+             "-e", f"CENTRALE_EVENT_URL={spawn.event_url(self.config, 'my-app', 'TASK-2', agent_name='custom')}",
              "sleep", "300", spawn.prompt_for("TASK-2")],
         )
 
@@ -2710,7 +2731,7 @@ class ReconcileResumeTests(ResumeIntegrationTests):
         self.assertEqual(tmux_args[:5], ["new-session", "-d", "-s", "centrale-my-app-task-2", "-c"])
         self.assertIn("CENTRALE_AGENT=claude", tmux_args)
         self.assertIn(
-            f"CENTRALE_EVENT_URL={spawn.event_url(config, 'my-app', 'TASK-2', agent_kind='claude')}",
+            f"CENTRALE_EVENT_URL={spawn.event_url(config, 'my-app', 'TASK-2', agent_kind='claude', agent_name='claude')}",
             tmux_args,
         )
 

@@ -1,3 +1,4 @@
+import io
 import http.server
 import json
 import os
@@ -42,6 +43,29 @@ class MainArgvHandlingTests(unittest.TestCase):
             with mock.patch.object(centrale_notify, "_post_event") as post_event:
                 centrale_notify.main(["centrale_notify.py", "finished", '{"turn": "payload"}'])
         post_event.assert_called_once_with("http://127.0.0.1:9/x", "finished")
+
+    def test_notification_payload_distinguishes_real_prompts_from_reminders(self):
+        for notification_type in ("permission_prompt", "elicitation_dialog",
+                                  "elicitation_url_dialog", "agent_needs_input",
+                                  "idle_prompt", "auth_success", "agent_completed", "future_type"):
+            with self.subTest(notification_type=notification_type), \
+                 mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://127.0.0.1:9/x"}), \
+                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"notification_type": notification_type}))), \
+                 mock.patch.object(centrale_notify, "_post_event") as post:
+                centrale_notify.main(["notify", "notification"])
+                if notification_type in {"permission_prompt", "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"}:
+                    post.assert_called_once_with("http://127.0.0.1:9/x", "waiting")
+                else:
+                    post.assert_not_called()
+
+    def test_bad_notification_payloads_are_silent_and_publish_nothing(self):
+        for payload in ("", "broken", "[]", "null", "{}"):
+            with self.subTest(payload=payload), \
+                 mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://127.0.0.1:9/x"}), \
+                 mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                 mock.patch.object(centrale_notify, "_post_event") as post:
+                centrale_notify.main(["notify", "notification"])
+                post.assert_not_called()
 
     def test_post_event_failure_is_swallowed(self):
         # A hook must never be able to break or hang the agent it's

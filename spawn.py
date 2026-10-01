@@ -54,7 +54,9 @@ PROMPT_TEMPLATE = (
     "`[ruling from <sender>] <text>`) is a ruling on this task: first "
     "record it on your task as a comment authored by the sender "
     "(`backlog task edit {task_id} --comment \"<text>\" --comment-author "
-    "<sender>`), then act on it."
+    "<sender>`), then act on it. "
+    "When you need the owner to decide, add the needs-owner-approval label "
+    "with your question as a task comment and stop until answered."
 )
 
 
@@ -274,7 +276,7 @@ def agent_kind_for_command(cmd):
     return basename if basename in server.AGENT_KINDS else None
 
 
-def event_url(config, project_name, task_id, agent_kind=None):
+def event_url(config, project_name, task_id, agent_kind=None, agent_name=None):
     """The CENTRALE_EVENT_URL set (via tmux -e) on every spawned/resumed
     session's own environment, regardless of agent type or the
     CENTRALE_SPAWN_CMD test override (task-37 AC #4): identity travels
@@ -290,6 +292,8 @@ def event_url(config, project_name, task_id, agent_kind=None):
     params = {"project": project_name, "task": task_id}
     if agent_kind is not None:
         params["agentKind"] = agent_kind
+    if agent_name is not None:
+        params["agentName"] = agent_name
     query = urllib.parse.urlencode(params)
     return f"http://127.0.0.1:{port}/api/agent-event?{query}"
 
@@ -1456,7 +1460,7 @@ def spawn(config, project_name, task_id, agent=None):
         tmux_args += ["-e", f"CENTRALE_AGENT={agent_name}"]
     tmux_args += [
         "-e",
-        f"CENTRALE_EVENT_URL={event_url(config, project_name, task_id, agent_kind=agent_kind)}",
+        f"CENTRALE_EVENT_URL={event_url(config, project_name, task_id, agent_kind=agent_kind, agent_name=agent_name or 'custom')}",
     ]
     extra_argv = _inject_agent_hooks(cmd) if agent_name is not None else []
     tmux_args += [*cmd, *extra_argv, prompt]
@@ -1465,11 +1469,13 @@ def spawn(config, project_name, task_id, agent=None):
     # event store is keyed by task. Drop the previous session's residue at
     # the last possible moment before launch. Clearing after run_tmux would
     # race the detached agent's first hook event and could erase fresh state.
-    server.clear_agent_event(project_name, task_id)
+    server.clear_agent_event(project_name, task_id, agent_name=agent_name or "custom")
+    launched_at = time.time()
     proc = server.run_tmux(tmux_args)
     if proc.returncode != 0:
         stderr = (proc.stderr or proc.stdout or "tmux new-session failed").strip()
         raise SpawnError(f"tmux new-session failed: {stderr}", status=500)
+    server.record_session_started(project_name, task_id, agent_name or "custom", launched_at)
     hold_session_geometry(name)
 
     result = {
@@ -1675,7 +1681,10 @@ def resume(config, project_name, task_id, reconcile=False):
             cmd = resume_cmd
             prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
         elif agent_cmd and agent_cmd[0] == "claude":
-            cmd = ["claude", "--continue"]
+            # task-183: the agent's own arguments from projects.json ride
+            # along (--model, --permission-mode, ...), so a resumed agent
+            # runs as configured; an agent with none resumes with none.
+            cmd = ["claude", "--continue", *agent_cmd[1:]]
             prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
         elif agent_cmd and agent_cmd[0] == "codex":
             # task-115: the codex equivalent of `claude --continue`. Both
@@ -1686,8 +1695,9 @@ def resume(config, project_name, task_id, reconcile=False):
             # verified empirically: the picker in two different repos
             # lists two different sets, and --all lists both plus more.
             # The injected -c hook overrides still apply: `codex resume`
-            # takes -c the same way the top-level command does.
-            cmd = ["codex", "resume", "--last"]
+            # takes -c the same way the top-level command does -- and so
+            # do the agent's own arguments (-m/--model, -c), task-183.
+            cmd = ["codex", "resume", "--last", *agent_cmd[1:]]
             prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
         else:
             cmd = agent_cmd
@@ -1703,7 +1713,7 @@ def resume(config, project_name, task_id, reconcile=False):
         tmux_args += ["-e", f"CENTRALE_AGENT={agent_name}"]
     tmux_args += [
         "-e",
-        f"CENTRALE_EVENT_URL={event_url(config, project_name, task_id, agent_kind=agent_kind)}",
+        f"CENTRALE_EVENT_URL={event_url(config, project_name, task_id, agent_kind=agent_kind, agent_name=agent_name or 'custom')}",
     ]
     extra_argv = _inject_agent_hooks(cmd) if agent_name is not None else []
     tmux_args += list(cmd) + extra_argv
@@ -1713,11 +1723,13 @@ def resume(config, project_name, task_id, reconcile=False):
     # A resumed conversation is still a new tmux session. Its predecessor's
     # last lifecycle event must not become the new session's initial badge;
     # clear before launch so the new agent's first hook cannot be lost.
-    server.clear_agent_event(project_name, task_id)
+    server.clear_agent_event(project_name, task_id, agent_name=agent_name or "custom")
+    launched_at = time.time()
     proc = server.run_tmux(tmux_args)
     if proc.returncode != 0:
         stderr = (proc.stderr or proc.stdout or "tmux new-session failed").strip()
         raise SpawnError(f"tmux new-session failed: {stderr}", status=500)
+    server.record_session_started(project_name, task_id, agent_name or "custom", launched_at)
     hold_session_geometry(name)
 
     result = {

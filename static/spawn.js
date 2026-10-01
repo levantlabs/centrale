@@ -15,25 +15,6 @@
     return projectName + "::" + taskId;
   }
 
-  // task-177: derive the project launch gate from the latest board cap
-  // and live tmux sessions on every read. The parsed session identity
-  // avoids counting another project whose name starts the same way.
-  function projectSpawnCapReason(projectName) {
-    var projects = C.boardData && C.boardData.projects || [];
-    var project = projects.find(function (p) { return p.name === projectName; });
-    var cap = project && project.maxAgents;
-    if (!Number.isInteger(cap) || cap < 1) return null;
-    var sessions = C.sessionsData.filter(function (s) {
-      var parsed = C.parseSessionTask(s.name);
-      return parsed && parsed.project === projectName;
-    });
-    if (sessions.length < cap) return null;
-    return "Project " + projectName + " has " + sessions.length + " live agent session" +
-      (sessions.length === 1 ? "" : "s") + " (maxAgents: " + cap + "): " +
-      sessions.map(function (s) { return s.name; }).join(", ") +
-      ". End a session before launching another agent.";
-  }
-
   function refreshSpawnButtons(projectName, taskId) {
     C.renderBoard();
     if (C.currentDrawer && C.currentDrawer.project === projectName && C.currentDrawer.id === taskId) {
@@ -157,11 +138,6 @@
     }
     if (live) return { text: "Session live", disabled: true, confirming: false };
     if (state && state.status === "loading") return { text: "Spawning…", disabled: true, confirming: false };
-    var capReason = projectSpawnCapReason(projectName);
-    if (capReason) {
-      return { text: C.spawnButtonLabel(plan), disabled: true, confirming: false,
-               capReason: capReason, plan: plan };
-    }
 
     var key = spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
@@ -232,7 +208,6 @@
     // (e.g. a stray programmatic click), since the button should never
     // be enabled while tmux is unavailable.
     if (!C.isTmuxAvailable()) return;
-    if (projectSpawnCapReason(projectName)) return;
     // task-171: nothing to launch until an agent is picked (the button is
     // disabled then; this covers a stray programmatic click).
     if (!spawnAgentPlan(C.findTask(projectName, taskId), projectName, taskId).agent) return;
@@ -281,7 +256,6 @@
   // deliberate every time, not just when something else is in the way.
   function handleRespawnClick(projectName, taskId) {
     if (!C.isTmuxAvailable()) return;
-    if (projectSpawnCapReason(projectName)) return;
 
     var key = spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
@@ -313,7 +287,6 @@
   // render together (see armedFor).
   function handleResumeClick(projectName, taskId) {
     if (!C.isTmuxAvailable()) return;
-    if (projectSpawnCapReason(projectName)) return;
 
     var key = spawnKey(projectName, taskId);
     var pending = C.spawnConfirmPending[key];
@@ -335,7 +308,6 @@
   }
 
   function spawnTask(projectName, taskId) {
-    if (projectSpawnCapReason(projectName)) return;
     var key = spawnKey(projectName, taskId);
     C.spawnStates[key] = { status: "loading" };
     C.renderBoard();
@@ -393,7 +365,6 @@
   // ({reconcile: true}) -- the server runs the same resume path with the
   // reconcile prompt instead; nothing else here differs.
   function resumeTask(projectName, taskId, reconcile) {
-    if (projectSpawnCapReason(projectName)) return;
     var key = spawnKey(projectName, taskId);
     C.spawnStates[key] = { status: "loading" };
     C.renderBoard();
@@ -446,7 +417,6 @@
   C.handleRespawnClick = handleRespawnClick;
   C.handleResumeClick = handleResumeClick;
   C.handleSpawnClick = handleSpawnClick;
-  C.projectSpawnCapReason = projectSpawnCapReason;
   C.resumeTask = resumeTask;
   C.renderSpawnAgentPicker = renderSpawnAgentPicker;
   C.spawnAgentPlan = spawnAgentPlan;

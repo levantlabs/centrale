@@ -675,7 +675,7 @@ def probe_spawn_cmd(sleep_seconds=300, marker="itest-probe"):
 # any test can reach it, which is what happened to the whole real-server
 # half of this tier between task-107 landing and task-119 finding it.
 APP_MODULES = ("server.py", "spawn.py", "browser.py", "harvest.py", "settings.py",
-               "centrale_notify.py", "version.py", "orchestrator.py")
+               "centrale_notify.py", "version.py", "orchestrator.py", "fleet.py")
 
 
 def deploy_app(dest_dir):

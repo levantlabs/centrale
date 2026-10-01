@@ -6,8 +6,10 @@ written into the user's home config or the target repo -- see
 server.hooks_settings_payload / spawn._inject_agent_hooks):
 
 - by Claude Code hooks passed inline via ``--settings '<json>'``, as
-  ``python3 centrale_notify.py working|waiting|finished`` (plus whatever
-  extra hook-payload arguments Claude Code itself appends -- ignored);
+  ``python3 centrale_notify.py working|notification|finished`` (plus whatever
+  extra hook-payload arguments Claude Code itself appends -- ignored).
+  The notification mode reads the stdin JSON and only forwards requests
+  for input as waiting; idle reminders and unrelated notifications are ignored;
 - by codex's ``-c notify=[...]`` override, as
   ``python3 centrale_notify.py finished <json-payload>`` -- codex always
   appends one extra JSON argument describing the completed turn, also
@@ -30,6 +32,10 @@ import sys
 import urllib.request
 
 TIMEOUT_SECONDS = 2
+INPUT_NOTIFICATIONS = frozenset({
+    "permission_prompt", "elicitation_dialog", "elicitation_url_dialog",
+    "agent_needs_input",
+})
 
 
 def _post_event(url, state):
@@ -56,6 +62,15 @@ def main(argv):
         return
 
     try:
+        if state == "notification":
+            # Claude sends the notification type on stdin. An idle_prompt
+            # is a delayed reminder about a previous stop, even when a new
+            # turn is already working; it must never overwrite that turn.
+            # Unknown/malformed notifications establish no need for input.
+            payload = json.load(sys.stdin)
+            if payload.get("notification_type") not in INPUT_NOTIFICATIONS:
+                return
+            state = "waiting"
         _post_event(url, state)
     except Exception:
         pass

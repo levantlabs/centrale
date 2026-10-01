@@ -2,6 +2,7 @@
 
 import concurrent.futures
 import http.client
+import io
 import json
 import os
 import subprocess
@@ -15,27 +16,12 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import centrale_notify
 import harvest
 import server
+import spawn
 
-
-class ManualTimer:
-    """Only the timer boundary is fake; callbacks can race cancellation."""
-    def __init__(self, interval, callback):
-        self.interval = interval
-        self.callback = callback
-        self.cancelled = False
-        self.daemon = False
-
-    def start(self):
-        pass
-
-    def cancel(self):
-        self.cancelled = True
-
-    def fire(self):
-        # Model a callback which passed Timer.cancel's check already.
-        self.callback()
+from lifecycle_harness import ManualTimer
 
 
 class OrchestratorHttpTests(unittest.TestCase):
@@ -56,6 +42,7 @@ class OrchestratorHttpTests(unittest.TestCase):
     def setUp(self):
         self.project = uuid.uuid4().hex
         self.other = uuid.uuid4().hex
+        self.config["worktreeRoot"] = "/unused"
         self.config["projects"] = [{"name": name, "path": "/unused"}
                                    for name in (self.project, self.other)]
         server._reset_agent_events()
@@ -76,6 +63,10 @@ class OrchestratorHttpTests(unittest.TestCase):
         ])
         self.capture = capture.start()
         self.addCleanup(capture.stop)
+
+    def confirm_stop(self):
+        with mock.patch.object(server, "capture_session_pane", return_value=["› Ask Codex to do anything"]):
+            self.timers[-1].fire()
 
     def request(self, path, method="GET", body=None, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
@@ -130,6 +121,7 @@ class OrchestratorHttpTests(unittest.TestCase):
     def test_codex_idle_is_not_finished_and_known_kind_is_retained(self):
         self.post_state("finished", kind="codex")
         server.record_agent_event(self.project, "TASK-2", "finished")
+        self.confirm_stop()
         cursor = self.line(self.wait(), "TASK-2 idle (turn ended, may need input)")
         self.line(self.wait(after=cursor), "nothing yet")
         self.post_state("waiting", kind="codex")
@@ -138,7 +130,134 @@ class OrchestratorHttpTests(unittest.TestCase):
         cursor = self.line(self.wait(after=cursor), "TASK-2 waiting for input")
         self.post_state("working", kind="codex")
         self.post_state("finished", kind="codex")
+        self.confirm_stop()
         self.line(self.wait(after=cursor), "TASK-2 idle (turn ended, may need input)")
+
+    def test_nested_stop_stays_working_until_pane_really_settles(self):
+        self.capture.return_value = ["• Working (2m 17s • esc to interrupt)", "›"]
+        self.post_state("working", kind="codex")
+        self.post_state("finished", kind="codex")
+        pending = self.timers[-1]
+        self.assertEqual(pending.interval, 1)
+        self.assertTrue(pending.daemon)
+        self.post_state("finished", kind="codex")  # duplicate notify
+        self.assertIs(self.timers[-1], pending)
+        pending.fire()
+        self.capture.assert_called_with(spawn.session_name(self.project, "TASK-2"), 0)
+        self.assertEqual(server.get_agent_state(self.project, "TASK-2"), "working")
+        cursor = self.line(self.wait(), "nothing yet")
+        self.assert_inbox([])
+        self.confirm_stop()
+        self.assertEqual(server.get_agent_state(self.project, "TASK-2"), "idle")
+        cursor = self.line(self.wait(after=cursor), "TASK-2 idle (turn ended, may need input)")
+        self.assert_inbox(["idle"])
+        self.timers[-1].fire()  # spent callback cannot publish twice
+        self.line(self.wait(after=cursor), "nothing yet")
+
+    def assert_inbox(self, kinds):
+        with mock.patch.object(server, "list_sessions", return_value=[{
+                "name": spawn.session_name(self.project, "TASK-2"), "created": 1}]), \
+             mock.patch.object(server, "read_delivery_log", return_value=([], 0)), \
+             mock.patch.object(server, "_task_view_or_none", return_value={
+                 "task": {"status": "In Progress", "finalSummary": ""}}):
+            status, body, _ = self.request("/api/fleet")
+        self.assertEqual(status, 200, body)
+        self.assertEqual([item["kind"] for item in json.loads(body)["needsYou"]], kinds)
+
+    def test_new_activity_clear_reset_or_kind_change_invalidates_stop(self):
+        for action in ("working", "waiting", "clear", "reset", "kind"):
+            with self.subTest(action=action):
+                self.post_state("finished", kind="codex")
+                pending = self.timers[-1]
+                if action in ("working", "waiting"):
+                    self.post_state(action, kind="codex")
+                elif action == "clear":
+                    server.clear_agent_event(self.project, "TASK-2")
+                elif action == "reset":
+                    server._reset_agent_events()
+                else:
+                    self.post_state("working", kind="claude")
+                pending.fire()
+                self.assertTrue(pending.cancelled)
+                self.line(self.wait(), "nothing yet")
+
+    def test_activity_during_stop_capture_cannot_publish_idle(self):
+        self.post_state("finished", kind="codex")
+        def capture(*args):
+            self.post_state("working", kind="codex")
+            return ["› Ask Codex to do anything"]
+        self.capture.side_effect = capture
+        self.timers[-1].fire()
+        self.assertEqual(server.get_agent_state(self.project, "TASK-2"), "working")
+        self.line(self.wait(), "nothing yet")
+
+    def test_stop_with_real_dialog_publishes_waiting_on_first_check(self):
+        self.post_state("finished", kind="codex")
+        self.timers[-1].fire()
+        self.assertEqual(server.get_agent_state(self.project, "TASK-2"), "waiting")
+        self.line(self.wait(), "TASK-2 waiting for input")
+
+    def test_stop_capture_failure_is_unknown_and_retries_except_gone_session(self):
+        for status in (500, 404):
+            with self.subTest(status=status):
+                self.post_state("working", kind="codex")
+                self.post_state("finished", kind="codex")
+                pending = self.timers[-1]
+                self.capture.side_effect = server.PaneCaptureError("capture failed", status=status)
+                pending.fire()
+                self.assertEqual(server.get_agent_state(self.project, "TASK-2"), "unknown")
+                self.line(self.wait(), "nothing yet")
+                self.assertEqual(self.timers[-1] is pending, status == 404)
+                self.post_state("working", kind="codex")
+        self.capture.side_effect = None
+
+    def test_empty_stop_capture_cannot_claim_idle_and_recovery_is_prompt(self):
+        self.post_state("finished", kind="codex")
+        self.capture.return_value = []
+        self.timers[-1].fire()
+        self.assertEqual(server.get_agent_state(self.project, "TASK-2"), "unknown")
+        self.line(self.wait(), "nothing yet")
+        self.confirm_stop()
+        self.line(self.wait(), "TASK-2 idle (turn ended, may need input)")
+
+    def test_old_working_text_above_footer_cannot_hide_real_stop(self):
+        self.post_state("finished", kind="codex")
+        self.capture.return_value = ["• Working (1s • esc to interrupt)"] + ["response text"] * 12 + ["›"]
+        self.timers[-1].fire()
+        self.line(self.wait(), "TASK-2 idle (turn ended, may need input)")
+
+    def test_new_stop_candidate_cannot_be_completed_by_old_capture(self):
+        self.post_state("finished", kind="codex")
+        old = self.timers[-1]
+        self.post_state("working", kind="codex")
+        self.post_state("finished", kind="codex")
+        old.fire()
+        self.line(self.wait(), "nothing yet")
+        self.confirm_stop()
+        self.line(self.wait(), "TASK-2 idle (turn ended, may need input)")
+
+    def test_claude_idle_reminder_cannot_overwrite_working_or_finished(self):
+        url = f"http://127.0.0.1:{self.port}/api/agent-event?" + urllib.parse.urlencode({
+            "project": self.project, "task": "TASK-2", "agentKind": "claude"})
+        cursor = None
+        for state in ("finished", "working"):
+            self.post_state(state)
+            if state == "finished":
+                cursor = self.line(self.wait(), "TASK-2 finished (ready to review)")
+            with mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": url}), \
+                 mock.patch.object(sys, "stdin", io.StringIO('{"notification_type":"idle_prompt"}')):
+                centrale_notify.main(["notify", "notification"])
+            self.assertEqual(server.get_agent_state(self.project, "TASK-2"), state)
+            self.line(self.wait(after=cursor), "nothing yet")
+            self.assert_inbox([])
+        for kind in ("permission_prompt", "elicitation_dialog", "agent_needs_input"):
+            self.post_state("working")
+            with mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": url}), \
+                 mock.patch.object(sys, "stdin", io.StringIO(json.dumps({"notification_type": kind}))):
+                centrale_notify.main(["notify", "notification"])
+            self.assertEqual(server.get_agent_state(self.project, "TASK-2"), "waiting")
+            cursor = self.line(self.wait(after=cursor), "TASK-2 waiting for input")
+            self.assert_inbox(["permission"])
 
     def test_transient_codex_permission_never_publishes_or_changes_badge_to_waiting(self):
         self.post_state("working", kind="codex")
@@ -227,6 +346,7 @@ class OrchestratorHttpTests(unittest.TestCase):
                 pending = self.timers[-1]
                 if action == "stop":
                     server.record_agent_event(self.project, "TASK-2", "finished")
+                    self.confirm_stop()
                 elif action == "clear":
                     server.clear_agent_event(self.project, "task-2")
                 elif action == "reset":
@@ -420,6 +540,8 @@ class OrchestratorHttpTests(unittest.TestCase):
                 self.assertFalse(result.done())
                 self.assertEqual(self.request("/api/harvest-progress")[0], 200)
                 self.post_state("finished", kind=kind)
+                if kind == "codex":
+                    self.confirm_stop()
                 self.line(result.result(timeout=2), expected)
 
     def test_timeout_is_bounded_and_keeps_the_cursor(self):
