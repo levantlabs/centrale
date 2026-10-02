@@ -331,25 +331,43 @@ the existing worktree, Resume starts a tmux session there running the
 resolved agent's **resume command**, continuing that same dead
 conversation instead:
 
-1. that agent's configured `resumeCmd` (see "Setup / configuration"
-   in [docs/configuration.md](configuration.md#setup--configuration)), if it has one;
-2. else, the family default for an agent Centrale ships, decided by the
-   `cmd`'s first argv element (so `claude-sonnet`/`claude-haiku`-style
-   entries count too, while a wrapper script or an absolute path counts
-   as neither): `["claude", "--continue"]` for `"claude"`, and
-   `["codex", "resume", "--last"]` for `"codex"`, each followed by the
-   agent's own arguments from its `cmd` (task-183) — so `claude-opus`
-   (`["claude", "--model", "opus", "--permission-mode", "auto"]`) resumes as
-   `claude --continue --model opus --permission-mode auto`, and an agent
-   with no arguments resumes with none. Both continue the most
-   recent conversation **in that directory** — codex's picker and
-   `--last` filter by working directory unless `--all` is passed — and
-   since every task gets its own worktree, that is reliably this task's
-   own conversation;
-3. else, a fresh start after all: that agent's own `cmd` with the
-   standard prompt, plus a note that prior work — committed and
-   uncommitted — already exists in the worktree, so the agent knows to
-   check `git status`/`git diff` before continuing rather than redoing it.
+For **Codex** (including aliases and absolute paths whose executable is named
+`codex`), Centrale reads `$CODEX_HOME/sessions` on each request, defaulting to
+`~/.codex/sessions`. Only interactive CLI records whose metadata and recorded
+turn directories match the task's exact worktree are eligible; subagents,
+malformed records and conversations moved to another directory are excluded.
+The most recently written eligible conversation is selected, then launched as
+`codex resume <UUID>` (argv prefix `["codex", "resume", "<UUID>"]`) with the
+agent's configured arguments. Recency is used
+only *within* verified records for this worktree: `--last` is never used.
+With no eligible record, Codex starts fresh with the existing prior-work note.
+Centrale explicitly passes the same `CODEX_HOME` to the new tmux child, so
+an older tmux server cannot substitute its own environment. No Centrale
+session mapping or cache is written (task-195).
+
+A Codex `resumeCmd` refuses with 409: remove it to enable the identity-bound
+built-in path. Session/directory overrides such as `--last`, `--remote`, `--cd`
+and `--worktree` also refuse on Resume. Put ordinary model/config/approval
+options on `cmd`; those still carry through. Wrapper scripts whose executable
+is not named `codex` remain custom agents, outside Codex identity verification.
+
+For other agents the existing priority order is:
+
+1. the agent's configured `resumeCmd`, if present;
+2. `claude --continue` (argv prefix `["claude", "--continue"]`) plus its configured arguments when the executable is
+   literally `claude`;
+3. otherwise a fresh start with the standard workflow prompt and a note that
+   prior committed and uncommitted work already exists in the worktree.
+
+Codex responses include `conversationId` (the selected UUID, or null for a
+fresh start) and `conversationStatus`. A five-second startup check reports
+`resumed` only after observing a normal conversation composer and footer
+(full-screen or inline), with the startup “Resuming session…” screen gone. `fresh` means
+that composer belongs to a newly started conversation; `dialog` or
+`unconfirmed` means startup did not establish a usable conversation, with
+`resumed: false` and an explanatory warning. The pane stays available to
+inspect. `/api/rule` and `/api/deliver` independently check for resume pickers
+and working-directory dialogs and refuse to paste into them.
 
 Neither case 1 nor case 2 passes a prompt argument at all — the resumed
 conversation already has its own context. ("Resume to reconcile", below,
@@ -396,7 +414,7 @@ one informed click:
   same agent resolution, same hook and `CENTRALE_EVENT_URL` injection, and
   the same three resume cases above — with a **reconcile prompt** as the
   trailing argument at every one of them: `resumeCmd` plus the prompt;
-  `claude --continue <prompt>` or `codex resume --last <prompt>` (both
+  `claude --continue <prompt>` or `codex resume <UUID> <prompt>` (both
   CLIs take an optional prompt alongside resume and deliver it into the
   continued conversation); or, when there is nothing to resume, the
   agent's own `cmd` with the prompt plus the same prior-work note a plain
@@ -610,8 +628,10 @@ so restarting the server clears them (which
 [docs/operations.md](operations.md) tells you to do after any merge
 touching Python). A badge rebuilds from the *next* event a session sends —
 and an agent sitting idle at a prompt sends nothing, possibly for hours. So
-one restart can leave every running session reading "state unknown" until
-somebody types into it. Centrale's server has never gated
+one restart could leave every running session reading "state unknown" until
+somebody types into it. Since task-201 a settled `finished`, `idle` or
+`waiting` of the same session comes back from the fleet journal, but a
+session that was `working`, or was recreated, still reads unknown. Centrale's server has never gated
 `POST /api/end-session` on agent state; this rule only ever lived in the
 frontend, and now it matches.
 
@@ -966,8 +986,11 @@ Each call returns one line and exits. Keeping curl hidden in an infinite
 shell loop would prevent the completion notification the master relies on.
 On a transport failure, retry the last handled cursor. On HTTP 409 the
 server has restarted, the project changed, or the cursor is ahead of its
-stream: reconcile from current board/session/branch state, then omit
-`after` to start again. History exists only for the running server process.
+stream: omit `after` to start again. After a restart the first lines
+announce every live session once — its journal-restored state or
+`state unknown after the server restart` — so working through them, plus
+reconciling any action you had in flight, is the full recovery (task-201).
+History exists only for the running server process.
 The [API reference](api.md#get-apiorchestrator-waitprojectnameaftercursortimeoutseconds)
 details the five event kinds, timeouts and cursor rules. Unchanged blocked,
 already-merged and error harvest lines are suppressed per project/task so

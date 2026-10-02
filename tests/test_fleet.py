@@ -48,6 +48,7 @@ class FleetTests(unittest.TestCase):
              mock.patch.object(server, "run_git", return_value=subprocess.CompletedProcess([], 1, "", "")), \
              mock.patch.object(server, "run_backlog", return_value={
                  "schemaVersion": 1, "task": task, "tasks": [task]}) as backlog, \
+             mock.patch.object(server, "parked_status", return_value=None), \
              mock.patch.object(server, "read_delivery_log", return_value=([], 0)):
             result = server.get_fleet(config)
         return result, capture.call_count, backlog.call_args_list
@@ -336,7 +337,12 @@ class FleetTests(unittest.TestCase):
             self.assertEqual(data['agents'][0]['agent'], 'helper')
             self.assertEqual(len(data['merges']), 1)
             self.assertEqual(len(data['messages']), 1)
-            self.assertEqual(tmux.call_count, 1)
+            # One list-sessions, plus one pane capture: this agent is unknown
+            # and ancient, so it is a parked candidate (task-170.3). The
+            # capture shows no dialog and the log row has no time, so it is
+            # not parked.
+            self.assertEqual(tmux.call_count, 2)
+            self.assertIsNone(data['agents'][0]['parked'])
             status, data = request('?window=10')
             self.assertEqual(status, 200)
             self.assertEqual([r['state'] for r in data['history']], ['merged'])

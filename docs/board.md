@@ -100,8 +100,10 @@ the group rather than from each one.
   A `working` agent arms on the first click (`endSessionArmReason`
   spells out why, under the button) and ends on the second; every other
   state, `unknown` included, ends on one click. `unknown` is the state a
-  server restart leaves every running session in — lifecycle badges are
-  in-memory — and it used to be the one state with no button, which left
+  server restart leaves a running session in when the journal cannot vouch
+  for its last state — lifecycle badges are in-memory, and only a settled
+  `finished`, `idle` or `waiting` of the same tmux session instance is
+  restored from the fleet journal (task-201) — and it used to be the one state with no button, which left
   the whole drawer with nothing to click. If there is no End session,
   there is no live session: the badge you are looking at is a
   branch-derived one.
@@ -142,6 +144,19 @@ the group rather than from each one.
   why (`backlog task edit` there fails with `EACCES`) and what to do
   instead (see "Ruling on a spawned task" in
   [docs/agents.md](agents.md#ruling-on-a-spawned-task)).
+- **Acceptance-criteria progress.** A card for a task that has at least one
+  acceptance criterion carries a small, quiet `done/total` count in its
+  badge row (`3/5`), read from the `acceptanceCriteriaCount` and
+  `acceptanceCriteriaCompleted` fields of the board's one
+  `backlog task list --json` — no extra command per load. On a To Do task
+  it is mostly `0/N`, a size hint. A **Done** task whose criteria were not
+  all checked gets the count in amber, with a tooltip saying some criteria
+  were never checked; a Done task with every criterion checked, or with
+  none, shows no highlight. The count is left off entirely for a task with
+  a `task/<id>` branch or a live session: its agent ticks criteria on the
+  branch (the one-writer rule), so main's copy would read `0/N` however
+  far along it is, and reading the branch for live counts is the per-poll
+  cost Centrale deliberately avoids. Centrale only reads these numbers.
 - Cards are sorted by priority (high, medium, low, then unset), then by
   ordinal.
 - **Filter controls**: the sidebar's text search box filters cards
@@ -192,14 +207,32 @@ the group rather than from each one.
 - **Clicking a card** opens a right-side drawer with the task's milestone
   (a "Milestone" row at the top of the summary, shown only when it has
   one), description, acceptance criteria (a read-only checklist reflecting
-  each item's checked state), dependencies (each shown with the resolved
-  status of that dependency from the current board data, or "unknown" if
-  it can't be resolved), and, if present, the implementation plan and
+  each item's checked state), the dependency chain (two sections, "Waiting
+  on" and "Blocks", described next), and, if present, the implementation plan and
   implementation notes. The drawer also has the Spawn button described in
   [docs/agents.md](agents.md#spawning-an-agent).
+- **Waiting on and Blocks.** The drawer reads the `dependencyGraph` that
+  `backlog task view --json` returns for the open task (no extra backlog
+  command; statuses are the main checkout's, never a branch's). *Waiting
+  on* opens with a one-line summary of what must finish ("Ready once
+  TASK-538 and TASK-559 are done. Both are in progress now.") and then the
+  whole transitive chain as an indented tree, each row an id, a status chip
+  and the title. *Blocks* summarises what finishing the task unblocks,
+  lists the direct dependents open-first, and keeps the indirect ones
+  behind a collapsed "Show N further down the chain" line. Rows for tasks
+  on the board are clickable and keyboard-focusable and open that task in
+  the drawer. A node that is not resolved -- a missing or ambiguous
+  reference, or a cycle -- is shown as an amber warning row rather than
+  dropped. A view without `dependencyGraph` (an older backlog) falls back
+  to the plain "Dependencies" list of direct dependencies.
+
+  ![A task drawer with acceptance criteria, Waiting on and Blocks](img/drawer-deps.png)
+
 - **Self-announcing sections.** Every section of that summary carries a
   header that says what it holds without scrolling to it: acceptance
-  criteria as a checked/total count ("2/6"), dependencies as a count,
+  criteria as a checked/total count ("2/6"), dependencies as a count
+  (open prerequisites for "Waiting on", direct and further dependents for
+  "Blocks"),
   and description/plan/notes as a word count. Clicking a header folds
   that section away and unfolds it again, so one long description can't
   push the rest of the ticket out of view — useful when a live session
@@ -308,7 +341,13 @@ the group rather than from each one.
   cancels the agent's menu rather than closing the drawer); or click a
   numbered option line and Centrale sends the arrow presses from the
   highlighted option (`❯` / `›`) to that line, then one Enter. Clicking
-  anywhere that is not a menu option sends nothing.
+  anywhere that is not a menu option sends nothing. **In the reply box,**
+  Up/Down also reach the agent, but only while the box is empty (an empty
+  box has nothing for an arrow to move); once you have typed a draft the
+  arrows stay with the box's cursor and the status line under it says so
+  instead of the press looking dead. Enter in the box is always the text
+  (an empty box refuses it); use the **Enter** button or the focused
+  session view to press Enter itself.
   Be aware the pane is a *polled capture*,
   so the prompt can move on between the capture and your keystroke; that
   is mitigated, not solved: the capture age sits right next to the input,

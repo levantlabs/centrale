@@ -53,7 +53,10 @@
           ],
           "ordinal": 2000,
           "createdAt": "2024-01-05T09:00:00Z",
-          "updatedAt": "2024-01-05T13:58:00Z"
+          "updatedAt": "2024-01-05T13:58:00Z",
+          "dependencies": [
+            "TASK-1"
+          ]
         },
         {
           "id": "TASK-3",
@@ -65,7 +68,10 @@
           "labels": [],
           "ordinal": 3000,
           "createdAt": "2024-01-05T09:05:00Z",
-          "updatedAt": null
+          "updatedAt": null,
+          "dependencies": [
+            "TASK-2"
+          ]
         },
         {
           "id": "TASK-4",
@@ -80,12 +86,14 @@
           ],
           "ordinal": 4000,
           "createdAt": "2024-01-05T09:10:00Z",
-          "updatedAt": null
+          "updatedAt": null,
+          "dependencies": [
+            "TASK-3"
+          ]
         }
       ],
       "ready": [
-        "TASK-2",
-        "TASK-3"
+        "TASK-2"
       ],
       "views": {
         "TASK-4": {
@@ -93,6 +101,18 @@
             {
               "author": "@claude",
               "body": "The checkout test fails about one run in twenty on CI. Should I quarantine it behind a retry now, or hold the release until the race is found?"
+            }
+          ],
+          "acceptanceCriteria": [
+            {
+              "index": 1,
+              "text": "Root cause of the race identified",
+              "checked": true
+            },
+            {
+              "index": 2,
+              "text": "Fix or documented quarantine merged",
+              "checked": false
             }
           ]
         },
@@ -112,6 +132,47 @@
             }
           ],
           "implementationPlan": "1. Reproduce with a seeded table.\n2. Fix the slice bound.\n3. Add the regression test.",
+          "implementationNotes": null
+        },
+        "TASK-1": {
+          "acceptanceCriteria": [
+            {
+              "index": 1,
+              "text": "Toggle in the settings panel",
+              "checked": true
+            },
+            {
+              "index": 2,
+              "text": "Choice survives a reload",
+              "checked": true
+            },
+            {
+              "index": 3,
+              "text": "Charts follow the theme",
+              "checked": false
+            }
+          ]
+        },
+        "TASK-3": {
+          "description": "New contributors keep asking the same five questions. Write a checklist that answers them and link it from the README.",
+          "acceptanceCriteria": [
+            {
+              "index": 1,
+              "text": "Checklist covers setup, tests and the review process",
+              "checked": false
+            },
+            {
+              "index": 2,
+              "text": "Linked from the README",
+              "checked": false
+            },
+            {
+              "index": 3,
+              "text": "A new contributor has walked through it",
+              "checked": false
+            }
+          ],
+          "implementationPlan": null,
           "implementationNotes": null
         }
       },
@@ -207,7 +268,27 @@
         "TASK-3",
         "TASK-4"
       ],
-      "views": {},
+      "views": {
+        "TASK-3": {
+          "acceptanceCriteria": [
+            {
+              "index": 1,
+              "text": "Public functions annotated",
+              "checked": true
+            },
+            {
+              "index": 2,
+              "text": "mypy passes on the parser package",
+              "checked": false
+            },
+            {
+              "index": 3,
+              "text": "No behaviour change",
+              "checked": false
+            }
+          ]
+        }
+      },
       "branchViews": {}
     }
   ],
@@ -282,7 +363,7 @@
       "",
       "  $ python3 -m build --wheel",
       "",
-      "\u203a 1. Yes, proceed (y)",
+      "› 1. Yes, proceed (y)",
       "  2. Yes, and don't ask again for commands that start with `python3 -m build` (p)",
       "  3. No, and tell Codex what to do differently (esc)",
       "",
@@ -291,14 +372,14 @@
     "centrale-my-lib-task-4": [
       "> Improve the error message when the config file is invalid.",
       "",
-      "\u25cf Read(src/config/loader.py)",
-      "  \u23bf  Read 88 lines",
+      "● Read(src/config/loader.py)",
+      "  ⎿  Read 88 lines",
       "",
-      "\u25cf The loader raises a bare KeyError for a missing field. I'll name the",
+      "● The loader raises a bare KeyError for a missing field. I'll name the",
       "  field and the file in a ConfigError instead.",
       "",
-      "\u25cf Update(src/config/loader.py)",
-      "  \u23bf  Updated 3 additions and 1 removal",
+      "● Update(src/config/loader.py)",
+      "  ⎿  Updated 3 additions and 1 removal",
       "",
       ">"
     ]
@@ -306,28 +387,156 @@
   "fleet": {
     "_readme": "Journal rows for the Fleet and Timeline views, as seconds before pageNowEpoch. The live agents' current state comes from sessions[]; these rows are the history behind it.",
     "history": [
-      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "spawn", "ago": 6000},
-      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "working", "ago": 5940},
-      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "waiting", "ago": 4800},
-      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "working", "ago": 4500},
-      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "finished", "ago": 3600},
-      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "merged", "ago": 3300},
-      {"project": "my-app", "task": "TASK-1", "agent": "claude", "state": "session ended", "ago": 3290},
-      {"project": "my-app", "task": "TASK-2", "agent": "claude", "state": "spawn", "ago": 2940},
-      {"project": "my-app", "task": "TASK-2", "agent": "claude", "state": "working", "ago": 2880},
-      {"project": "my-app", "task": "TASK-2", "agent": "claude", "state": "waiting", "ago": 1800},
-      {"project": "my-app", "task": "TASK-2", "agent": "claude", "state": "working", "ago": 1080},
-      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "spawn", "ago": 5400},
-      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "working", "ago": 5340},
-      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "idle", "ago": 2700},
-      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "merge blocked", "ago": 1500,
-       "harvest": {"reason": "the project's test command failed on the merged tree"}},
-      {"project": "my-lib", "task": "TASK-1", "agent": "codex", "state": "session ended", "ago": 1490},
-      {"project": "my-lib", "task": "TASK-2", "agent": "codex", "state": "spawn", "ago": 2700},
-      {"project": "my-lib", "task": "TASK-2", "agent": "codex", "state": "working", "ago": 2640},
-      {"project": "my-lib", "task": "TASK-2", "agent": "codex", "state": "waiting", "ago": 540},
-      {"project": "my-lib", "task": "TASK-4", "agent": "claude", "state": "spawn", "ago": 1800},
-      {"project": "my-lib", "task": "TASK-4", "agent": "claude", "state": "working", "ago": 1680}
+      {
+        "project": "my-app",
+        "task": "TASK-1",
+        "agent": "claude",
+        "state": "spawn",
+        "ago": 6000
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-1",
+        "agent": "claude",
+        "state": "working",
+        "ago": 5940
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-1",
+        "agent": "claude",
+        "state": "waiting",
+        "ago": 4800
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-1",
+        "agent": "claude",
+        "state": "working",
+        "ago": 4500
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-1",
+        "agent": "claude",
+        "state": "finished",
+        "ago": 3600
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-1",
+        "agent": "claude",
+        "state": "merged",
+        "ago": 3300
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-1",
+        "agent": "claude",
+        "state": "session ended",
+        "ago": 3290
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-2",
+        "agent": "claude",
+        "state": "spawn",
+        "ago": 2940
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-2",
+        "agent": "claude",
+        "state": "working",
+        "ago": 2880
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-2",
+        "agent": "claude",
+        "state": "waiting",
+        "ago": 1800
+      },
+      {
+        "project": "my-app",
+        "task": "TASK-2",
+        "agent": "claude",
+        "state": "working",
+        "ago": 1080
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-1",
+        "agent": "codex",
+        "state": "spawn",
+        "ago": 5400
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-1",
+        "agent": "codex",
+        "state": "working",
+        "ago": 5340
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-1",
+        "agent": "codex",
+        "state": "idle",
+        "ago": 2700
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-1",
+        "agent": "codex",
+        "state": "merge blocked",
+        "ago": 1500,
+        "harvest": {
+          "reason": "the project's test command failed on the merged tree"
+        }
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-1",
+        "agent": "codex",
+        "state": "session ended",
+        "ago": 1490
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-2",
+        "agent": "codex",
+        "state": "spawn",
+        "ago": 2700
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-2",
+        "agent": "codex",
+        "state": "working",
+        "ago": 2640
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-2",
+        "agent": "codex",
+        "state": "waiting",
+        "ago": 540
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-4",
+        "agent": "claude",
+        "state": "spawn",
+        "ago": 1800
+      },
+      {
+        "project": "my-lib",
+        "task": "TASK-4",
+        "agent": "claude",
+        "state": "working",
+        "ago": 1680
+      }
     ]
   },
   "shots": [
@@ -347,6 +556,13 @@
       "theme": "light",
       "project": "my-app",
       "task": "TASK-2"
+    },
+    {
+      "name": "drawer-deps",
+      "kind": "drawer-deps",
+      "theme": "light",
+      "project": "my-app",
+      "task": "TASK-3"
     },
     {
       "name": "view-needs-you-light",

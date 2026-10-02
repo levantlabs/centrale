@@ -7,7 +7,7 @@
   var pending = {};                 // only input requests currently in flight
   var messages = {};                // transient input outcomes, never verdicts
   var labels = {permission: "Permission or menu", merge: "Merge needs recheck",
-    message: "Held or undelivered message", idle: "Agent may need input", owner: "Owner question"};
+    message: "Held or undelivered message", idle: "Agent may need input", parked: "Parked", owner: "Owner question"};
 
   function key(item) { return item.kind + ":" + item.project + ":" + item.taskId; }
   function items(snapshot) { return snapshot && snapshot.needsYou || []; }
@@ -97,6 +97,7 @@
   var details = {permission: "Pick an answer. It goes to the agent as arrow keys and Enter.",
     merge: "The last merge attempt did not go through.",
     message: "Centrale could not deliver this message.",
+    parked: "Idle behind a dialog or an undelivered message. The pane's last line is quoted. Attach or open the task to answer.",
     idle: "The agent stopped without reporting finished. It may be asking something in plain text.",
     owner: "A question labeled for the owner."};
   var WAIT_CAP = 30 * 60;   // seconds of waiting that fill the urgency bar

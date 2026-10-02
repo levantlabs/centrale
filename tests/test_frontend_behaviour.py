@@ -440,6 +440,22 @@ function menuKeyboardAndClick() {
       return settle().then(function () { out.otherKeys = bodies.length - before; });
     });
   }).then(function () {
+    // task-203: the reply box forwards Up/Down only while it is empty.
+    var box = C.byId("drawer-pane-reply-input");
+    var before = bodies.length;
+    box.value = "";
+    box.dispatch("keydown", { key: "ArrowUp" });
+    return settle().then(function () {
+      out.boxEmptyArrow = bodies.slice(before);
+      advance(1000);
+      before = bodies.length;
+      box.value = "draft";
+      box.dispatch("keydown", { key: "ArrowDown" });
+      return settle().then(function () {
+        out.boxDraftArrow = { sent: bodies.length - before, status: replyStatus() };
+      });
+    });
+  }).then(function () {
     var menu = [
       "Do you want to proceed?",
       "\u276f 1. Yes",
@@ -818,6 +834,13 @@ class LivePaneBehaviourTests(unittest.TestCase):
                          [{"project": "my-tool", "taskId": "TASK-77", "key": "Down"}])
         self.assertEqual(self.out["otherKeys"], 0)
 
+    def test_the_reply_box_forwards_arrows_only_while_empty_and_says_so_otherwise(self):
+        self.assertEqual(self.out["boxEmptyArrow"],
+                         [{"project": "my-tool", "taskId": "TASK-77", "key": "Up"}])
+        self.assertEqual(self.out["boxDraftArrow"]["sent"], 0)
+        self.assertIn("clear it to send them to the agent",
+                      self.out["boxDraftArrow"]["status"])
+
     def test_a_click_maps_to_arrows_from_the_highlight_then_one_enter(self):
         menu = self.out["menu"]
         self.assertEqual(menu["down2"], ["Down", "Down", "Enter"])
@@ -1101,7 +1124,14 @@ var SCENARIOS = [
   { name: "liveExternal", opts: { checkout: EXTERNAL, dirty: true, live: "working" } },
   { name: "badge", opts: {} },
   // task-172: spawned, so main's copy of its task file is read-only.
-  { name: "locked", opts: { locked: true } }
+  { name: "locked", opts: { locked: true } },
+  // task-200: criteria progress, all with no branch unless said otherwise.
+  { name: "acTodo", opts: { hasSpawnBranch: false, status: "To Do", ac: [0, 4] } },
+  { name: "acDoneGap", opts: { hasSpawnBranch: false, status: "Done", ac: [3, 5] } },
+  { name: "acDoneFull", opts: { hasSpawnBranch: false, status: "Done", ac: [5, 5] } },
+  { name: "acDoneNone", opts: { hasSpawnBranch: false, status: "Done", ac: [0, 0] } },
+  { name: "acBranch", opts: { status: "Done", ac: [0, 5] } },
+  { name: "acLive", opts: { hasSpawnBranch: false, status: "In Progress", ac: [0, 5], live: "working" } }
 ];
 
 function build(name) {
@@ -1109,7 +1139,9 @@ function build(name) {
   for (; i < SCENARIOS.length; i++) if (SCENARIOS[i].name === name) break;
   var opts = SCENARIOS[i].opts;
   return {
-    id: "TASK-" + (i + 1), title: "A task", status: "In Progress", ready: true,
+    id: "TASK-" + (i + 1), title: "A task", status: opts.status || "In Progress", ready: true,
+    acceptanceCriteriaCompleted: opts.ac ? opts.ac[0] : undefined,
+    acceptanceCriteriaCount: opts.ac ? opts.ac[1] : undefined,
     hasSpawnBranch: "hasSpawnBranch" in opts ? opts.hasSpawnBranch : true,
     alreadyMerged: !!opts.alreadyMerged,
     worktreeDirty: !!opts.dirty,
@@ -1432,6 +1464,31 @@ class ExternalBranchBehaviourTests(unittest.TestCase):
                          [{"text": "Worked externally", "disabled": True,
                            "title": self.out["reason"]}])
         self.assertEqual(self.out["clicks"]["mergedExternal"], [])
+
+    # -- task-200: acceptance-criteria progress on the card --
+
+    def _ac(self, scenario):
+        return [(b["className"], b["text"], b["title"])
+                for b in self.out["cards"][scenario]["badges"]
+                if b["className"].startswith("card-ac")]
+
+    def test_a_card_with_criteria_shows_done_over_total(self):
+        self.assertEqual(self._ac("acTodo"),
+                         [("card-ac", "0/4", "0 of 4 acceptance criteria checked")])
+
+    def test_a_done_task_with_unchecked_criteria_is_highlighted_with_a_tooltip(self):
+        [(cls, text, title)] = self._ac("acDoneGap")
+        self.assertEqual((cls, text), ("card-ac card-ac-gap", "3/5"))
+        self.assertIn("never checked", title)
+
+    def test_a_done_task_with_all_or_no_criteria_is_not_highlighted(self):
+        self.assertEqual([c for c, _, _ in self._ac("acDoneFull")], ["card-ac"])
+        self.assertEqual(self._ac("acDoneNone"), [])
+        self.assertEqual(self._ac("centrale"), [])  # counts absent entirely
+
+    def test_a_spawned_task_shows_no_count_from_main(self):
+        self.assertEqual(self._ac("acBranch"), [])  # branch, even though Done
+        self.assertEqual(self._ac("acLive"), [])    # live session, no branch
 
     # -- the drawer --
 
@@ -3227,6 +3284,241 @@ class DrawerSectionRenderTests(unittest.TestCase):
         # An empty section says so in its body rather than in a count.
         self.assertEqual(
             {s["key"]: s["bodyText"] for s in out["initial"]}["dependencies"], "None.")
+
+
+# ---------------------------------------------------------------------
+# task-202: the drawer's "Waiting on" and "Blocks" sections
+# ---------------------------------------------------------------------
+
+DEPENDENCY_GRAPH_DRIVER_JS = r"""
+var fs = require("fs");
+var path = require("path");
+var vm = require("vm");
+
+var STATIC = process.argv[1];
+["state.js", "dom.js", "tasks.js", "board.js", "spawn.js", "harvest.js", "drawer.js"].forEach(function (name) {
+  vm.runInThisContext(fs.readFileSync(path.join(STATIC, name), "utf8"), { filename: name });
+});
+var C = window.Centrale;
+C.syncDrawerPanePolling = function () {};
+C.renderBoard = function () {};
+C.renderSessionsPanel = function () {};
+C.showToast = function () {};
+
+var CASE = JSON.parse(process.argv[2]);
+var fetched = [];
+global.fetch = function (url) {
+  fetched.push(url);
+  return Promise.resolve({ ok: true, status: 200, json: function () {
+    return Promise.resolve({ task: CASE.task, branchTask: null });
+  } });
+};
+
+var tasks = CASE.onBoard.map(function (id) {
+  return { id: id, title: "Board " + id, status: "To Do", ready: false,
+           hasSpawnBranch: false, alreadyMerged: false };
+});
+var ROOT = { id: CASE.task.id, title: CASE.task.title, status: CASE.task.status,
+             ready: false, hasSpawnBranch: false, alreadyMerged: false };
+var PROJECT = { name: "my-app", tasks: tasks.concat([ROOT]), statuses: ["To Do", "In Progress", "Done"] };
+C.knownProjects.length = 0;
+C.knownProjects.push("my-app");
+C.boardData = { projects: [PROJECT], capabilities: { tmux: true } };
+C.sessionsData = [];
+
+function section(key) {
+  var hit = document.getElementById("drawer-body").childNodes.filter(function (n) {
+    return n.attrs && n.attrs["data-section"] === key;
+  });
+  return hit[0] || null;
+}
+function rowsOf(s) {
+  return s ? s.querySelectorAll(".dep-row").map(function (r) {
+    return { id: r.childNodes[0].textContent, chip: r.childNodes[1].textContent,
+             title: r.childNodes[2].textContent, cls: r.className,
+             linked: r.getAttribute("data-dep") !== null,
+             tabindex: r.getAttribute("tabindex") };
+  }) : null;
+}
+function tick() { return new Promise(function (r) { setTimeout(r, 0); }); }
+
+var out = {};
+C.openDrawer(PROJECT, ROOT);
+tick().then(function () {
+  var keys = document.getElementById("drawer-body").childNodes
+    .filter(function (n) { return n.attrs && n.attrs["data-section"]; })
+    .map(function (n) { return n.attrs["data-section"]; });
+  out.keys = keys;
+  var w = section("waitingOn"), b = section("blocks"), d = section("dependencies");
+  out.waitHeader = w ? w.childNodes[0].textContent : null;
+  out.waitText = w ? w.childNodes[1].textContent : null;
+  out.waitRows = rowsOf(w);
+  out.blocksHeader = b ? b.childNodes[0].textContent : null;
+  out.blocksText = b ? b.childNodes[1].textContent : null;
+  out.blocksRows = rowsOf(b);
+  out.directText = d ? d.childNodes[1].textContent : null;
+  out.directRows = d ? d.querySelectorAll(".dep-item").length : null;
+  var more = b ? b.querySelectorAll("button.dep-more")[0] : null;
+  if (more) {
+    out.moreBefore = more.textContent;
+    out.hiddenBefore = b.querySelectorAll(".dep-further-list")[0].hidden;
+    more.click();
+    out.moreAfter = more.textContent;
+    out.hiddenAfter = b.querySelectorAll(".dep-further-list")[0].hidden;
+  }
+  // Click the first linked row, then the keyboard path on another.
+  var linked = document.getElementById("drawer-body").querySelectorAll("[data-dep]");
+  out.linkedIds = linked.map(function (r) { return r.getAttribute("data-dep"); });
+  fetched.length = 0;
+  if (linked.length) linked[0].click();
+  return tick();
+}).then(function () {
+  out.afterClick = fetched.slice();
+  fetched.length = 0;
+  var linked = document.getElementById("drawer-body").querySelectorAll("[data-dep]");
+  return tick().then(function () {
+    linked = document.getElementById("drawer-body").querySelectorAll("[data-dep]");
+    if (linked.length) linked[linked.length - 1].key("Enter");
+    return tick();
+  }).then(function () { out.afterEnter = fetched.slice(); });
+}).then(function () {
+  console.log(JSON.stringify(out));
+});
+"""
+
+
+def _node(id_, title, status, state="resolved", completed=None, **extra):
+    n = {"id": id_, "title": title, "status": status, "state": state,
+         "completed": status == "Done" if completed is None else completed,
+         "dependencyDepth": None, "dependentDepth": None}
+    n.update(extra)
+    return n
+
+
+class DependencyGraphDrawerTests(unittest.TestCase):
+    """AC #1-#3: built from the view's dependencyGraph alone."""
+
+    def _run(self, task, on_board=()):
+        payload = json.dumps({"task": task, "onBoard": list(on_board)})
+        return js_harness.run_driver(self, DEPENDENCY_GRAPH_DRIVER_JS, payload, timeout=30)
+
+    def _task(self, graph, deps=()):
+        task = {"id": "TASK-569", "title": "Root", "status": "To Do",
+                "description": "d", "acceptanceCriteria": [],
+                "dependencies": list(deps)}
+        if graph is not None:
+            task["dependencyGraph"] = graph
+        return task
+
+    @js_harness.requires_node
+    def test_waiting_on_is_an_indented_chain_with_a_summary(self):
+        graph = {"root": "TASK-569", "nodes": [
+            _node("TASK-569", "Root", "To Do"),
+            _node("TASK-538", "Bump the pin", "In Progress"),
+            _node("TASK-517", "No-port test", "Done"),
+            _node("TASK-559", "Spec anchors", "In Progress"),
+        ], "edges": [
+            {"from": "TASK-569", "to": "TASK-538"},
+            {"from": "TASK-538", "to": "TASK-517"},
+            {"from": "TASK-569", "to": "TASK-559"},
+        ]}
+        out = self._run(self._task(graph, ["TASK-538", "TASK-559"]),
+                        on_board=["TASK-538", "TASK-517", "TASK-559"])
+        self.assertEqual(out["keys"], ["description", "acceptanceCriteria", "waitingOn", "blocks"])
+        self.assertEqual(out["waitHeader"], "Waiting on2 open")
+        self.assertIn("Ready once TASK-538 and TASK-559 are done. Both are in progress now.",
+                      out["waitText"])
+        self.assertEqual([r["id"] for r in out["waitRows"]], ["TASK-538", "TASK-517", "TASK-559"])
+        self.assertIn("depth-1", out["waitRows"][1]["cls"])
+        self.assertNotIn("depth-", out["waitRows"][0]["cls"])
+        self.assertIn("done", out["waitRows"][1]["cls"].split())
+        self.assertEqual(out["waitRows"][0]["chip"], "In Progress")
+        self.assertEqual(out["waitRows"][0]["title"], "Bump the pin")
+        self.assertEqual(out["blocksHeader"], "Blocks0")
+        self.assertIn("Nothing waits on this task.", out["blocksText"])
+
+    @js_harness.requires_node
+    def test_blocks_lists_open_dependents_first_and_folds_the_indirect_ones(self):
+        nodes = [_node("TASK-409", "Root", "In Progress"),
+                 _node("TASK-11", "Done direct", "Done"),
+                 _node("TASK-12", "Open direct", "In Progress"),
+                 _node("TASK-13", "Open direct two", "To Do"),
+                 _node("TASK-20", "Further", "To Do"),
+                 _node("TASK-21", "Further two", "Done")]
+        edges = [{"from": "TASK-11", "to": "TASK-409"},
+                 {"from": "TASK-12", "to": "TASK-409"},
+                 {"from": "TASK-13", "to": "TASK-409"},
+                 {"from": "TASK-20", "to": "TASK-12"},
+                 {"from": "TASK-21", "to": "TASK-20"}]
+        task = self._task({"root": "TASK-409", "nodes": nodes, "edges": edges})
+        task["id"] = "TASK-409"
+        out = self._run(task, on_board=["TASK-11", "TASK-12", "TASK-13", "TASK-20"])
+        self.assertEqual(out["waitHeader"], "Waiting on0")
+        self.assertIn("Nothing. This task can proceed.", out["waitText"])
+        self.assertEqual(out["blocksHeader"], "Blocks3 direct · 2 further")
+        self.assertIn("Finishing this unblocks 2 open tasks directly; 1 of the 3 is already done.",
+                      out["blocksText"])
+        direct = [r["id"] for r in out["blocksRows"]][:3]
+        self.assertEqual(direct, ["TASK-12", "TASK-13", "TASK-11"])
+        self.assertEqual(out["moreBefore"], "Show 2 further down the chain (20, 21)")
+        self.assertIs(out["hiddenBefore"], True)
+        self.assertEqual(out["moreAfter"], "Hide the 2 further down the chain")
+        self.assertIs(out["hiddenAfter"], False)
+
+    @js_harness.requires_node
+    def test_rows_open_the_linked_task_by_click_and_keyboard(self):
+        graph = {"root": "TASK-569", "nodes": [
+            _node("TASK-569", "Root", "To Do"),
+            _node("TASK-538", "A", "In Progress"),
+            _node("TASK-559", "B", "In Progress"),
+        ], "edges": [{"from": "TASK-569", "to": "TASK-538"},
+                     {"from": "TASK-569", "to": "TASK-559"}]}
+        out = self._run(self._task(graph), on_board=["TASK-538", "TASK-559"])
+        self.assertEqual(out["linkedIds"], ["TASK-538", "TASK-559"])
+        self.assertTrue(all(r["linked"] and r["tabindex"] == "0" for r in out["waitRows"]))
+        self.assertEqual(len(out["afterClick"]), 1)
+        self.assertIn("id=TASK-538", out["afterClick"][0])
+        self.assertEqual(len(out["afterEnter"]), 1)
+        self.assertIn("id=TASK-559", out["afterEnter"][0])
+
+    @js_harness.requires_node
+    def test_unresolved_and_cyclic_nodes_show_as_warnings(self):
+        graph = {"root": "TASK-1", "nodes": [
+            _node("TASK-1", "Root", "To Do"),
+            _node("TASK-2", "Ghost", None, state="missing", completed=False),
+            _node("TASK-3", "Twin", None, state="ambiguous", completed=False),
+            _node("TASK-4", "Loop", "To Do"),
+            _node("TASK-5", "Waits on root", "To Do"),
+        ], "edges": [
+            {"from": "TASK-1", "to": "TASK-2"},
+            {"from": "TASK-1", "to": "TASK-3"},
+            {"from": "TASK-1", "to": "TASK-4"},
+            {"from": "TASK-4", "to": "TASK-1"},
+            {"from": "TASK-5", "to": "TASK-1"},
+        ]}
+        task = self._task(graph)
+        task["id"] = "TASK-1"
+        out = self._run(task)
+        rows = {r["id"]: r for r in out["waitRows"]}
+        self.assertEqual(rows["TASK-2"]["chip"], "missing")
+        self.assertEqual(rows["TASK-3"]["chip"], "ambiguous")
+        self.assertIn("warn", rows["TASK-2"]["cls"].split())
+        self.assertIn("warn", rows["TASK-3"]["cls"].split())
+        # TASK-4 depends back on the root: listed once under the root's
+        # needs, and the walk back to TASK-1 is a visible cycle warning.
+        self.assertEqual([r["id"] for r in out["waitRows"]],
+                         ["TASK-2", "TASK-3", "TASK-4", "TASK-1"])
+        self.assertEqual(rows["TASK-1"]["chip"], "cycle")
+        self.assertEqual(out["waitHeader"], "Waiting on1 open")
+
+    @js_harness.requires_node
+    def test_a_view_without_the_graph_keeps_the_direct_list(self):
+        out = self._run(self._task(None, ["TASK-538"]), on_board=["TASK-538"])
+        self.assertEqual(out["keys"], ["description", "acceptanceCriteria", "dependencies"])
+        self.assertEqual(out["directRows"], 1)
+        self.assertIn("TASK-538", out["directText"])
+        self.assertIsNone(out["waitRows"])
+        self.assertIsNone(out["blocksRows"])
 
 
 # ---------------------------------------------------------------------
@@ -8389,3 +8681,62 @@ class ViewMotionStylesheetTests(unittest.TestCase):
         # waiting is solid in the summary bar and its stripes are still
         # elsewhere: the marching motion was distracting (owner, 2026-09-30)
         self.assertNotIn("view-march", css)
+
+
+# ---------------------------------------------------------------------
+# task-170.3: a parked session reads PARKED on its sidebar row
+# ---------------------------------------------------------------------
+
+PARKED_BADGE_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "board.js",
+                      "spawn.js", "harvest.js", "sessions.js"]);
+C.openDrawer = function () {};
+C.copyText = function () {};
+C.isTmuxAvailable = function () { return true; };
+C.boardData = { projects: [], capabilities: { tmux: true } };
+
+function rows(sessions) {
+  C.sessionsData = sessions;
+  C.renderSessionsPanel();
+  var found = [];
+  (function walk(n) {
+    if (String(n.className || "").indexOf("agent-badge") === 0) {
+      found.push({ cls: n.className, text: n.textContent, title: n.title || "" });
+    }
+    n.childNodes.forEach(walk);
+  })(C.byId("sessions-list"));
+  var lines = [];
+  (function walk(n) {
+    if (/^last line:/.test(n.textContent || "") && !n.childNodes.length) lines.push(n.textContent);
+    n.childNodes.forEach(walk);
+  })(C.byId("sessions-list"));
+  return { badges: found, lines: lines };
+}
+
+var out = {
+  parked: rows([{ name: "centrale-app-task-1", agentState: "finished",
+                  parked: { reason: "dialog on the pane", lastLine: "Press enter to continue" } }]),
+  finished: rows([{ name: "centrale-app-task-1", agentState: "finished", parked: null }]),
+  fieldless: rows([{ name: "centrale-app-task-1", agentState: "finished" }])
+};
+process.stdout.write(JSON.stringify(out));
+"""
+
+
+@js_harness.requires_node
+class ParkedBadgeBehaviourTests(unittest.TestCase):
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, PARKED_BADGE_DRIVER_JS)
+
+    def test_a_parked_session_shows_parked_and_its_last_line(self):
+        parked = self.out["parked"]
+        self.assertEqual([b["text"] for b in parked["badges"]], ["PARKED"])
+        self.assertIn("Press enter to continue", parked["badges"][0]["title"])
+        self.assertEqual(parked["lines"], ["last line: Press enter to continue"])
+
+    def test_a_finished_session_is_not_parked(self):
+        for case in ("finished", "fieldless"):
+            with self.subTest(case):
+                self.assertEqual([b["text"] for b in self.out[case]["badges"]], ["finished"])
+                self.assertEqual(self.out[case]["lines"], [])

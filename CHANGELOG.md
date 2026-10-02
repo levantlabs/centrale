@@ -23,6 +23,69 @@ would protect is the shape of `projects.json`, the `/api` endpoints
 documented in [docs/api.md](docs/api.md), and what a spawned agent is
 handed.
 
+## v0.4.0 — parked agents, restart-safe states
+
+Agents that are stuck now say so, the board shows more of what a task
+needs, and restarting Centrale no longer loses what it knew about your
+running agents.
+
+Tested against **`backlog` v1.53.0**, up from v1.51.0. The full suite, the
+real-process integration tier, and a real spawn, claim, branch-side edit
+and gated merge all ran against 1.53.0. Centrale's board reads (`task
+list --json`, `milestone list`) are not cut short by 1.53's new paging
+options, which are opt-in: a 320-task project returns every task. Entries
+in earlier versions naming 1.51.0 are correct history.
+
+**New:**
+
+- **PARKED agents.** An agent that is idle behind a permission dialog or
+  an undelivered message is marked PARKED on its session badge and listed
+  in Needs you, instead of looking merely idle. `parkedAfterSeconds` in
+  `projects.json` sets how long it must sit there first.
+- **Dependency chains in the task drawer.** **Waiting on** shows
+  everything a task transitively depends on, **Blocks** everything that
+  transitively waits on it, read from `backlog`'s `dependencyGraph`. An
+  unknown or ambiguous task id shows as a warning row, never as a
+  satisfied dependency.
+- **Criteria progress on cards.** A card shows how many acceptance
+  criteria are checked (`3/5`). A **Done** task with unchecked criteria
+  shows the count in amber.
+- **Restart-safe agent states.** See the next section.
+
+**Changed:**
+
+- **Restarting Centrale keeps what it knew about live agents.** Agents
+  whose tmux session is the same one as before the restart get their last
+  settled state (finished, idle or waiting) back instead of showing
+  unknown (an agent that was mid-work still shows unknown);
+  every live session is announced to `GET /api/orchestrator-wait` so an
+  orchestrator's cursor does not miss it; and hook events that arrive
+  while the server is coming back are retried for up to 8 seconds. This
+  is a deliberate exception to deriving state fresh on every read,
+  written down in [MANIFESTO.md](MANIFESTO.md#derive-do-not-remember),
+  and it applies only to the same tmux session instance: a new session
+  never inherits an old state.
+- **Resuming a Codex agent continues only that task's own conversation.**
+  The conversation is identified by its UUID and verified to belong to
+  that worktree, instead of `codex resume --last`, which picked whichever
+  session the machine had used most recently, possibly another task's.
+  `POST /api/resume` reports `conversationId` and `conversationStatus`,
+  and a Codex `resumeCmd` that would bypass this is now refused.
+- **Readiness comes from the task list.** The board reads each task's
+  `isReady` from the one `task list --json`, and the second
+  `task list --ready` run is gone, so a board refresh is one CLI call
+  fewer.
+- **Arrow keys reach the agent from the reply box.** With an empty reply
+  box, Up and Down go to the agent (to move through a menu or its input
+  history), and the box keeps focus after you send.
+- **Tested `backlog` baseline is 1.53.0** (see above).
+
+**Fixed:**
+
+- **A missing module no longer surfaces only at release.** A unit test
+  now checks the integration tier's copy of the app lists every module,
+  after one went missing and blocked the v0.3.0 gate.
+
 ## v0.3.0 — views
 
 Three new views over your running agents sit beside the board, and agents

@@ -42,6 +42,43 @@ def pane(name):
 
 
 class DialogDetectionTests(unittest.TestCase):
+    def test_resume_picker_and_working_directory_dialog_refuse_delivery(self):
+        for lines in (["Resume a previous session", "Updated  Branch  Conversation", "› task B"],
+                      ["Working directory · resume", "Session = latest cwd recorded in the resumed session",
+                       "1. Use session directory (/worktrees/b)", "2. Use current directory (/worktrees/a)"]):
+            with self.subTest(lines=lines), \
+                 mock.patch.object(server, "capture_session_pane", return_value=lines), \
+                 mock.patch.object(server, "send_session_input") as send:
+                result = server.deliver_message(SESSION, "[ruling from owner] Continue task A")
+                self.assertEqual(result["outcome"], "dialog")
+                send.assert_not_called()
+
+    def test_loading_resume_refuses_input_before_its_dialog_can_appear(self):
+        lines = ["Resuming session…", "› Ask Codex to do anything", "? for shortcuts"]
+        with mock.patch.object(server, "capture_session_pane", return_value=lines), \
+             mock.patch.object(server, "send_session_input") as send:
+            result = server.deliver_message(SESSION, "[ruling from owner] Continue")
+        self.assertEqual(result["outcome"], "dialog")
+        send.assert_not_called()
+
+    def test_loading_marker_only_in_scrollback_does_not_block_a_ruling(self):
+        current = ["› Ask Codex to do anything", "? for shortcuts"]
+        history = ["Resuming session…"] + [f"old row {i}" for i in range(20)] + current
+        text = "[ruling from owner] Continue"
+        with mock.patch.object(server, "capture_session_pane", side_effect=[history, current, ["› " + text]]) as capture, \
+             mock.patch.object(server, "send_session_input") as send, \
+             mock.patch.object(server, "_delivery_sleep"):
+            result = server.deliver_message(SESSION, text)
+        self.assertEqual(result["outcome"], "delivered")
+        send.assert_called_once()
+        self.assertIn(mock.call(SESSION, 0), capture.call_args_list)
+
+    def test_historical_resume_heading_above_normal_composer_is_not_a_dialog(self):
+        lines = ["Resume a previous session"] + [f"old transcript row {i}" for i in range(20)]
+        lines += ["› Ask Codex to do anything", "? for shortcuts"]
+        self.assertIsNone(server.detect_pane_dialog(lines))
+        self.assertIsNone(server.detect_pane_dialog(["Resume session using an explicit UUID."]))
+
     def test_real_trust_dialogs_are_detected_by_their_footer(self):
         self.assertEqual(
             server.detect_pane_dialog(pane("claude-trust-dialog.txt")),
@@ -488,6 +525,19 @@ class RuleApiTests(ApiHarness):
         self.assertEqual(status, 409, body)
         self.assertEqual(body["mode"], "delivered")
         self.assertEqual(body["outcome"], "dialog")
+        self.commit.assert_not_called()
+
+    def test_rule_refuses_codex_resume_picker_before_any_input(self):
+        with mock.patch.object(server, "list_sessions", return_value=[{"name": SESSION}]), \
+             mock.patch.object(server, "capture_session_pane", return_value=["Resume a previous session", "› other task"]), \
+             mock.patch.object(server, "send_session_input") as send:
+            status, body = self._request("POST", "/api/rule", {
+                "project": "my-app", "taskId": "TASK-9", "sender": "lead-agent", "text": self.RULING,
+            })
+        self.assertEqual(status, 409)
+        self.assertEqual(body["outcome"], "dialog")
+        self.assertFalse(body["ok"])
+        send.assert_not_called()
         self.commit.assert_not_called()
 
     def test_no_live_agent_commits_the_ruling_on_the_branch(self):

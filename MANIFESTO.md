@@ -20,7 +20,7 @@ a session, before the code. A constitution nobody rereads is decoration.
 
 Centrale stores no task state of its own. The board, the live sessions, the
 branch states and the merge verdicts are re-derived on every request from the
-`backlog` CLI, from `git` and from `tmux`, with one measured exception below.
+`backlog` CLI, from `git` and from `tmux`, with two measured exceptions below.
 No database, no synced copy of a task, no cache of what a branch looked like.
 Delete Centrale and no task data is lost, because none of it was ever here.
 
@@ -51,6 +51,16 @@ answer as current. Concurrent readers share a load, and CLI children run at
 low priority where the platform supports it. Git, tmux, lifecycle enrichment,
 task-detail reads and merge gates remain fresh. This is a disposable display
 optimization, never another source of task truth.
+
+The second exception is what a restart may remember (task-201, decision-5).
+An agent's hook state cannot be re-derived: only the agent's hook knows it
+finished, and a restart that blanked every badge left an orchestrator blind
+for an hour while four finished workers waited. So at startup a still-live
+session gets back its last *settled* state (finished, idle or waiting) from
+the fleet journal, which already records every change. It gets it back only
+when the row is not older than the tmux session's creation time and names
+the same session instance. A session that was working, or was recreated
+under the same name, still shows that Centrale does not know.
 
 ## Gates over trust
 

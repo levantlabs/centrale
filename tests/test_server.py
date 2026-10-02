@@ -1072,18 +1072,12 @@ class BoardAggregationTests(unittest.TestCase):
 
     def test_happy_path_aggregation_and_ready_merge(self):
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
         my_tool_list = load_fixture("my_tool_list.json")
-        my_tool_ready = load_fixture("my_tool_ready.json")
 
         def fake_run_backlog(args, cwd):
             if cwd == self.my_app_dir:
-                if "--ready" in args:
-                    return my_app_ready
                 return my_app_list
             if cwd == self.my_tool_dir:
-                if "--ready" in args:
-                    return my_tool_ready
                 return my_tool_list
             raise AssertionError(f"unexpected cwd {cwd}")
 
@@ -1116,10 +1110,9 @@ class BoardAggregationTests(unittest.TestCase):
         server.record_agent_event("my-app", "TASK-2", "finished", agent_kind="codex")
 
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            return my_app_ready if "--ready" in args else my_app_list
+            return my_app_list
 
         with mock.patch.object(server, "run_backlog", side_effect=fake_run_backlog), \
              mock.patch.object(server, "run_git", return_value=git_proc([], 0, "", "")):
@@ -1135,12 +1128,9 @@ class BoardAggregationTests(unittest.TestCase):
 
     def test_ready_flag_merging(self):
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
-        ready_ids = {t["id"] for t in my_app_ready["tasks"]}
+        ready_ids = {t["id"] for t in my_app_list["tasks"] if t["isReady"]}
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         config = make_config([{"name": "my-app", "path": self.my_app_dir}])
@@ -1163,12 +1153,9 @@ class BoardAggregationTests(unittest.TestCase):
         # frontend knows to offer the Merge button regardless of what
         # main's own status says (see harvest.py's gate 2 fix).
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
         branches_proc = git_proc([], 0, "task/task-2\ntask/task-3\n", "")
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         with mock.patch.object(server, "run_backlog", side_effect=fake_run_backlog), \
@@ -1191,11 +1178,8 @@ class BoardAggregationTests(unittest.TestCase):
 
     def test_has_spawn_branch_false_for_every_task_when_project_has_no_task_branches(self):
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         config = make_config([{"name": "my-app", "path": self.my_app_dir}])
@@ -1216,11 +1200,8 @@ class BoardAggregationTests(unittest.TestCase):
         `tag_stdout`/`returncode` and every other git call succeeding
         with nothing to say."""
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         def fake_run_git(args, cwd=None, **kwargs):
@@ -1314,13 +1295,10 @@ class BoardAggregationTests(unittest.TestCase):
         # uncommitted changes in its worktree -- distinct from a clean
         # branch that's simply awaiting merge.
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
         dirty_wt = os.path.join("/tmp/does-not-matter", "my-app-task-2")
         clean_wt = os.path.join("/tmp/does-not-matter", "my-app-task-3")
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         def fake_run_git(args, cwd=None):
@@ -1353,7 +1331,6 @@ class BoardAggregationTests(unittest.TestCase):
         import spawn
 
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
         foreign = os.path.join(self.my_app_dir, ".worktrees", "task-2-integrated")
         centrale_wt = os.path.join("/tmp/does-not-matter", "my-app-task-3")
         porcelain = (
@@ -1363,8 +1340,6 @@ class BoardAggregationTests(unittest.TestCase):
         )
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         def fake_run_git(args, cwd=None):
@@ -1401,11 +1376,8 @@ class BoardAggregationTests(unittest.TestCase):
 
     def test_branch_checkout_skips_worktree_listing_when_project_has_no_branches(self):
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         config = make_config([{"name": "my-app", "path": self.my_app_dir}])
@@ -1418,11 +1390,8 @@ class BoardAggregationTests(unittest.TestCase):
 
     def test_worktree_dirty_false_when_worktree_directory_is_missing(self):
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         def fake_run_git(args, cwd=None):
@@ -1457,10 +1426,9 @@ class BoardAggregationTests(unittest.TestCase):
         # Progress, TASK-3 is Done -- both made ancestors here, so only
         # TASK-3 (ancestor AND Done) should read as alreadyMerged.
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            return my_app_ready if "--ready" in args else my_app_list
+            return my_app_list
 
         def fake_run_git(args, cwd=None):
             if args[:1] == ["for-each-ref"]:
@@ -1491,14 +1459,13 @@ class BoardAggregationTests(unittest.TestCase):
         # exact same comparison, or a repo with custom-cased statuses
         # would make the two features disagree about what "Done" means.
         my_app_list = json.loads(json.dumps(load_fixture("my_app_list.json")))
-        my_app_ready = load_fixture("my_app_ready.json")
         by_fixture_id = {t["id"]: t for t in my_app_list["tasks"]}
         by_fixture_id["TASK-2"]["status"] = "done"   # lowercase
         by_fixture_id["TASK-3"]["status"] = "DONE"   # uppercase
         by_fixture_id["TASK-1"]["status"] = None     # missing/unknown status
 
         def fake_run_backlog(args, cwd):
-            return my_app_ready if "--ready" in args else my_app_list
+            return my_app_list
 
         def fake_run_git(args, cwd=None):
             if args[:1] == ["for-each-ref"]:
@@ -1524,10 +1491,9 @@ class BoardAggregationTests(unittest.TestCase):
         # branch on a task someone (wrongly) marked Done early must not
         # read as already merged.
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            return my_app_ready if "--ready" in args else my_app_list
+            return my_app_list
 
         def fake_run_git(args, cwd=None):
             if args[:1] == ["for-each-ref"]:
@@ -1552,10 +1518,9 @@ class BoardAggregationTests(unittest.TestCase):
         # merge-base ancestry call is never even made for a task that
         # isn't Done -- TASK-2 (In Progress) here.
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            return my_app_ready if "--ready" in args else my_app_list
+            return my_app_list
 
         def fake_run_git(args, cwd=None):
             if args[:1] == ["for-each-ref"]:
@@ -1578,10 +1543,9 @@ class BoardAggregationTests(unittest.TestCase):
         # silently vanish for a task that still genuinely needs one.
         # Uses TASK-3 (Done) so the merge-base call is actually reached.
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            return my_app_ready if "--ready" in args else my_app_list
+            return my_app_list
 
         def fake_run_git(args, cwd=None):
             if args[:1] == ["for-each-ref"]:
@@ -1602,13 +1566,10 @@ class BoardAggregationTests(unittest.TestCase):
 
     def test_per_project_failure_isolation(self):
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
             if cwd == self.my_tool_dir:
                 raise server.BacklogError("backlog: command failed: boom")
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         with mock.patch.object(server, "run_backlog", side_effect=fake_run_backlog), \
@@ -1651,8 +1612,6 @@ class BoardAggregationTests(unittest.TestCase):
 
         def fake_run_backlog(args, cwd):
             calls["n"] += 1
-            if "--ready" in args:
-                return {"schemaVersion": 1, "kind": "task-list", "tasks": []}
             return {"schemaVersion": 1, "kind": "task-list", "tasks": []}
 
         config = make_config([{"name": "my-app", "path": self.my_app_dir}])
@@ -1679,7 +1638,7 @@ class BoardInputCacheTests(unittest.TestCase):
             f.write("project_name: test\n")
         self.config = make_config([{"name": "app", "path": self.root}])
         self.data = {"schemaVersion": 1, "tasks": [
-            {"id": "TASK-1", "status": "To Do", "milestone": "m-0"}]}
+            {"id": "TASK-1", "status": "To Do", "milestone": "m-0", "isReady": True}]}
         self.cli = self.enterContext(mock.patch.object(server, "run_backlog", return_value=self.data))
         self.raw = self.enterContext(mock.patch.object(server, "run_backlog_raw", return_value=
             subprocess.CompletedProcess([], 0, "  m-0: First (0/1 done)\n", "")))
@@ -1693,7 +1652,7 @@ class BoardInputCacheTests(unittest.TestCase):
             first = self.board(True)
         with mock.patch.object(server, "get_agent_lifecycle", return_value={"agentState": "idle"}):
             second = self.board(True)
-        self.assertEqual(self.cli.call_count, 2)
+        self.assertEqual(self.cli.call_count, 1)
         self.assertEqual(self.raw.call_count, 1)
         self.assertEqual(first["tasks"][0]["agentState"], "working")
         self.assertEqual(second["tasks"][0]["agentState"], "idle")
@@ -1716,7 +1675,7 @@ class BoardInputCacheTests(unittest.TestCase):
                     else:
                         os.unlink(path + ".new")
                     self.board()
-                    self.assertEqual(self.cli.call_count, before + 2)
+                    self.assertEqual(self.cli.call_count, before + 1)
 
     def test_failed_reload_does_not_serve_old_tasks_or_cache_error(self):
         self.board()
@@ -1740,7 +1699,7 @@ class BoardInputCacheTests(unittest.TestCase):
         with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
             results = list(pool.map(lambda _: self.board(True), range(6)))
         self.assertTrue(all(r["error"] is None for r in results))
-        self.assertEqual(self.cli.call_count, 2)
+        self.assertEqual(self.cli.call_count, 1)
         self.assertEqual(self.raw.call_count, 1)
 
     def test_root_config_disables_reuse_for_redirected_boards(self):
@@ -1750,27 +1709,27 @@ class BoardInputCacheTests(unittest.TestCase):
         self.data["tasks"][0]["title"] = "Redirected board"
         self.assertEqual(self.board()["tasks"][0].get("title"), "Redirected board")
         self.board()
-        self.assertEqual(self.cli.call_count, 6)
+        self.assertEqual(self.cli.call_count, 3)
 
     def test_missing_local_config_does_not_cache_parent_board(self):
         os.unlink(os.path.join(self.root, "backlog", "config.yml"))
         self.board(True)
         self.board(True)
-        self.assertEqual(self.cli.call_count, 4)
+        self.assertEqual(self.cli.call_count, 2)
 
     def test_legacy_config_disables_reuse(self):
         self.board(True)
         with open(os.path.join(self.root, "backlog.json"), "w") as f:
             f.write("{}")
         self.board(True)
-        self.assertEqual(self.cli.call_count, 4)
+        self.assertEqual(self.cli.call_count, 2)
 
     def test_environment_redirect_disables_reuse(self):
         self.board(True)
         with mock.patch.dict(os.environ, {"BACKLOG_CWD": "/some/other/project"}):
             self.board(True)
             self.board(True)
-        self.assertEqual(self.cli.call_count, 6)
+        self.assertEqual(self.cli.call_count, 3)
 
     def test_unreadable_metadata_retries_cli_instead_of_serving_old_data(self):
         self.board(True)
@@ -1778,7 +1737,7 @@ class BoardInputCacheTests(unittest.TestCase):
         with mock.patch.object(server.os, "walk", side_effect=PermissionError("denied")):
             self.assertEqual(self.board()["tasks"][0].get("title"), "New")
             self.board()
-        self.assertEqual(self.cli.call_count, 6)
+        self.assertEqual(self.cli.call_count, 3)
 
     def test_different_projects_do_not_share_inputs(self):
         other = os.path.join(self.root, "other")
@@ -1788,23 +1747,59 @@ class BoardInputCacheTests(unittest.TestCase):
         self.config["projects"].append({"name": "other", "path": other})
         first = server.get_board(self.config)
         self.assertEqual(len(first["projects"]), 2)
-        self.assertEqual(self.cli.call_count, 4)
+        self.assertEqual(self.cli.call_count, 2)
         with open(os.path.join(other, "backlog", "task.md"), "w") as f:
             f.write("changed")
         server.get_board(self.config)
-        self.assertEqual(self.cli.call_count, 6)
+        self.assertEqual(self.cli.call_count, 3)
 
     def test_change_during_load_is_not_cached(self):
         def read(args, cwd):
-            if "--ready" in args:
-                with open(os.path.join(self.root, "backlog", "config.yml"), "a") as f:
-                    f.write("change")
+            with open(os.path.join(self.root, "backlog", "config.yml"), "a") as f:
+                f.write("change")
             return self.data
         self.cli.side_effect = read
         self.board(True)
         self.cli.side_effect = None
         self.board(True)
-        self.assertEqual(self.cli.call_count, 4)
+        self.assertEqual(self.cli.call_count, 2)
+
+    def test_board_load_runs_one_task_list_and_no_ready_run(self):
+        self.board(True)
+        self.assertEqual([c.args[0] for c in self.cli.call_args_list],
+                         [["task", "list", "--json"]])
+        self.assertEqual(self.raw.call_count, 1)  # milestone titles: the second command
+
+    def test_criteria_counts_ride_the_one_list_with_no_extra_command(self):
+        self.data["tasks"] = [
+            {"id": "TASK-1", "status": "Done", "isReady": False,
+             "acceptanceCriteriaCount": 5, "acceptanceCriteriaCompleted": 3}]
+        task = self.board(True)["tasks"][0]
+        self.assertEqual((task["acceptanceCriteriaCount"],
+                          task["acceptanceCriteriaCompleted"]), (5, 3))
+        self.assertEqual([c.args[0] for c in self.cli.call_args_list],
+                         [["task", "list", "--json"]])
+
+    def test_ready_is_exactly_isReady_from_the_list(self):
+        self.data["tasks"] = [
+            {"id": "TASK-1", "status": "To Do", "isReady": True},
+            {"id": "TASK-2", "status": "To Do", "isReady": False},
+            {"id": "TASK-3", "status": "In Progress", "isReady": True},
+        ]
+        ready = {t["id"]: t["ready"] for t in self.board(True)["tasks"]}
+        self.assertEqual(ready, {"TASK-1": True, "TASK-2": False, "TASK-3": True})
+
+    def test_a_list_missing_isReady_fails_loudly_and_is_not_cached(self):
+        for bad in (None, "true", 1):
+            with self.subTest(isReady=bad):
+                server._reset_board_cache()
+                task = {"id": "TASK-1", "status": "To Do"}
+                if bad is not None:
+                    task["isReady"] = bad
+                self.data["tasks"] = [task]
+                project = self.board(True)
+                self.assertEqual(project["tasks"], [])
+                self.assertIn("isReady", project["error"])
 
 
 class BacklogPriorityTests(unittest.TestCase):
@@ -1876,7 +1871,8 @@ class MilestoneTitleResolutionTests(unittest.TestCase):
 
     @staticmethod
     def _task(task_id, milestone=None, status="To Do"):
-        return {"id": task_id, "title": task_id, "status": status, "milestone": milestone}
+        return {"id": task_id, "title": task_id, "status": status, "milestone": milestone,
+                "isReady": False}
 
     # -- the parser --
 
@@ -1918,14 +1914,12 @@ class MilestoneTitleResolutionTests(unittest.TestCase):
 
     # -- the board build --
 
-    def _board(self, per_project_tasks, milestone_plain, ready_ids=()):
+    def _board(self, per_project_tasks, milestone_plain):
         """Build a board over the given {project name: (path, [tasks])},
         with `backlog milestone list` answered per project path from
         `milestone_plain` ({path: CompletedProcess})."""
         def fake_run_backlog(args, cwd):
             tasks = per_project_tasks[cwd]
-            if "--ready" in args:
-                return self._task_list(*[t for t in tasks if t["id"] in ready_ids])
             return self._task_list(*tasks)
 
         raw = mock.Mock(side_effect=lambda args, cwd: milestone_plain[cwd])
@@ -3343,11 +3337,8 @@ class HttpApiTests(unittest.TestCase):
 
     def test_api_board_happy_path(self):
         my_app_list = load_fixture("my_app_list.json")
-        my_app_ready = load_fixture("my_app_ready.json")
 
         def fake_run_backlog(args, cwd):
-            if "--ready" in args:
-                return my_app_ready
             return my_app_list
 
         with mock.patch.object(server, "run_backlog", side_effect=fake_run_backlog), \
@@ -7892,13 +7883,21 @@ class DrawerSectionDiscoverabilityTests(unittest.TestCase):
         # No section escapes the builder: a bare "drawer-section" div
         # would be a header with no count and no fold.
         self.assertNotIn('C.h("div", { className: "drawer-section" })', self.drawer)
-        for key in ("milestone", "description", "acceptanceCriteria", "dependencies",
+        for key in ("milestone", "description", "acceptanceCriteria",
                     "implementationPlan", "implementationNotes", "branch"):
             self.assertIn('drawerSection("%s",' % key, self.detail_flat)
+        # task-202: the dependency sections are built by two helpers the
+        # detail renderer calls, through the same builder.
+        direct = " ".join(function_body(self.drawer, "renderDirectDependencies").split()).replace("( ", "(")
+        graph = " ".join(function_body(self.drawer, "renderDependencyGraphSections").split()).replace("( ", "(")
+        self.assertIn('drawerSection("dependencies",', direct)
+        self.assertIn('drawerSection("waitingOn",', graph)
+        self.assertIn('drawerSection("blocks",', graph)
 
     def test_the_counts_are_checked_over_total_a_length_and_a_word_count(self):
         self.assertIn('acChecked + "/" + ac.length', self.detail_flat)
-        self.assertIn("deps.length ? String(deps.length) : null", self.detail_flat)
+        direct = " ".join(function_body(self.drawer, "renderDirectDependencies").split()).replace("( ", "(")
+        self.assertIn("deps.length ? String(deps.length) : null", direct)
         self.assertIn('pluralCount(descWords, "word")', self.detail_flat)
         self.assertIn('pluralCount(planWords, "word")', self.detail_flat)
         self.assertIn('pluralCount(notesWords, "word")', self.detail_flat)

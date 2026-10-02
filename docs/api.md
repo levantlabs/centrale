@@ -234,7 +234,7 @@ Every task from `backlog task list --json` round-trips as-is (`id`, `title`,
 `status`, `priority`, `assignees`, `labels`, `milestone`, `ordinal`,
 timestamps, ...), plus ten fields Centrale adds:
 
-- `ready` — from `backlog task list --ready --json`: unblocked by its
+- `ready` — from `isReady` in `backlog task list --json`: unblocked by its
   dependencies.
 - `hasSpawnBranch` — a `task/<id>` branch exists, computed with one
   `git for-each-ref` call per project (never one per task). It says nothing
@@ -478,6 +478,12 @@ curl -s 'http://127.0.0.1:7420/api/sessions' | python3 -m json.tool
   ]
 }
 ```
+
+A session whose agent is `finished`, `idle` or `unknown` also carries
+`parked`: `null`, or `{"reason", "since", "lastLine", "dialog"}` when it has
+been idle for `parkedAfterSeconds` with a dialog on its pane or an
+undelivered message (see `needsYou` under `GET /api/fleet`); the sidebar
+shows it as PARKED with the pane's last line.
 
 `created` is the tmux session-creation timestamp as a Unix-epoch string
 (straight from `#{session_created}`), not milliseconds and not ISO-8601.
@@ -916,14 +922,19 @@ curl -s 'http://127.0.0.1:7420/api/fleet?window=7200'
   limit. `agentCount` counts fresh live tmux sessions, independent of badges.
 - `agents` includes configured-project sessions only. `state` and `stateSince`
   come from this process's hook observations; duplicate hooks do not reset
-  the start time. After restart these are `unknown` and `null` until a hook
-  arrives. Agent names are configured names, distinct from `agentKind`;
+  the start time. After restart a live session's settled state (`finished`,
+  `idle`, `waiting`) and its original `stateSince` are restored from the
+  journal when the row belongs to the same tmux session instance; anything
+  else is `unknown` and `null` until a hook arrives (task-201). Agent names are configured names, distinct from `agentKind`;
   an unavailable name is `unknown`. New spawn/resume hook URLs include the
   optional `agentName` query parameter so custom names survive restart.
 - `history` is oldest first within the requested window, with Unix-second
   timestamps, uppercase task ids and states `spawn`, `working`, `waiting`,
   `idle`, `finished`, `unknown`, `merge blocked`, `merged`, `session ended`.
   Codex turn-end stays `idle`; it is not a claim that the task is complete.
+  Hook-state rows may also carry `agentKind` and `created` (the tmux
+  session's creation time, when a survey had seen it), which is what a
+  restart's restore matches on.
   Spawn records cover resume too. End records come from successful explicit
   end requests or the first successful fleet/sessions survey that notices
   disappearance; their timestamp is observation time, not an inferred exit
@@ -932,7 +943,7 @@ curl -s 'http://127.0.0.1:7420/api/fleet?window=7200'
   their `harvest` attempt details (`time`, `project`, `taskId`, `branch`,
   `trigger`, `merged`, and optional `reason`, `error`, `baseBranch` or
   `alreadyMerged`). These are historical outcomes, never current merge gates.
-- `needsYou` contains derived inbox items with `kind` (`permission`, `idle`,
+- `needsYou` contains derived inbox items with `kind` (`permission`, `parked`, `idle`,
   `merge`, `message`, `owner`), `project`, `taskId`, `agent`, `since`
   (Unix seconds or null when unknown), and a human-readable `signal`.
   `needsYouErrors` lists unavailable checks; a partial inbox is not an all-clear.
@@ -944,6 +955,14 @@ curl -s 'http://127.0.0.1:7420/api/fleet?window=7200'
     and compares the screen before sending ordered arrows followed by Enter;
     a failed arrow aborts the chain. Items disappear when a fresh capture no
     longer shows the dialog, without changing the agent's hook state.
+  - Parked items (task-170.3) are agents whose hook state is `finished`, `idle`
+    or `unknown` (never `working`/`waiting`) for at least `parkedAfterSeconds`
+    (an `unknown` agent ages from its session start) **and** that either show a
+    dialog on the pane or whose latest delivery attempt, made during this
+    session, was not `delivered`. They carry the pane's last non-blank line as
+    `text`/`lastLine`, and replace the agent's idle item. A finished agent with a
+    clean pane and nothing pending is never parked. Each `agents[]` row also
+    carries `parked` (`null`, or `{reason, since, lastLine, dialog}`).
   - Idle items require a live idle hook and a readable worker-branch task with
     neither Done status nor a nonempty `finalSummary`. An unreadable report is
     an error, not evidence that the worker needs attention. Finished hooks and
@@ -1307,9 +1326,25 @@ consumes no events. Other HTTP requests continue while a call waits.
 History is in memory for the lifetime of the server process, with no size
 or age eviction; memory grows with notification count. Server restart
 clears it. A cursor from before restart, from another project, or ahead
-of the stream returns **409 JSON**, explicitly refusing to hide a gap:
-reconcile current tasks/sessions/branches through the ordinary APIs, then
-restart without `after`. Notifications are historical observations; act
+of the stream returns **409 JSON**, explicitly refusing to hide a gap;
+pre-restart cursors are deliberately not made valid across a restart.
+
+Instead, before serving its first request a restarted server publishes one
+line per live session in each project (task-201), so a wait **without
+`after`** first hears every worker's current state:
+
+```text
+<cursor> TASK-2 finished (ready to review) (state before the server restart)
+<cursor> TASK-3 state unknown after the server restart (no hook event since; check the session)
+```
+
+The state is the one restored from the fleet journal (`finished`, `idle`,
+`waiting`) or `unknown`. Events fired during the restart follow as ordinary
+lines once their hook's retry lands. So the 409 recovery is: drop the
+cursor, wait without `after`, handle each announced session (read a
+`state unknown` worker's pane or task), then continue with the cursors as
+usual. Reconcile merges or spawns you had in flight through the ordinary
+APIs. Notifications are historical observations; act
 on freshly read task/session/gate state. No disk log or new external
 resource is introduced.
 
@@ -1648,7 +1683,7 @@ Same validation, session naming, project cap and 409-on-duplicate as `/api/spawn
 never claims/commits the task or creates a new branch — it only reuses the
 worktree that's already there, starting a fresh tmux session running the
 resolved agent's *resume* command (its configured `resumeCmd`, else `claude
---continue` / `codex resume --last` for a claude-/codex-family agent, followed
+--continue` / `codex resume <UUID>` for a claude-/codex-family agent, followed
 by the agent's own `cmd` arguments such as `--model`, else a
 fresh prompt noting prior work already exists). See "Resuming an interrupted agent" in
 [docs/agents.md](agents.md#resuming-an-interrupted-agent).
@@ -1668,9 +1703,37 @@ curl -s -X POST http://127.0.0.1:7420/api/resume \
   "session": "centrale-my-app-task-2",
   "attach": "tmux attach -t centrale-my-app-task-2",
   "agent": "codex",
-  "resumed": true
+  "resumed": true,
+  "conversationId": "11111111-1111-4111-8111-111111111111",
+  "conversationStatus": "resumed"
 }
 ```
+
+For Codex, the response additionally carries `conversationId` (the selected
+UUID, or `null` for a fresh start) and `conversationStatus`:
+
+| `conversationStatus` | `resumed` | Meaning |
+|---|---|---|
+| `resumed` | `true` | A verified worktree conversation was selected by UUID and its normal composer appeared. |
+| `fresh` | `false` | No eligible conversation existed; a fresh Codex composer appeared with the prior-work fallback prompt. |
+| `dialog` | `false` | Startup is blocked by a dialog or picker; inspect the named pane. |
+| `unconfirmed` | `false` | Startup did not establish a normal composer within five seconds, or capture failed. |
+
+`conversationId` identifies the **selected** conversation; it is not proof of
+successful startup when `resumed` is false. For a fresh start, this endpoint
+does not predict the new UUID. A dialog/unconfirmed result includes a warning
+and leaves the pane available for inspection. Callers must check these fields
+before sending a ruling; delivery also performs its own fresh dialog check,
+including the transitional “Resuming session…” screen that already shows a
+composer before the selected conversation has loaded.
+These Codex fields are absent for other agent families, whose existing
+`resumed` semantics remain unchanged.
+
+Selection reads only eligible interactive records for the exact worktree under
+`$CODEX_HOME/sessions` (default `~/.codex/sessions`), with no persistent Centrale
+mapping. Custom Codex `resumeCmd` and session/directory overrides refuse with
+409; remove `resumeCmd` and keep ordinary model/config options on `cmd` to use
+the safe built-in resume. See [the agent guide](agents.md).
 
 When resume recreates a missing worktree, its response may also contain
 `warnings` for skipped `worktreeLinks`, as on spawn.
@@ -1694,7 +1757,7 @@ reuse (never a new branch, never a re-claim), same agent resolution, same
 hook/`CENTRALE_EVENT_URL` injection, and the same resume-command tiers. The
 one difference is the trailing argument: the **reconcile prompt** (plus the
 agent's `promptSuffix`) is appended at every tier — `resumeCmd` plus the
-prompt, `claude --continue <prompt>` or `codex resume --last <prompt>`, or
+prompt, `claude --continue <prompt>` or `codex resume <UUID> <prompt>`, or
 the agent's own `cmd` with the prompt plus the fresh-start prior-work note
 when there is nothing to resume — so the conversation that built the branch
 is continued and handed the new job, rather than replaced by an agent that
@@ -1863,7 +1926,13 @@ endpoint that still takes its identity from the query string, because
 `CENTRALE_EVENT_URL` is the only thing a notify hook receives — see
 "Request requirements".
 
-**Body:** `{"state": "working" | "waiting" | "finished"}`, required. (There
+**Body:** `{"state": "working" | "waiting" | "finished"}`, required, plus
+optional `"firedAt"`: when the hook fired, in epoch seconds (task-201).
+`centrale_notify.py` sends it, and retries in the background for a few
+seconds when the server is unreachable; an event whose `firedAt` is older
+than the last applied one for the task (or than the spawn/resume that
+replaced its session) is accepted with `{"ok": true}` but ignored, so a
+retried event cannot overwrite a later state. (There
 was once a `?state=` query fallback for a reporter that could not send a
 body; it is gone, because it was also the one way a bodyless cross-origin
 form POST could drive this endpoint.)
@@ -1878,7 +1947,8 @@ curl -s -X POST 'http://127.0.0.1:7420/api/agent-event?project=my-app&task=TASK-
 
 **Errors:** 400 for a missing `project`, a missing/invalid `task`, a
 missing/invalid `state` (must be exactly one of `working`/`waiting`/
-`finished`), or an invalid `agentKind`. 404 for an unknown project.
+`finished`), an invalid `agentKind`, or a `firedAt` that is not a finite
+number. 404 for an unknown project.
 
 ## `POST /api/end-session`
 
@@ -2477,7 +2547,9 @@ tries.
 **Lifecycle metadata is ephemeral, in-memory, and keyed by
 `(project, taskId)` — not by tmux session name**, so state and built-in kind
 survive a session being killed and re-spawned/resumed, but reset on every
-server restart. Every task then reads `agentState: "unknown"` and
+server restart. At startup a live session whose fleet-journal row shows a
+settled state of the same tmux session instance gets it back (task-201);
+every other task then reads `agentState: "unknown"` and
 `agentKind: "unknown"` until an event arrives. A built-in session's next
 event restores both because its URL carries `agentKind`. This remains a live
 status hint, not Centrale-owned task data.

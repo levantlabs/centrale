@@ -70,6 +70,11 @@ session:
 
 ![Task drawer showing the unmerged-branch section and the live session pane](docs/img/drawer-pane.png)
 
+The dependency chain of a task that is not started yet, with its acceptance
+criteria above it:
+
+![Task drawer showing acceptance criteria, Waiting on and Blocks](docs/img/drawer-deps.png)
+
 The same pane and reply row in the session theater, for reading and answering
 at length:
 
@@ -124,12 +129,15 @@ project's own statuses; cards carry a project chip, priority, labels, a green
 `main` hasn't yet seen what an agent committed. A search box (title, task ID,
 or label) and a "Ready to start" filter narrow it down, per-project show/hide
 and that filter persist across reloads, and a project that fails to load
-degrades to an error banner instead of taking the board down. → [docs/board.md](docs/board.md#using-the-board)
+degrades to an error banner instead of taking the board down. A card also
+shows how many of its acceptance criteria are checked (`3/5`), in amber on a
+Done task that left some unchecked. → [docs/board.md](docs/board.md#using-the-board)
 
 **Three views over your running agents.** Tabs above the board open **Needs
 you** (an inbox of what only a person can do: a permission dialog or menu
 you answer in place with arrows and Enter or a click, an agent that went idle
-without a report, a failed delivery, a blocked merge, an owner question, with a
+without a report, an agent **PARKED** idle behind a dialog or an undelivered
+message, a failed delivery, a blocked merge, an owner question, with a
 live count on the tab), **Fleet** (a card per project: agent slots used out of
 `maxAgents`, each agent's state, time in it and a two-hour sparkline) and
 **Timeline** (every recently active agent as a row of state segments, with
@@ -148,7 +156,9 @@ records the answer removes the label.
 task's description, acceptance criteria, dependencies, plan and notes. When an
 agent has a branch in flight, a separate **"On agent branch (unmerged)"**
 section shows that branch's own status, checked criteria and notes — the work
-as actually committed, which `main` cannot see yet.
+as actually committed, which `main` cannot see yet. Dependencies show as a
+full chain: **Waiting on** (everything the task transitively needs) and
+**Blocks** (everything that transitively waits on it).
 → [docs/board.md](docs/board.md#using-the-board)
 
 **Read and answer a running agent without attaching.** For a task with a live
@@ -160,7 +170,9 @@ and **Enter** buttons send those two keys themselves, for a session parked on a
 startup dialog that no amount of typed text can answer. **Expand** widens
 the drawer to the full 80-column grid; **Maximize** opens the *session
 theater*, the same pane and reply row in a large in-page overlay, with Esc
-returning you to the drawer exactly as it was. It costs one `tmux capture-pane`
+returning you to the drawer exactly as it was. A Centrale restart keeps what
+it knew: a live session whose tmux session is unchanged gets its last settled
+state back instead of "unknown". It costs one `tmux capture-pane`
 per tick for the one open drawer, however many agents are running, and a
 Settings toggle turns the whole tier off, server endpoint included.
 → [docs/board.md](docs/board.md#using-the-board)
@@ -233,7 +245,7 @@ frees the worktree and leaves the branch parked and mergeable.
   the one hard dependency; without it there is no task data and nothing works.
   It ships as a global **npm** package, so it needs **Node.js and `npm`**
   (Backlog.md publishes no minimum version; Centrale is verified against
-  `backlog` v1.51.0 on Node 20, `--json` `schemaVersion: 1`):
+  `backlog` v1.53.0 on Node 20, `--json` `schemaVersion: 1`):
 
   ```bash
   npm i -g backlog.md

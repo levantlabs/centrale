@@ -395,6 +395,25 @@
         title: "Spawned: the agent is this task file's only writer until its branch is merged, discarded, abandoned or cleaned up, so `backlog task edit` on the main checkout is refused (EACCES). To rule on the task, POST /api/rule -- it messages a live agent, or commits the ruling as a comment on the branch when none is running."
       }));
     }
+    // task-200: acceptance-criteria progress, from the counts the board's
+    // one `task list --json` already carries (no extra CLI run). Left off
+    // while the task is spawned: its agent ticks criteria on its own
+    // branch (one-writer rule), so main's count would claim no progress,
+    // and reading the branch for live counts is the per-poll cost
+    // task-196 removed.
+    var acTotal = Number(task.acceptanceCriteriaCount) || 0;
+    if (acTotal > 0 && !effBranch && !live) {
+      var acDone = Number(task.acceptanceCriteriaCompleted) || 0;
+      var acGap = C.isDoneStatus(task.status) && acDone < acTotal;
+      var acChip = C.h("span", {
+        className: "card-ac" + (acGap ? " card-ac-gap" : ""),
+        text: acDone + "/" + acTotal
+      });
+      acChip.title = acGap
+        ? "Done, but " + (acTotal - acDone) + " of " + acTotal + " acceptance criteria were never checked"
+        : acDone + " of " + acTotal + " acceptance criteria checked";
+      meta.appendChild(acChip);
+    }
     card.appendChild(meta);
 
     // task-86: the milestone chip leads the same chips row the labels

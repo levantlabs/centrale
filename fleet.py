@@ -115,6 +115,14 @@ class Journal:
             return next((dict(r) for r in reversed(self.rows)
                          if r['project'] == project and r['taskId'] == task_id.upper()), {})
 
+    def last_agent_state(self, project, task_id):
+        """The newest row describing the session itself (task-201): merge
+        outcomes are harvest observations about the branch, not the agent."""
+        with self.lock:
+            return next((dict(r) for r in reversed(self.rows)
+                         if r['project'] == project and r['taskId'] == task_id.upper()
+                         and r['state'] not in {'merged', 'merge blocked'}), {})
+
     def agent(self, project, task_id):
         return self.latest(project, task_id).get('agent', 'unknown')
 

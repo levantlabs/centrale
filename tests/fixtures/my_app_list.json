@@ -15,7 +15,8 @@
       "parentTaskId": null,
       "ordinal": 1000,
       "createdAt": "2024-01-05T09:00:00Z",
-      "updatedAt": null
+      "updatedAt": null,
+      "isReady": true
     },
     {
       "id": "TASK-2",
@@ -23,14 +24,19 @@
       "status": "In Progress",
       "type": "task",
       "priority": "medium",
-      "assignees": ["@claude"],
+      "assignees": [
+        "@claude"
+      ],
       "reporter": null,
-      "labels": ["demo"],
+      "labels": [
+        "demo"
+      ],
       "milestone": null,
       "parentTaskId": null,
       "ordinal": 2000,
       "createdAt": "2024-01-05T09:00:00Z",
-      "updatedAt": "2024-01-05T11:30:00Z"
+      "updatedAt": "2024-01-05T11:30:00Z",
+      "isReady": false
     },
     {
       "id": "TASK-3",
@@ -40,12 +46,15 @@
       "priority": "low",
       "assignees": [],
       "reporter": null,
-      "labels": ["demo"],
+      "labels": [
+        "demo"
+      ],
       "milestone": null,
       "parentTaskId": null,
       "ordinal": 3000,
       "createdAt": "2024-01-05T09:00:00Z",
-      "updatedAt": "2024-01-05T14:00:00Z"
+      "updatedAt": "2024-01-05T14:00:00Z",
+      "isReady": true
     },
     {
       "id": "TASK-4",
@@ -60,7 +69,8 @@
       "parentTaskId": null,
       "ordinal": 4000,
       "createdAt": "2024-01-05T09:00:00Z",
-      "updatedAt": null
+      "updatedAt": null,
+      "isReady": false
     }
   ]
 }

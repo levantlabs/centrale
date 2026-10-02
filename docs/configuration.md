@@ -162,11 +162,19 @@ Fields:
     prompt (see "Resume to reconcile" in
     [docs/agents.md](agents.md#resume-to-reconcile-a-branch-that-fell-behind-main)),
     so a wrapper script configured here must tolerate one extra argument
-    the way `claude --continue [prompt]` and `codex resume --last
+    the way `claude --continue [prompt]` and `codex resume <UUID>
     [prompt]` already do. This is how you point an assignee at a wrapper script,
     `claude`/`codex` with extra flags or a custom system prompt, or a
     prompt that steers the agent toward a repo-defined `.claude/agents`
     subagent — all purely through config, no code changes needed.
+
+    **Codex exception (task-195):** Resume selects an explicit UUID from
+    `$CODEX_HOME/sessions` (default `~/.codex/sessions`) for the exact task
+    worktree, or starts fresh with the prior-work note. A Codex `resumeCmd`
+    returns 409; remove it to use verified selection. Session/directory
+    overrides in `cmd` also refuse on Resume. Ordinary model/config/approval
+    arguments in `cmd` are preserved. These records are read only; Centrale
+    adds no cache or session registry.
 
     Both forms are normalized to one internal shape when Centrale starts
     (`server.load_config`), so a malformed entry — a missing, empty, or
@@ -227,6 +235,11 @@ Fields:
   whole number `>= 5` if present (a malformed value is rejected at startup,
   same style as `harvest`). Purely client-side — the server doesn't act on
   a timer for this, it just tells the frontend what interval to use.
+- `parkedAfterSeconds` (optional) — how long, in seconds, an agent must sit
+  idle (hook state finished/idle, or no hook yet) before a dialog on its pane
+  or an undelivered message flags it PARKED. Defaults to `180`; a whole number
+  `>= 10` if present (malformed values are rejected at startup). Read on every
+  poll from the live config; a restart is needed after editing the file.
 - `subprocessTimeoutSeconds` (optional) — the timeout every `backlog`/`git`/
   `tmux` subprocess call shares (one knob for `run_backlog`, `run_backlog_raw`,
   `run_git`, `run_tmux`, not four separate ones). Defaults to `30` seconds

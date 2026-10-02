@@ -1467,6 +1467,16 @@
     letter-spacing: 0.3px;
   }
 
+  /* task-200: acceptance-criteria progress. Quiet by default; amber only
+     for a Done task whose criteria were never all checked. */
+  .card-ac {
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .card-ac-gap { color: var(--warning); font-weight: 700; }
+
   .badge-blocked {
     font-size: 10px;
     font-weight: 700;
@@ -1510,6 +1520,12 @@
     color: var(--success);
     background: var(--success-dim);
     border: 1px solid var(--success);
+  }
+  .agent-badge-parked {
+    color: var(--warning);
+    background: transparent;
+    border: 1px solid var(--warning);
+    font-weight: 700;
   }
   .agent-badge-idle {
     color: var(--text-muted);
@@ -1903,6 +1919,64 @@
   .dep-item-linked { cursor: pointer; transition: border-color .12s ease, background .12s ease; }
   .dep-item-linked:hover { border-color: var(--border-strong); background: var(--bg-hover); }
   .dep-item-linked:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+
+  /* task-202: the dependency chain. Tokens only, so light and dark both follow. */
+  .dep-summary { font-size: 13px; color: var(--text); line-height: 1.45; margin-bottom: 6px; }
+  .dep-row {
+    display: grid;
+    grid-template-columns: auto auto 1fr;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    min-width: 0;
+    font-size: 12.5px;
+    outline: none;
+    position: relative;
+  }
+  .dep-row .dep-id { font-family: var(--mono); font-size: 12px; color: var(--accent); }
+  .dep-row .dep-title { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-dim); }
+  .dep-row.done .dep-title { color: var(--text-faint); }
+  .dep-row.warn { background: var(--warning-dim); }
+  .dep-row.warn .dep-title { color: var(--warning); white-space: normal; }
+  .dep-chip { font-size: 10.5px; font-weight: 700; border-radius: 999px; padding: 1px 7px; white-space: nowrap; }
+  .dep-chip.s-done { color: var(--success); background: var(--success-dim); }
+  .dep-chip.s-prog { color: var(--accent); background: var(--accent-dim); }
+  .dep-chip.s-todo { color: var(--text-dim); background: var(--bg-hover); }
+  .dep-chip.s-wait { color: var(--warning); background: var(--warning-dim); }
+  .dep-row.depth-1 { padding-left: 26px; }
+  .dep-row.depth-2 { padding-left: 46px; }
+  .dep-row.depth-3 { padding-left: 66px; }
+  .dep-row.depth-4 { padding-left: 86px; }
+  .dep-row[class*="depth-"]::before {
+    content: "";
+    position: absolute;
+    left: 12px;
+    top: 0;
+    bottom: 50%;
+    width: 9px;
+    border-left: 1px solid var(--border-strong);
+    border-bottom: 1px solid var(--border-strong);
+    border-bottom-left-radius: 4px;
+  }
+  .dep-row.depth-2::before { left: 32px; }
+  .dep-row.depth-3::before { left: 52px; }
+  .dep-row.depth-4::before { left: 72px; }
+  .dep-row-linked { cursor: pointer; }
+  .dep-row-linked:hover { background: var(--bg-hover); }
+  .dep-row-linked:focus-visible { box-shadow: 0 0 0 3px var(--focus-ring); }
+  .dep-more {
+    background: none;
+    border: 0;
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 12.5px;
+    color: var(--accent);
+    cursor: pointer;
+    text-align: left;
+  }
+  .dep-more:focus-visible { box-shadow: 0 0 0 3px var(--focus-ring); border-radius: 4px; }
+  .dep-further-list[hidden] { display: none; }
 
   #drawer-detail-loading, #drawer-detail-error {
     color: var(--text-dim);
@@ -2385,7 +2459,7 @@
   border: 1px solid var(--border); border-radius: var(--radius-lg); padding: 16px 18px; background: var(--bg-card); }
 .needs-you-item::before { content: ""; position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--c); }
 .ny-k-merge { --c: var(--danger); }
-.ny-k-permission, .ny-k-message { --c: var(--warning); }
+.ny-k-permission, .ny-k-message, .ny-k-parked { --c: var(--warning); }
 .ny-k-owner { --c: var(--accent); }
 .ny-k-idle { --c: var(--text-faint); }
 .needs-you-body { display: flex; flex-direction: column; gap: 8px; min-width: 0; }

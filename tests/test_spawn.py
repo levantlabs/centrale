@@ -2385,6 +2385,108 @@ class ClaimCommitScopeRealGitTests(unittest.TestCase):
         self.assertEqual(self._git("status", "--porcelain"), "")
 
 
+class CodexConversationTests(unittest.TestCase):
+    """Identity comes from Codex records, never another task's recency."""
+
+    A = "11111111-1111-4111-8111-111111111111"
+    B = "22222222-2222-4222-8222-222222222222"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = self.tmp.name
+        patch = mock.patch.dict(os.environ, {"CODEX_HOME": self.home})
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def record(self, identity, cwd, stamp, source="cli", tail=""):
+        folder = os.path.join(self.home, "sessions", "2026", "10", "01")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"rollout-{identity}.jsonl")
+        with open(path, "w") as f:
+            f.write(json.dumps({"type": "session_meta", "payload": {
+                "id": identity, "cwd": cwd, "source": source,
+            }}) + "\n" + tail)
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_newer_task_b_never_displaces_task_a(self):
+        self.record(self.A, "/worktrees/a", 1)
+        self.record(self.B, "/worktrees/b", 2)
+        self.assertEqual(spawn.codex_conversation_id("/worktrees/a"), self.A)
+        self.assertEqual(spawn.codex_conversation_id("/worktrees/b"), self.B)
+        self.assertIsNone(spawn.codex_conversation_id("/worktrees/c"))
+
+    def test_latest_own_interactive_conversation_excludes_subagents(self):
+        self.record(self.A, "/worktrees/a", 1)
+        self.record(self.B, "/worktrees/a", 2, {"subagent": {"other": "reviewer"}})
+        self.assertEqual(spawn.codex_conversation_id("/worktrees/a"), self.A)
+        self.record(self.B, "/worktrees/a", 3)
+        self.assertEqual(spawn.codex_conversation_id("/worktrees/a"), self.B)
+
+    def test_malformed_identity_and_missing_records_are_not_resumable(self):
+        self.assertIsNone(spawn.codex_conversation_id("/worktrees/a"))
+        self.record("--last", "/worktrees/a", 1)
+        self.record(self.B, "/worktrees/another", 2)
+        self.assertIsNone(spawn.codex_conversation_id("/worktrees/a"))
+
+    def test_large_metadata_and_malformed_records(self):
+        path = self.record(self.A, "/worktrees/a", 1)
+        with open(path) as f:
+            record = json.load(f)
+        record["payload"]["base_instructions"] = {"text": "x" * 70000}
+        with open(path, "w") as f:
+            f.write(json.dumps(record) + "\n")
+        self.assertEqual(spawn.codex_conversation_id("/worktrees/a"), self.A)
+        with open(path, "w") as f:
+            f.write('{"type":')
+        self.assertIsNone(spawn.codex_conversation_id("/worktrees/a"))
+
+    def test_conversation_that_moved_to_another_cwd_is_not_resumable(self):
+        self.record(self.A, "/worktrees/a", 1, tail=json.dumps({
+            "type": "turn_context", "payload": {"cwd": "/worktrees/b"},
+        }) + "\n")
+        self.assertIsNone(spawn.codex_conversation_id("/worktrees/a"))
+
+
+class CodexResumeReadinessTests(unittest.TestCase):
+    def test_waits_through_empty_startup_then_reports_composer(self):
+        with mock.patch.object(server, "capture_session_pane", side_effect=[[], ["› Ask Codex", "? for shortcuts"]]) as capture, \
+             mock.patch.object(spawn.time, "sleep"):
+            self.assertEqual(spawn.codex_resume_readiness("centrale-test-task-1"), ("ready", None))
+        self.assertEqual(capture.call_count, 2)
+        capture.assert_called_with("centrale-test-task-1", 0)
+
+    def test_startup_composer_does_not_certify_a_resume_still_loading(self):
+        screens = [["Resuming session…", "› Ask Codex to do anything", "? for shortcuts"],
+                   ["Working directory · resume", "1. Use session directory", "2. Use current directory"]]
+        with mock.patch.object(server, "capture_session_pane", side_effect=screens), \
+             mock.patch.object(spawn.time, "sleep"):
+            outcome, _ = spawn.codex_resume_readiness("centrale-test-task-1")
+        self.assertEqual(outcome, "dialog")
+
+    def test_inline_codex_composer_with_model_directory_footer_is_ready(self):
+        with mock.patch.object(server, "capture_session_pane", return_value=[
+            "› Ask Codex to do anything", "probe default · /tmp/task-a   ⚠ 1 warning · f2 to view",
+        ]), mock.patch.object(spawn.time, "monotonic", side_effect=[0, 6]):
+            self.assertEqual(spawn.codex_resume_readiness("centrale-test-task-1"), ("ready", None))
+
+    def test_picker_header_above_twelve_lines_is_not_ready(self):
+        lines = ["Resume a previous session"] + [f"session {i}" for i in range(20)] + ["› choice", "Select a session"]
+        with mock.patch.object(server, "capture_session_pane", return_value=lines):
+            outcome, _ = spawn.codex_resume_readiness("centrale-test-task-1")
+        self.assertEqual(outcome, "dialog")
+
+    def test_timeout_and_capture_failure_never_claim_resume(self):
+        with mock.patch.object(server, "capture_session_pane", return_value=[]), \
+             mock.patch.object(spawn.time, "monotonic", side_effect=[0, 6]):
+            outcome, _ = spawn.codex_resume_readiness("centrale-test-task-1")
+        self.assertEqual(outcome, "unconfirmed")
+        with mock.patch.object(server, "capture_session_pane", side_effect=server.PaneCaptureError("gone", 404)):
+            outcome, _ = spawn.codex_resume_readiness("centrale-test-task-1")
+        self.assertEqual(outcome, "unconfirmed")
+
+
 class ResumeCmdForAgentTests(unittest.TestCase):
     """Unit tests for spawn.resume_cmd_for_agent, the small lookup
     resume() uses to find an agent's configured resumeCmd (looked up
@@ -2429,6 +2531,16 @@ class ResumeIntegrationTests(unittest.TestCase):
         self.env_patch.start()
         os.environ.pop("CENTRALE_SPAWN_CMD", None)
         self.addCleanup(self.env_patch.stop)
+        self.codex_home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.codex_home.cleanup)
+        os.environ["CODEX_HOME"] = self.codex_home.name
+        folder = os.path.join(self.codex_home.name, "sessions")
+        os.makedirs(folder)
+        with open(os.path.join(folder, f"rollout-{CodexConversationTests.A}.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "session_meta", "payload": {
+                "id": CodexConversationTests.A, "cwd": "/worktrees/my-app-task-2", "source": "cli",
+            }}) + "\n")
+
 
     def _run_resume(self, config, assignees, reconcile=False, sessions=None, status=None):
         fake_git = FakeGit(branch_exists=True, worktree_registered=True, wt_dir="/worktrees/my-app-task-2")
@@ -2437,6 +2549,7 @@ class ResumeIntegrationTests(unittest.TestCase):
              mock.patch.object(server, "list_sessions", return_value=sessions or []), \
              mock.patch.object(server, "run_backlog", return_value=task_view(assignees, status=status)), \
              mock.patch.object(server, "run_backlog_raw") as run_backlog_raw, \
+             mock.patch.object(server, "capture_session_pane", return_value=["› Ask Codex to do anything", "? for shortcuts"]), \
              mock.patch.object(server, "probe_codex_hook_trust", return_value=False), \
              mock.patch("os.path.isdir", return_value=True), \
              mock.patch("os.makedirs"):
@@ -2445,6 +2558,72 @@ class ResumeIntegrationTests(unittest.TestCase):
             else:
                 result = spawn.resume(config, "my-app", "TASK-2")
         return result, run_tmux, run_backlog_raw, fake_git
+
+    def test_codex_without_own_conversation_starts_fresh_and_says_so(self):
+        config = dict(self.config, agents=server.normalize_agents_map({"codex": ["codex"]}),
+                      defaultAgent="codex")
+        with mock.patch.object(spawn, "codex_conversation_id", return_value=None), \
+             mock.patch.object(spawn, "codex_resume_readiness", return_value=("ready", None)):
+            result, tmux, _, _ = self._run_resume(config, [])
+        argv = new_session_argv(tmux)
+        self.assertNotIn("resume", argv)
+        self.assertIn(spawn.RESUME_FALLBACK_NOTE, argv[-1])
+        self.assertFalse(result["resumed"])
+        self.assertEqual(result["conversationStatus"], "fresh")
+        self.assertIsNone(result["conversationId"])
+
+    def test_codex_resume_a_ignores_later_b_and_reports_selected_identity(self):
+        folder = os.path.join(self.codex_home.name, "sessions")
+        with open(os.path.join(folder, f"rollout-{CodexConversationTests.B}.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "session_meta", "payload": {
+                "id": CodexConversationTests.B, "cwd": "/worktrees/my-app-task-3", "source": "cli",
+            }}) + "\n")
+        config = dict(self.config, agents=server.normalize_agents_map({"codex-alias": ["/usr/bin/codex", "--model", "m-1"]}),
+                      defaultAgent="codex-alias")
+        result, tmux, _, _ = self._run_resume(config, [])
+        self.assertTrue(result["resumed"])
+        self.assertEqual(result["conversationId"], CodexConversationTests.A)
+        self.assertEqual(result["conversationStatus"], "resumed")
+        argv = new_session_argv(tmux)
+        self.assertIn(CodexConversationTests.A, argv)
+        self.assertNotIn(CodexConversationTests.B, argv)
+        self.assertNotIn("--last", argv)
+
+    def test_codex_launch_pins_the_record_store_in_tmux_environment(self):
+        config = dict(self.config, agents=server.normalize_agents_map({"codex": ["codex"]}),
+                      defaultAgent="codex")
+        _, tmux, _, _ = self._run_resume(config, [])
+        self.assertIn("CODEX_HOME=" + self.codex_home.name, new_session_argv(tmux))
+
+    def test_codex_missing_conversation_reconcile_uses_fresh_framing(self):
+        config = dict(self.config, agents=server.normalize_agents_map({"codex": ["codex"]}),
+                      defaultAgent="codex")
+        with mock.patch.object(spawn, "codex_conversation_id", return_value=None):
+            result, tmux, _, _ = self._run_resume(config, [], reconcile=True)
+        self.assertFalse(result["resumed"])
+        prompt = new_session_argv(tmux)[-1]
+        self.assertIn("Reconcile backlog task", prompt)
+        self.assertIn(spawn.RESUME_FALLBACK_NOTE, prompt)
+        self.assertNotIn("You built this branch", prompt)
+
+    def test_codex_directory_override_refuses_before_launch(self):
+        for flags in (["--cd", "/other"], ["-C/other"], ["-C=/other"], ["--remote=unix:///other"], ["--worktree"], ["resume", "--last"]):
+            config = dict(self.config, agents=server.normalize_agents_map({"codex": ["codex", *flags]}),
+                          defaultAgent="codex")
+            with self.subTest(flags=flags):
+                with self.assertRaises(spawn.SpawnError) as cm:
+                    self._run_resume(config, [])
+                self.assertEqual(cm.exception.status, 409)
+
+    def test_codex_resume_dialog_is_reported_as_not_resumed(self):
+        config = dict(self.config, agents=server.normalize_agents_map({"codex": ["codex"]}),
+                      defaultAgent="codex")
+        with mock.patch.object(spawn, "codex_conversation_id", return_value=CodexConversationTests.A), \
+             mock.patch.object(spawn, "codex_resume_readiness", return_value=("dialog", "Working directory · resume")):
+            result, _, _, _ = self._run_resume(config, [])
+        self.assertFalse(result["resumed"])
+        self.assertEqual(result["conversationStatus"], "dialog")
+        self.assertEqual(result["conversationId"], CodexConversationTests.A)
 
     def test_configured_resume_cmd_is_used_with_no_prompt_argument(self):
         config = make_config("/worktrees", [{"name": "my-app", "path": "/repos/my-app"}])
@@ -2542,7 +2721,7 @@ class ResumeIntegrationTests(unittest.TestCase):
 
     def test_codex_agent_arguments_ride_along_on_resume(self):
         # task-183: resume uses the agent's own arguments from
-        # projects.json -- right after `resume --last`, before the hook
+        # projects.json -- right after `resume <UUID>`, before the hook
         # overrides -- so a resumed agent keeps its model and config.
         config = make_config("/worktrees", [{"name": "my-app", "path": "/repos/my-app"}])
         config["agents"] = server.normalize_agents_map({
@@ -2555,14 +2734,12 @@ class ResumeIntegrationTests(unittest.TestCase):
         cmd_start = tmux_args.index("codex")
         self.assertEqual(
             tmux_args[cmd_start:cmd_start + 7],
-            ["codex", "resume", "--last", "--model", "m-1", "-c", 'model_reasoning_effort="high"'],
+            ["codex", "resume", CodexConversationTests.A, "--model", "m-1", "-c", 'model_reasoning_effort="high"'],
         )
 
-    def test_codex_family_agent_without_resume_cmd_defaults_to_resume_last(self):
-        # task-115: the codex equivalent of `claude --continue`. Both the
-        # picker and --last filter by working directory unless --all is
-        # passed, and every task has its own worktree, so this continues
-        # THIS task's conversation rather than some other repo's.
+    def test_codex_family_agent_without_resume_cmd_defaults_to_explicit_identity(self):
+        # task-195: explicit identity from this worktree's Codex records;
+        # recency-based --last did not reliably filter by cwd.
         config = make_config("/worktrees", [{"name": "my-app", "path": "/repos/my-app"}])
         config["agents"] = server.normalize_agents_map({"codex": ["codex"]})
         config["defaultAgent"] = "codex"
@@ -2571,7 +2748,7 @@ class ResumeIntegrationTests(unittest.TestCase):
         self.assertEqual(result["agent"], "codex")
         tmux_args = new_session_argv(run_tmux)
         cmd_start = tmux_args.index("codex")
-        self.assertEqual(tmux_args[cmd_start:cmd_start + 3], ["codex", "resume", "--last"])
+        self.assertEqual(tmux_args[cmd_start:cmd_start + 3], ["codex", "resume", CodexConversationTests.A])
         # No prompt: the resumed conversation carries its own context.
         self.assertNotIn(spawn.prompt_for("TASK-2"), tmux_args)
         # The codex notify/hook injection still rides along -- `codex
@@ -2582,18 +2759,16 @@ class ResumeIntegrationTests(unittest.TestCase):
             tmux_args,
         )
 
-    def test_resume_cmd_takes_priority_over_codex_default(self):
-        # Tier 1 still wins: a configured resumeCmd is the user's own
-        # choice and must beat the family default.
-        config = make_config("/worktrees", [{"name": "my-app", "path": "/repos/my-app"}])
-        config["agents"] = server.normalize_agents_map({
-            "codex": {"cmd": ["codex"], "resumeCmd": ["codex", "resume", "--yolo"]},
-        })
-        config["defaultAgent"] = "codex"
-        _, run_tmux, _, _ = self._run_resume(config, [])
-        tmux_args = new_session_argv(run_tmux)
-        cmd_start = tmux_args.index("codex")
-        self.assertEqual(tmux_args[cmd_start:cmd_start + 3], ["codex", "resume", "--yolo"])
+    def test_codex_custom_resume_command_cannot_bypass_identity(self):
+        for command in (["codex", "resume", "--last"], ["codex", "resume", CodexConversationTests.B],
+                        ["wrapper", "continue"]):
+            config = dict(self.config, agents=server.normalize_agents_map({
+                "codex": {"cmd": ["codex"], "resumeCmd": command},
+            }), defaultAgent="codex")
+            with self.subTest(command=command), self.assertRaises(spawn.SpawnError) as cm:
+                self._run_resume(config, [])
+            self.assertEqual(cm.exception.status, 409)
+            self.assertIn("remove resumeCmd", str(cm.exception))
 
     def test_resume_cmd_takes_priority_over_claude_default(self):
         config = make_config("/worktrees", [{"name": "my-app", "path": "/repos/my-app"}])
@@ -2669,7 +2844,7 @@ class ReconcileResumeTests(ResumeIntegrationTests):
     """task-66: resume(..., reconcile=True) is the same resume path with
     a different job for the agent; task-133: delivered through the same
     three tiers plain Resume uses (resumeCmd, `claude --continue` /
-    `codex resume --last`, fresh start), with the reconcile prompt as the
+    `codex resume <UUID>`, fresh start), with the reconcile prompt as the
     trailing argument at each. Inherits ResumeIntegrationTests'
     harness (and, deliberately, every one of its normal-resume tests --
     they must still pass untouched with this subclass's setUp)."""
@@ -2757,7 +2932,7 @@ class ReconcileResumeTests(ResumeIntegrationTests):
         self.assertEqual(tmux_args[4:6], ["-c", "/worktrees/my-app-task-2"])
 
     def test_reconcile_codex_family_without_resume_cmd_resumes_last_with_the_prompt(self):
-        # task-133 AC #2 (tier 2, codex): `codex resume --last <prompt>`
+        # task-133 AC #2 (tier 2, codex): `codex resume <UUID> <prompt>`
         # ("[PROMPT] Optional user prompt to start the session"), with the
         # codex notify injection still riding along in between.
         config = make_config("/worktrees", [self._project()])
@@ -2768,7 +2943,7 @@ class ReconcileResumeTests(ResumeIntegrationTests):
         self.assertEqual(result["agent"], "codex")
         tmux_args = new_session_argv(run_tmux)
         cmd_start = tmux_args.index("codex")
-        self.assertEqual(tmux_args[cmd_start:cmd_start + 3], ["codex", "resume", "--last"])
+        self.assertEqual(tmux_args[cmd_start:cmd_start + 3], ["codex", "resume", CodexConversationTests.A])
         self.assertEqual(tmux_args[cmd_start + 3], "-c")
         self.assertEqual(
             tmux_args[-1], spawn.reconcile_prompt_for("TASK-2", "main", resumed=True)
@@ -2807,21 +2982,20 @@ class ReconcileResumeTests(ResumeIntegrationTests):
         result, run_tmux, _, _ = self._run_resume(config, [], reconcile=True)
         self.assertEqual(result["agent"], "codex")
         tmux_args = new_session_argv(run_tmux)
-        self.assertEqual(tmux_args[-6:-3], ["codex", "resume", "--last"])
+        self.assertEqual(tmux_args[-6:-3], ["codex", "resume", CodexConversationTests.A])
         self.assertEqual(tmux_args[-3], "-c")  # codex notify injection, as on every spawn/resume
         prompt_arg = tmux_args[-1]
         self.assertTrue(prompt_arg.startswith("Reconcile backlog task TASK-2"))
         self.assertTrue(prompt_arg.endswith("\n\nPrefer small commits."))
 
-        # Tier 1 (resumeCmd): same placement.
+        # Tier 1 (resumeCmd) remains supported for non-Codex agents.
         config["agents"] = server.normalize_agents_map({
-            "codex": {"cmd": ["codex"], "resumeCmd": ["codex", "resume", "--yolo"],
-                      "promptSuffix": "Prefer small commits."},
+            "claude": {"cmd": ["claude"], "resumeCmd": ["claude", "--continue"],
+                       "promptSuffix": "Prefer small commits."},
         })
+        config["defaultAgent"] = "claude"
         _, run_tmux, _, _ = self._run_resume(config, [], reconcile=True)
-        tmux_args = new_session_argv(run_tmux)
-        self.assertEqual(tmux_args[-6:-3], ["codex", "resume", "--yolo"])
-        self.assertTrue(tmux_args[-1].endswith("\n\nPrefer small commits."))
+        self.assertTrue(new_session_argv(run_tmux)[-1].endswith("\n\nPrefer small commits."))
 
         # Tier 3 (fresh start): prompt, then the note, then the suffix --
         # the same order a plain Resume's fresh start uses.
@@ -3451,6 +3625,16 @@ class SpawnHttpApiTests(unittest.TestCase):
         self.assertEqual(body["session"], "centrale-my-app-task-2")
         self.assertTrue(body["resumed"])
         fake_resume.assert_called_once_with(self.config, "my-app", "TASK-2", reconcile=False)
+
+    def test_resume_api_preserves_identity_fresh_and_dialog_outcomes(self):
+        for state, identity in (("resumed", CodexConversationTests.A), ("fresh", None),
+                                ("dialog", CodexConversationTests.A), ("unconfirmed", CodexConversationTests.A)):
+            response = {"session": "s", "agent": "codex", "resumed": state == "resumed",
+                        "conversationId": identity, "conversationStatus": state}
+            with self.subTest(state=state), mock.patch("spawn.resume", return_value=response):
+                status, body = self._post("/api/resume", json.dumps({"project": "my-app", "taskId": "TASK-2"}).encode())
+            self.assertEqual(status, 200)
+            self.assertEqual(body, response)
 
     def test_post_resume_reconcile_flag_is_plumbed_through(self):
         # task-66: the flag rides on the same endpoint; only a literal

@@ -556,7 +556,7 @@
     input.type = "text";
     input.id = "drawer-pane-reply-input";
     input.className = "settings-input drawer-pane-reply-input";
-    input.placeholder = "Type a one-line reply; Enter sends it";
+    input.placeholder = "Type a one-line reply; Enter sends it (Up/Down go to the agent while this is empty)";
     input.maxLength = 1000; // MAX_SESSION_INPUT_TEXT_CHARS
     input.autocomplete = "off";
     input.spellcheck = false;
@@ -565,6 +565,17 @@
       if (e.key === "Enter") {
         e.preventDefault();
         sendDrawerPaneReply({ text: input.value });
+      } else if ((e.key === "ArrowUp" || e.key === "ArrowDown") && !e.ctrlKey && !e.metaKey && !e.altKey && !e.shiftKey) {
+        // task-203: an empty box has nothing for an arrow to move, so it
+        // goes to the agent like it does from the focused pane; with a
+        // draft in it the caret keeps the key, and the status line says
+        // so rather than leaving the press looking dead.
+        if (input.value) {
+          setDrawerPaneReplyMessage("Up/Down move the cursor while the box has text; clear it to send them to the agent", "error");
+        } else {
+          e.preventDefault();
+          sendDrawerPaneReply({ key: PANE_KEYBOARD_KEYS[e.key] });
+        }
       } else if (e.key === "Escape") {
         // The field owns Escape while focused (like the search box): clear
         // a draft, or drop focus -- never close the drawer under the user.
@@ -721,6 +732,11 @@
       if (payload.key !== undefined) body.key = payload.key; else body.text = payload.text;
       bodies = [body];
     }
+    // task-203: the gate below disables the box for the length of a send,
+    // which drops focus -- so an arrow sent from the box would leave the
+    // next arrow with nowhere to land. Put focus back once it re-enables.
+    var inputBefore = C.byId("drawer-pane-reply-input");
+    var refocus = !!inputBefore && document.activeElement === inputBefore;
     paneReply.inFlight = true;
     updateDrawerPaneReplyGate();
     // task-184: a click on a menu option is N arrows then ONE Enter, sent
@@ -740,7 +756,7 @@
       // starting to answer read as one motion instead of one jump.
       startPaneBurst();
       refreshDrawerPaneNow();
-      if (input && payload.text !== undefined && !input.disabled) input.focus();
+      if (input && (payload.text !== undefined || refocus) && !input.disabled) input.focus();
     }).catch(function (err) {
       paneReply.inFlight = false;
       if (err && err.status === 403) {
@@ -757,6 +773,8 @@
       else msg = "not sent: " + ((err && err.message) || err);
       setDrawerPaneReplyMessage(msg, "error");
       refreshDrawerPaneNow();
+      var failedInput = C.byId("drawer-pane-reply-input");
+      if (refocus && failedInput && !failedInput.disabled) failedInput.focus();
     });
   }
 

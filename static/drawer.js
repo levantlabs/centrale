@@ -351,6 +351,263 @@
     body.scrollTop = Math.max(0, Math.min(view.scrollTop, maxScroll));
   }
 
+  function renderDirectDependencies(body, project, task) {
+    var deps = task.dependencies || [];
+    var depSection = drawerSection(
+      "dependencies",
+      "Dependencies",
+      deps.length ? String(deps.length) : null,
+      deps.length > AUTO_COLLAPSE_ITEMS
+    );
+    if (deps.length === 0) {
+      depSection.body.appendChild(C.h("div", { className: "drawer-empty", text: "None." }));
+    } else {
+      deps.forEach(function (depId) {
+        var depTask = C.findTask(project.name, depId);
+        var status = depTask ? depTask.status : null;
+        var rowClassName = "dep-item" + (depTask ? " dep-item-linked" : "");
+        var row = C.h("div", {
+          className: rowClassName,
+          // data-dep (task-127): the id is what a focused row is found
+          // again by after a refresh rebuilds the body. Only the linked
+          // rows carry it, because only they can hold focus.
+          attrs: depTask ? { tabindex: "0", role: "button", "data-dep": depId } : {}
+        });
+        row.appendChild(C.h("span", { className: "dep-id", text: depId }));
+        row.appendChild(C.h("span", {
+          className: "dep-title" + (depTask ? "" : " unknown"),
+          text: depTask ? (depTask.title || "(untitled)") : "(not on board)"
+        }));
+        if (status) {
+          row.appendChild(C.h("span", { className: "dep-status", text: status }));
+        } else {
+          row.appendChild(C.h("span", { className: "dep-status unknown", text: "unknown" }));
+        }
+        if (depTask) {
+          row.addEventListener("click", function () { openDrawer(project, depTask); });
+          row.addEventListener("keydown", function (e) {
+            if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              openDrawer(project, depTask);
+            }
+          });
+        }
+        depSection.body.appendChild(row);
+      });
+    }
+    body.appendChild(depSection.section);
+  }
+
+  // ---- Dependency chain (task-202) -------------------------------
+  // `graph` is `task view --json`'s dependencyGraph: nodes carry
+  // id/title/status/state/completed, and an edge {from, to} reads
+  // "from depends on to". Everything below is derived from it alone --
+  // no extra backlog command, and statuses are the main checkout's.
+  // A node whose state is not "resolved" (unknown or ambiguous id, a
+  // cycle) is never dropped: it renders as a warning row.
+  var furtherOpen = {}; // "project/id" -> the "further down" line is unfolded
+
+  function depNodeIsOpen(n) {
+    return n.state === "resolved" && !n.completed;
+  }
+
+  function depStatusClass(n) {
+    if (n.completed) return "s-done";
+    return n.status === "In Progress" ? "s-prog" : "s-todo";
+  }
+
+  function depWarningLabel(n) {
+    return n.state === "resolved" ? "" : String(n.state || "unresolved");
+  }
+
+  // Pure: the two halves of the section, from a graph and its root.
+  // Exported for tests as C.buildDependencyView.
+  function buildDependencyView(graph, rootId) {
+    var byId = {};
+    graph.nodes.forEach(function (n) { byId[n.id] = n; });
+    var needs = {}, needed = {};
+    graph.edges.forEach(function (e) {
+      (needs[e.from] = needs[e.from] || []).push(e.to);
+      (needed[e.to] = needed[e.to] || []).push(e.from);
+    });
+    function node(id) {
+      return byId[id] || { id: id, title: "", status: null, state: "unknown", completed: false };
+    }
+
+    // Waiting on: a depth-first tree; a node reached twice (a diamond)
+    // is listed where first reached, and one already on the path (a
+    // cycle) is listed as a warning and not walked into again.
+    var waiting = [], seen = {};
+    seen[rootId] = true;
+    (function walk(id, depth, path) {
+      (needs[id] || []).forEach(function (childId) {
+        if (path[childId]) {
+          waiting.push({ node: Object.assign({}, node(childId), { state: "cycle" }), depth: depth });
+          return;
+        }
+        if (seen[childId]) return;
+        seen[childId] = true;
+        waiting.push({ node: node(childId), depth: depth });
+        var next = Object.assign({}, path);
+        next[childId] = true;
+        walk(childId, depth + 1, next);
+      });
+    })(rootId, 0, (function () { var p = {}; p[rootId] = true; return p; })());
+    var directNeeds = (needs[rootId] || []).map(node).filter(depNodeIsOpen);
+
+    // Blocks: direct dependents (open first), then everything further
+    // along the chain.
+    var directIds = {};
+    var direct = (needed[rootId] || []).map(function (id) { directIds[id] = true; return node(id); });
+    var reach = {}, further = [];
+    reach[rootId] = true;
+    direct.forEach(function (n) { reach[n.id] = true; });
+    var queue = direct.map(function (n) { return n.id; });
+    while (queue.length) {
+      var cur = queue.shift();
+      (needed[cur] || []).forEach(function (id) {
+        if (reach[id]) return;
+        reach[id] = true;
+        further.push(node(id));
+        queue.push(id);
+      });
+    }
+    function openFirst(list) {
+      return list.filter(function (n) { return n.state !== "resolved" || !n.completed; })
+        .concat(list.filter(function (n) { return n.state === "resolved" && n.completed; }));
+    }
+    return {
+      waiting: waiting,
+      waitingOpen: waiting.filter(function (r) { return depNodeIsOpen(r.node); }).length,
+      directNeeds: directNeeds,
+      blocksDirect: openFirst(direct),
+      blocksFurther: openFirst(further)
+    };
+  }
+
+  function joinIds(ids) {
+    if (ids.length <= 1) return ids.join("");
+    return ids.slice(0, -1).join(", ") + " and " + ids[ids.length - 1];
+  }
+
+  function waitingSummary(view) {
+    var open = view.directNeeds;
+    if (view.waiting.length === 0) return "Nothing. This task can proceed.";
+    if (open.length === 0) return "All prerequisites are done.";
+    var line = "Ready once " + joinIds(open.map(function (n) { return n.id; })) +
+      (open.length === 1 ? " is" : " are") + " done.";
+    var statuses = {};
+    open.forEach(function (n) { statuses[n.status] = true; });
+    var kinds = Object.keys(statuses);
+    if (kinds.length === 1 && kinds[0] && kinds[0] !== "null") {
+      line += " " + (open.length === 1 ? "It is" : open.length === 2 ? "Both are" : "All are") +
+        " " + kinds[0].toLowerCase() + " now.";
+    }
+    return line;
+  }
+
+  function blocksSummary(view) {
+    var total = view.blocksDirect.length;
+    var open = view.blocksDirect.filter(depNodeIsOpen).length;
+    var done = view.blocksDirect.filter(function (n) { return n.completed; }).length;
+    if (total === 0) return "";
+    if (open === 0) return "Every task waiting on this one is already done.";
+    var line = "Finishing this unblocks " + pluralCount(open, "open task") + " directly";
+    if (done) line += "; " + done + " of the " + total + " " + (done === 1 ? "is" : "are") + " already done";
+    return line + ".";
+  }
+
+  function depRow(project, n, depth) {
+    var linked = !!C.findTask(project.name, n.id);
+    var warn = depWarningLabel(n);
+    var row = C.h("div", {
+      className: "dep-row" + (n.completed ? " done" : "") + (warn ? " warn" : "") +
+        (linked ? " dep-row-linked" : "") + (depth ? " depth-" + Math.min(depth, 4) : ""),
+      attrs: linked ? { tabindex: "0", role: "button", "data-dep": n.id } : {}
+    });
+    row.appendChild(C.h("span", { className: "dep-id", text: n.id }));
+    if (warn) {
+      row.appendChild(C.h("span", { className: "dep-chip s-wait", text: warn }));
+      row.appendChild(C.h("span", {
+        className: "dep-title",
+        text: n.title || (warn === "cycle" ? "Circular dependency" : "Not a task on this board")
+      }));
+    } else {
+      row.appendChild(C.h("span", { className: "dep-chip " + depStatusClass(n), text: n.status || "unknown" }));
+      row.appendChild(C.h("span", { className: "dep-title", text: n.title || "(untitled)" }));
+    }
+    if (linked) {
+      var open = function () {
+        var t = C.findTask(project.name, n.id);
+        if (t) openDrawer(project, t);
+      };
+      row.addEventListener("click", open);
+      row.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          open();
+        }
+      });
+    }
+    return row;
+  }
+
+  function renderDependencyGraphSections(body, project, task, graph) {
+    var view = buildDependencyView(graph, graph.root || task.id);
+
+    var wait = drawerSection(
+      "waitingOn",
+      "Waiting on",
+      view.waiting.length ? view.waitingOpen + " open" : "0",
+      view.waiting.length > AUTO_COLLAPSE_ITEMS
+    );
+    wait.body.appendChild(C.h("div", { className: "dep-summary", text: waitingSummary(view) }));
+    view.waiting.forEach(function (r) { wait.body.appendChild(depRow(project, r.node, r.depth)); });
+    body.appendChild(wait.section);
+
+    var nDirect = view.blocksDirect.length, nFurther = view.blocksFurther.length;
+    var blocks = drawerSection(
+      "blocks",
+      "Blocks",
+      nDirect + nFurther === 0 ? "0" :
+        nDirect + " direct" + (nFurther ? " · " + nFurther + " further" : ""),
+      nDirect > AUTO_COLLAPSE_ITEMS
+    );
+    if (nDirect + nFurther === 0) {
+      blocks.body.appendChild(C.h("div", { className: "drawer-empty", text: "Nothing waits on this task." }));
+    } else {
+      if (nDirect) blocks.body.appendChild(C.h("div", { className: "dep-summary", text: blocksSummary(view) }));
+      view.blocksDirect.forEach(function (n) { blocks.body.appendChild(depRow(project, n, 0)); });
+      if (nFurther) {
+        var key = project.name + "/" + task.id;
+        var wrap = C.h("div", { className: "dep-further" });
+        var list = C.h("div", { className: "dep-further-list" });
+        view.blocksFurther.forEach(function (n) { list.appendChild(depRow(project, n, 0)); });
+        var toggle = C.h("button", {
+          className: "dep-more",
+          attrs: { type: "button" }
+        });
+        var sync = function () {
+          var openNow = !!furtherOpen[key];
+          toggle.setAttribute("aria-expanded", openNow ? "true" : "false");
+          toggle.textContent = openNow
+            ? "Hide the " + nFurther + " further down the chain"
+            : "Show " + nFurther + " further down the chain (" +
+              view.blocksFurther.map(function (n) { return n.id.replace(/^[A-Za-z]+-/, ""); }).join(", ") + ")";
+          list.hidden = !openNow;
+        };
+        toggle.addEventListener("click", function () { furtherOpen[key] = !furtherOpen[key]; sync(); });
+        sync();
+        wrap.appendChild(toggle);
+        wrap.appendChild(list);
+        blocks.body.appendChild(wrap);
+      }
+    }
+    body.appendChild(blocks.section);
+  }
+
+  C.buildDependencyView = buildDependencyView;
+
   function renderDrawerDetail(task, project, branchTask, preserveView) {
     var body = C.byId("drawer-body");
     var view = preserveView ? captureDrawerBodyView(body) : null;
@@ -413,51 +670,15 @@
     }
     body.appendChild(acSection.section);
 
-    // Dependencies
-    var deps = task.dependencies || [];
-    var depSection = drawerSection(
-      "dependencies",
-      "Dependencies",
-      deps.length ? String(deps.length) : null,
-      deps.length > AUTO_COLLAPSE_ITEMS
-    );
-    if (deps.length === 0) {
-      depSection.body.appendChild(C.h("div", { className: "drawer-empty", text: "None." }));
+    // Dependencies (task-202): the full chain from the view's
+    // dependencyGraph as "Waiting on" and "Blocks"; a view without the
+    // graph (an older backlog) keeps the direct list below.
+    var graph = task.dependencyGraph;
+    if (graph && Array.isArray(graph.nodes) && Array.isArray(graph.edges)) {
+      renderDependencyGraphSections(body, project, task, graph);
     } else {
-      deps.forEach(function (depId) {
-        var depTask = C.findTask(project.name, depId);
-        var status = depTask ? depTask.status : null;
-        var rowClassName = "dep-item" + (depTask ? " dep-item-linked" : "");
-        var row = C.h("div", {
-          className: rowClassName,
-          // data-dep (task-127): the id is what a focused row is found
-          // again by after a refresh rebuilds the body. Only the linked
-          // rows carry it, because only they can hold focus.
-          attrs: depTask ? { tabindex: "0", role: "button", "data-dep": depId } : {}
-        });
-        row.appendChild(C.h("span", { className: "dep-id", text: depId }));
-        row.appendChild(C.h("span", {
-          className: "dep-title" + (depTask ? "" : " unknown"),
-          text: depTask ? (depTask.title || "(untitled)") : "(not on board)"
-        }));
-        if (status) {
-          row.appendChild(C.h("span", { className: "dep-status", text: status }));
-        } else {
-          row.appendChild(C.h("span", { className: "dep-status unknown", text: "unknown" }));
-        }
-        if (depTask) {
-          row.addEventListener("click", function () { openDrawer(project, depTask); });
-          row.addEventListener("keydown", function (e) {
-            if (e.key === "Enter" || e.key === " ") {
-              e.preventDefault();
-              openDrawer(project, depTask);
-            }
-          });
-        }
-        depSection.body.appendChild(row);
-      });
+      renderDirectDependencies(body, project, task);
     }
-    body.appendChild(depSection.section);
 
     // Implementation plan
     var planWords = wordCount(task.implementationPlan);

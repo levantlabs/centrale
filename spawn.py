@@ -26,6 +26,8 @@ import tempfile
 import threading
 import time
 import urllib.parse
+import uuid
+from pathlib import Path
 
 import server
 
@@ -1499,6 +1501,85 @@ RESUME_FALLBACK_NOTE = (
 # already in there, so this note doesn't repeat it separately.
 
 
+def codex_home_dir():
+    """The same absolute record/config store for lookup and tmux's child."""
+    return os.path.abspath(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+
+
+def codex_conversation_id(wt_dir):
+    """Latest interactive UUID belonging to this exact worktree (task-195).
+
+    Read Codex's own records on each resume; never keep a task/session map.
+    CODEX_HOME is shared with the launched CLI. Metadata identifies the
+    original cwd; turn contexts also exclude conversations moved elsewhere.
+    Subagents share cwd but are not the task's interactive conversation.
+    Unreadable, malformed or incomplete records cannot establish identity.
+    """
+    home = Path(codex_home_dir())
+    target = os.path.realpath(wt_dir)
+    candidates = []
+    for folder, _, names in os.walk(home / "sessions"):
+        for name in names:
+            if not name.endswith(".jsonl"):
+                continue
+            path = Path(folder) / name
+            try:
+                with path.open(encoding="utf-8") as stream:
+                    meta = json.loads(stream.readline())
+                payload = meta.get("payload", {})
+                if (meta.get("type") != "session_meta"
+                        or payload.get("source") != "cli"
+                        or not isinstance(payload.get("cwd"), str)
+                        or os.path.realpath(payload["cwd"]) != target):
+                    continue
+                identity = str(uuid.UUID(payload["id"]))
+                # UUID lookup uses the rollout filename too; reject records
+                # whose metadata and filename disagree.
+                if not name.endswith(f"-{identity}.jsonl"):
+                    continue
+                candidates.append((path.stat().st_mtime_ns, identity, path))
+            except (OSError, ValueError, TypeError, KeyError, AttributeError):
+                continue
+    for _, identity, path in sorted(candidates, reverse=True):
+        try:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    event = json.loads(line)
+                    if event.get("type") in {"session_meta", "turn_context"}:
+                        cwd = event.get("payload", {}).get("cwd")
+                        if not isinstance(cwd, str) or os.path.realpath(cwd) != target:
+                            break
+                else:
+                    return identity
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+    return None
+
+
+def codex_resume_readiness(name):
+    """Bounded current-screen check; process creation alone is not resume.
+
+    The normal composer plus shortcut footer is evidence the TUI left its
+    startup dialogs. Unknown/empty screens fail closed, with the pane left
+    available for inspection. Uses the existing injectable tmux boundary.
+    """
+    deadline = time.monotonic() + 5.0
+    while True:
+        try:
+            lines = server.capture_session_pane(name, 0)
+        except server.PaneCaptureError as exc:
+            return "unconfirmed", str(exc)
+        loading = server.codex_resume_loading(lines)
+        dialog = server.detect_pane_dialog(lines)
+        if dialog and not loading:
+            return "dialog", dialog
+        if not loading and server.codex_pane_has_composer(lines):
+            return "ready", None
+        if time.monotonic() >= deadline:
+            return "unconfirmed", "Codex startup has not shown a normal conversation composer"
+        time.sleep(0.1)
+
+
 def resume_cmd_for_agent(config, agent_name):
     """The configured `resumeCmd` for `agent_name`, or None if it has
     none. Looked up separately from resolve_agent (rather than folded
@@ -1539,7 +1620,7 @@ RECONCILE_PROMPT_TEMPLATE = (
 # being continued built this branch, so it already holds the why of every
 # change on it (that is exactly what reconciling a semantic conflict
 # needs, and why the prompt now rides along with `--continue`/`resume
-# --last` instead of replacing the conversation); the one thing it holds
+# <UUID>` instead of replacing the conversation); the one thing it holds
 # that is wrong is its memory of the base branch, which the prompt's own
 # orient-then-merge instructions correct by sending it to the repository.
 RECONCILE_RESUMED_CONTEXT = (
@@ -1560,7 +1641,7 @@ def reconcile_prompt_for(task_id, base_branch, check_command=None, resumed=False
 
     resumed=True (task-133) is the prompt as delivered alongside a
     resumed conversation (`claude --continue <prompt>`, `codex resume
-    --last <prompt>`, or a configured resumeCmd): identical text plus
+    <UUID> <prompt>`, or a configured resumeCmd): identical text plus
     RECONCILE_RESUMED_CONTEXT, since "you built this branch; the base
     has moved" is the truer framing for an agent that did. The fresh
     variant (resumed=False) is what a fresh start gets, and what the
@@ -1585,15 +1666,16 @@ def resume(config, project_name, task_id, reconcile=False):
     first time it was spawned) and starts a new tmux session there
     running the resolved agent's resume command, in priority order:
 
+    Codex uses only a verified UUID from its own records for this worktree,
+    otherwise starts fresh with RESUME_FALLBACK_NOTE. Custom Codex resumeCmd
+    and directory/session overrides refuse with 409. Other agents use:
+
     1. that agent's configured `resumeCmd` (see server.normalize_agents_map),
        if it has one -- no prompt argument, since the resumed conversation
        already has its own context (the reconcile variant below is the
        one exception: there the job is new, and the prompt is appended);
-    2. else, the family default for an agent Centrale ships (decided by
-       its `cmd`'s first argv element, so a wrapper script or an absolute
-       path is treated as neither): `["claude", "--continue"]` for
-       "claude", `["codex", "resume", "--last"]` for "codex" -- also no
-       prompt, since each continues that worktree's own conversation;
+    2. else, `["claude", "--continue"]` plus configured arguments for
+       an executable literally named "claude";
     3. else, a fresh start: that agent's own `cmd` with the standard
        workflow prompt, plus RESUME_FALLBACK_NOTE calling out that prior
        work already exists in the worktree.
@@ -1614,7 +1696,7 @@ def resume(config, project_name, task_id, reconcile=False):
     except that reconcile_prompt_for()'s prompt (plus the agent's
     promptSuffix) is the trailing argument at EVERY tier (task-133):
     `resumeCmd + [prompt]`, `["claude", "--continue", prompt]` /
-    `["codex", "resume", "--last", prompt]` (both CLIs accept a prompt
+    `["codex", "resume", <verified UUID>, prompt]` (both CLIs accept a prompt
     alongside resume and deliver it into the continued conversation), or
     the fresh-start `cmd + [prompt + RESUME_FALLBACK_NOTE]`. Reconciling
     is a fully specified job (merge <base> into the branch, resolve
@@ -1631,7 +1713,9 @@ def resume(config, project_name, task_id, reconcile=False):
     the judgment work in its worktree and the ordinary gates re-verify
     the result afterward. The response adds "reconcile": true.
 
-    Returns {"session", "attach", "agent", "resumed": true}. Raises
+    Codex adds conversationId/conversationStatus; resumed is true only
+    for a selected UUID with a normal composer. Other agents retain their
+    existing resumed semantics. Returns session/attach/agent too. Raises
     SpawnError on any failure, same as spawn().
     """
     project, name = _validate_and_check_session(config, project_name, task_id)
@@ -1664,6 +1748,8 @@ def resume(config, project_name, task_id, reconcile=False):
             resumed=resumed,
         )
 
+    conversation_id = None
+    codex_launch = False
     if spawn_cmd_override():
         cmd = spawn_cmd()
         agent_name = None
@@ -1677,27 +1763,36 @@ def resume(config, project_name, task_id, reconcile=False):
         # (it already has its context); reconcile passes the reconcile
         # prompt at the same tiers, as the trailing argument -- the job is
         # new even though the conversation is not (task-133).
-        if resume_cmd:
+        if agent_kind == "codex" or agent_kind_for_command(resume_cmd or []) == "codex":
+            # A custom resume command can select a foreign UUID, remote
+            # server or cwd. Refuse it rather than silently bypass this
+            # identity gate. Removing it enables the safe built-in path.
+            if resume_cmd:
+                raise SpawnError(
+                    "Codex resumeCmd cannot establish task conversation identity; "
+                    "remove resumeCmd to use the worktree-bound UUID resume", status=409,
+                )
+            # These options can redirect identity/cwd or turn this into a
+            # different command. Ordinary model/config/approval flags stay.
+            if any(arg in {"resume", "--last", "--all", "--remote", "--cd", "-C", "--worktree"}
+                   or arg.startswith(("--remote=", "--cd=", "-C"))
+                   for arg in agent_cmd[1:]):
+                raise SpawnError("Codex resume refuses session or working-directory overrides in cmd", status=409)
+            codex_launch = True
+            conversation_id = codex_conversation_id(wt_dir)
+            if conversation_id:
+                cmd = [agent_cmd[0], "resume", conversation_id, *agent_cmd[1:]]
+                prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
+            else:
+                cmd = agent_cmd
+                base_prompt = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
+                prompt_arg = base_prompt + RESUME_FALLBACK_NOTE
+                warnings.append("No verified Codex conversation for this worktree; started fresh with prior-work instructions")
+        elif resume_cmd:
             cmd = resume_cmd
             prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
         elif agent_cmd and agent_cmd[0] == "claude":
-            # task-183: the agent's own arguments from projects.json ride
-            # along (--model, --permission-mode, ...), so a resumed agent
-            # runs as configured; an agent with none resumes with none.
             cmd = ["claude", "--continue", *agent_cmd[1:]]
-            prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
-        elif agent_cmd and agent_cmd[0] == "codex":
-            # task-115: the codex equivalent of `claude --continue`. Both
-            # the picker and --last filter by working directory unless
-            # --all is passed ("Show all sessions (disables cwd
-            # filtering)"), and every task has its own worktree, so "the
-            # most recent session here" is this task's own conversation --
-            # verified empirically: the picker in two different repos
-            # lists two different sets, and --all lists both plus more.
-            # The injected -c hook overrides still apply: `codex resume`
-            # takes -c the same way the top-level command does -- and so
-            # do the agent's own arguments (-m/--model, -c), task-183.
-            cmd = ["codex", "resume", "--last", *agent_cmd[1:]]
             prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
         else:
             cmd = agent_cmd
@@ -1709,6 +1804,11 @@ def resume(config, project_name, task_id, reconcile=False):
             prompt_arg = f"{prompt_arg}\n\n{prompt_suffix}"
 
     tmux_args = new_session_args(name, wt_dir)
+    if codex_launch:
+        # A long-lived tmux server can retain a different CODEX_HOME.
+        # Explicitly bind its child to the store whose UUID we verified.
+        tmux_args += ["-e", f"CODEX_HOME={codex_home_dir()}"]
+
     if agent_name is not None:
         tmux_args += ["-e", f"CENTRALE_AGENT={agent_name}"]
     tmux_args += [
@@ -1738,6 +1838,15 @@ def resume(config, project_name, task_id, reconcile=False):
         "agent": agent_name if agent_name is not None else "custom",
         "resumed": True,
     }
+    if codex_launch:
+        readiness, reason = codex_resume_readiness(name)
+        result["conversationId"] = conversation_id
+        result["resumed"] = bool(conversation_id) and readiness == "ready"
+        result["conversationStatus"] = (
+            ("resumed" if conversation_id else "fresh") if readiness == "ready" else readiness
+        )
+        if reason:
+            warnings.append(f"Codex not confirmed resumed: {reason}; inspect {name} before sending a ruling")
     if reconcile:
         result["reconcile"] = True
     if warnings:

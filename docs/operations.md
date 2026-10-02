@@ -247,8 +247,18 @@ The fleet observation journal (task-186) is a second state file:
 append and snapshot reads. Compaction creates a temporary file beside the
 journal and atomically replaces it. Give separate server instances separate
 paths (or separate `XDG_STATE_HOME` values); one process owns each journal.
-The journal survives restart, but live badges are still unknown until fresh
-hooks arrive. Deleting the journal while the server is stopped loses only
+The journal survives restart, and at startup it restores the badges it can
+vouch for (task-201, decision-5): a still-live session whose last journal
+state was `finished`, `idle` or `waiting` gets that state back with its
+original start time, provided the row is not older than the tmux session's
+creation time (a session recreated under the same name inherits nothing).
+`working` and everything else stay unknown until fresh hooks arrive. A hook
+that fires while the server is down retries in the background for about
+eight seconds, so a quick restart loses no event; a longer outage can leave a
+restored badge stale until the agent's next event, exactly as between any two
+events. Orchestrator history is not journal-backed: see
+[`GET /api/orchestrator-wait`](api.md#get-apiorchestrator-waitprojectnameaftercursortimeoutseconds)
+for what an orchestrator hears after a restart. Deleting the journal while the server is stopped loses only
 observations, never task state. I/O failures appear as `historyError` in
 [`GET /api/fleet`](api.md#get-apifleetwindowseconds).
 
@@ -479,7 +489,7 @@ This is the reproducible manual check to run against a real repository
    ```
 
    Check that the real tasks from each configured project appear, with
-   `ready` flags matching what `backlog task list --ready` reports for that
+   `ready` flags matching what `backlog task list --ready` reports (the board reads the same answer from each task's `isReady`) for that
    repo.
 
 3. Confirm validation rejects bad input before anything is created — each of
@@ -524,15 +534,15 @@ This is the reproducible manual check to run against a real repository
 
 ## Regenerating the documentation screenshots
 
-`docs/img/` holds the four images the README and the docs lead with —
-`board-light.png`, `board-dark.png`, `drawer-pane.png` and
-`session-theater.png`. They are generated, not hand-taken:
+`docs/img/` holds the images the README and the docs lead with —
+`board-light.png`, `board-dark.png`, `drawer-pane.png`, `drawer-deps.png`,
+`session-theater.png` and the `view-*` set. They are generated, not hand-taken:
 
 ```bash
 python3 scripts/screenshots.py
 ```
 
-That rewrites all four in place, at the size and light/dark pairing the
+That rewrites them all in place, at the size and light/dark pairing the
 docs already reference, so the only thing a `git diff` shows is the UI
 change you just made. `--only board-light` (repeatable) shoots one of
 them; `--out <dir>` shoots into a scratch directory instead, which is how
@@ -625,7 +635,7 @@ inputs outside `backlog/` to discard cached lists. See the
   cleaned up (only a best-effort `atexit` termination on graceful shutdown)
   — see "Opening a project's Backlog.md board" in [docs/board.md](board.md#opening-a-projects-backlogmd-board).
 - Depends on the `backlog` CLI's JSON contract (`schemaVersion: 1`, verified
-  against CLI v1.51.0). A future upstream schema change would need a
+  against CLI v1.53.0). A future upstream schema change would need a
   corresponding update here. Centrale already treats a `schemaVersion` other
   than `1` as a per-project error rather than letting it crash the whole
   board or the `/api/task` endpoint.

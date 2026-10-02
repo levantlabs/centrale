@@ -161,6 +161,14 @@ without merging.
 | `checkCommand` | Configured check failed on the merged tree or timed out. Read the reason/output and send the worker back to fix it. |
 | `mainCheckoutClean` | Destination has staged changes anywhere, or unstaged/untracked files overlapping the merge. Have their owner resolve them; never discard someone else's edits. Unrelated unstaged files are allowed. |
 
+For Codex, inspect `/api/resume`'s `conversationId` and `conversationStatus`
+before ruling: `resumed` means a verified worktree UUID with a normal composer;
+`fresh` means no eligible conversation existed and the prior-work prompt was
+used. `dialog` and `unconfirmed` both mean `resumed: false`; inspect the pane.
+Rulings refuse resume pickers, working-directory dialogs, and the transitional
+“Resuming session…” screen. A custom Codex
+`resumeCmd` refuses; remove it to enable verified UUID selection.
+
 `POST /api/resume` accepts `reconcile: true` for a branch behind its base;
 this asks the worker to reconcile on its branch. Re-run harvest after the
 worker finishes and its session is ended. When a gate fails, fix what it
@@ -175,7 +183,9 @@ names and harvest again; don't merge by hand to get past it.
 - `idle` / "turn ended · may need input": Codex emits the same event for done
   and asking a question, and an idle event can arrive while it is still
   working. Read the current screen before acting on a Codex idle event.
-- `unknown`: no usable hook signal, often after restart. Inspect the session.
+- `unknown`: no usable hook signal, e.g. a session that was `working` when the
+  server restarted. A restart restores only settled states (`finished`, `idle`,
+  `waiting`) of the same session. Inspect the session.
 - "likely finished": a live unknown-state agent whose branch task says Done,
   shown in the drawer. This is an inference, not a hook or passed merge gate.
 - "ready": Backlog dependency readiness, not merge readiness. "interrupted":
@@ -207,5 +217,9 @@ describe the past and do not authorize actions.
 `CURSOR nothing yet` is normal timeout: call again with that cursor.
 Timeout is 0–300 seconds (default 60); use a longer client timeout.
 History is in memory. 409 means unavailable cursor (restart, wrong project,
-future position): reconcile board/tasks/sessions, then start without `after`.
+future position): drop the cursor and wait without `after`. After a restart
+the first lines name every live session once, e.g. `TASK-2 finished (ready to
+review) (state before the server restart)` or `TASK-3 state unknown after the
+server restart (...)`: handle each (inspect unknown ones), reconcile actions you
+had in flight, then continue with cursors as usual.
 Waiting consumes no events and blocks no other API requests.

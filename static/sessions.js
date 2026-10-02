@@ -63,7 +63,14 @@
       // see effectiveAgentState's doc comment -- so this is the raw
       // agentState, never the "likely finished" fallback.
       var displayState = C.effectiveAgentState(s.agentState, s, null);
-      top.appendChild(C.renderAgentBadge(displayState));
+      // task-170.3: idle behind a dialog or an undelivered message reads as
+      // PARKED whatever the hook state says; the pane's last line is the
+      // badge's title and its own row, so it is visible without attaching.
+      if (s.parked) {
+        top.appendChild(C.renderAgentBadge("parked", s.parked.reason + (s.parked.lastLine ? " \u2014 " + s.parked.lastLine : "")));
+      } else {
+        top.appendChild(C.renderAgentBadge(displayState));
+      }
       if (s.attached) top.appendChild(C.h("span", { className: "live-dot", text: "● attached" }));
       row.appendChild(top);
 
@@ -71,6 +78,10 @@
         var status = C.findTaskStatus(parsed.project, parsed.taskId);
         var descr = parsed.project + " / " + parsed.taskId + (status ? (" — " + status) : "");
         row.appendChild(C.h("div", { className: "created", text: descr }));
+      }
+
+      if (s.parked && s.parked.lastLine) {
+        row.appendChild(C.h("div", { className: "created", text: "last line: " + s.parked.lastLine }));
       }
 
       var createdMs = parseInt(s.created, 10);

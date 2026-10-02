@@ -527,6 +527,7 @@
       text: "turn ended · may need input",
       title: "Codex reports the same turn-end event when it is done and when it is waiting for your chat reply. Attach to check."
     },
+    parked: { className: "agent-badge agent-badge-parked", text: "PARKED" },
     "likely-finished": { className: "agent-badge agent-badge-likely-finished", text: "likely finished" },
     unknown: { className: "agent-badge agent-badge-unknown", text: "state unknown" }
   };

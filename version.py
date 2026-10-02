@@ -52,10 +52,10 @@ with `python3 server.py`; there is no `pip install`, no setup.py and no
 build step, and a version constant does not need one.
 """
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 #: The `backlog` CLI version this release was verified against. Bumping
 #: it is a procedure, not an edit -- see docs/operations.md,
 #: "Versioning": re-run the suite and a real spawn/merge against the new
 #: CLI, update the README's stated version, and say so in the CHANGELOG.
-TESTED_BACKLOG_VERSION = "1.51.0"
+TESTED_BACKLOG_VERSION = "1.53.0"

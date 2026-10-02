@@ -8,14 +8,17 @@
       "status": "In Progress",
       "type": null,
       "priority": null,
-      "assignees": ["@claude"],
+      "assignees": [
+        "@claude"
+      ],
       "reporter": null,
       "labels": [],
       "milestone": null,
       "parentTaskId": null,
       "ordinal": 1000,
       "createdAt": "2026-08-29T20:54:00Z",
-      "updatedAt": "2026-08-29T20:55:00Z"
+      "updatedAt": "2026-08-29T20:55:00Z",
+      "isReady": false
     },
     {
       "id": "TASK-2",
@@ -30,7 +33,8 @@
       "parentTaskId": null,
       "ordinal": 2000,
       "createdAt": "2026-08-29T20:54:00Z",
-      "updatedAt": null
+      "updatedAt": null,
+      "isReady": true
     }
   ]
 }

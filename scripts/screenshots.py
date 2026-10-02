@@ -2,7 +2,7 @@
 """Regenerate docs/img/*.png from committed synthetic data (task-153).
 
 The images the README and docs lead with -- board-light.png,
-board-dark.png, drawer-pane.png, session-theater.png and the
+board-dark.png, drawer-pane.png, drawer-deps.png, session-theater.png and the
 view-{needs-you,fleet,timeline}-{light,dark}.png set -- were hand-taken
 until now, so they drifted silently as the UI moved and nobody could
 tell how stale they were. This script re-shoots them all the same way
@@ -253,12 +253,54 @@ class World:
         }
         return stub
 
-    def task_list(self, project, ready_only=False):
-        tasks = [self._task_stub(t) for t in project["tasks"]]
-        if ready_only:
-            ready = set(project.get("ready") or [])
-            tasks = [t for t in tasks if t["id"] in ready]
+    def task_list(self, project):
+        # task-199/task-200: `task list --json` carries each task's own
+        # isReady and its acceptance-criteria counts, so the board reads
+        # nothing else. Counts come from the main-checkout view's
+        # criteria; a fixture task may state them outright instead.
+        ready = set(project.get("ready") or [])
+        tasks = []
+        for raw in project["tasks"]:
+            stub = self._task_stub(raw)
+            criteria = (project.get("views", {}).get(raw["id"]) or {}).get("acceptanceCriteria") or []
+            stub["isReady"] = raw["id"] in ready
+            stub["acceptanceCriteriaCount"] = raw.get(
+                "acceptanceCriteriaCount", len(criteria))
+            stub["acceptanceCriteriaCompleted"] = raw.get(
+                "acceptanceCriteriaCompleted", sum(1 for c in criteria if c.get("checked")))
+            tasks.append(stub)
         return {"schemaVersion": 1, "kind": "task-list", "tasks": tasks}
+
+    def dependency_graph(self, project, root_id):
+        """`task view --json`'s dependencyGraph (task-202): every task
+        reachable from `root_id` along `dependencies` (what it waits on)
+        and along the reverse (what waits on it), as nodes plus
+        {from, to} edges meaning "from depends on to"."""
+        by_id = {t["id"]: t for t in project["tasks"]}
+        edges, reach = [], {root_id}
+        queue = [root_id]
+        while queue:  # everything the root transitively waits on
+            cur = queue.pop(0)
+            for dep in by_id[cur].get("dependencies") or []:
+                edges.append({"from": cur, "to": dep})
+                if dep not in reach:
+                    reach.add(dep)
+                    queue.append(dep)
+        queue = [root_id]
+        while queue:  # everything that transitively waits on the root
+            cur = queue.pop(0)
+            for t in project["tasks"]:
+                if cur in (t.get("dependencies") or []) and {"from": t["id"], "to": cur} not in edges:
+                    edges.append({"from": t["id"], "to": cur})
+                    if t["id"] not in reach:
+                        reach.add(t["id"])
+                        queue.append(t["id"])
+        nodes = [
+            {"id": i, "title": by_id[i]["title"], "status": by_id[i]["status"],
+             "state": "resolved", "completed": by_id[i]["status"] == "Done"}
+            for i in sorted(reach)
+        ]
+        return {"nodes": nodes, "edges": edges}
 
     def task_view(self, project, task_id, on_branch=False):
         raw = next((t for t in project["tasks"] if t["id"] == task_id), None)
@@ -278,6 +320,7 @@ class World:
             "implementationNotes": None,
         })
         task.update(project.get("views", {}).get(task_id) or {})
+        task["dependencyGraph"] = self.dependency_graph(project, task_id)
         if on_branch:
             task.update(project.get("branchViews", {}).get(task_id) or {})
         return {"schemaVersion": 1, "kind": "task-view", "task": task}
@@ -292,7 +335,7 @@ class World:
         if project is None:
             raise server.BacklogError(f"no such backlog repo in the sandbox: {cwd}")
         if args[:2] == ["task", "list"]:
-            return self.task_list(project, ready_only="--ready" in args)
+            return self.task_list(project)
         if args[:2] == ["task", "view"] and len(args) >= 3:
             try:
                 return self.task_view(project, args[2], on_branch=task_id_of_cwd is not None)
@@ -540,6 +583,18 @@ def shoot(context_factory, shot, out_dir, expected_cards, Image):
                 "() => { var el = document.querySelector('.drawer-branch-section');"
                 " if (el) el.scrollIntoView({block: 'start'}); }"
             )
+        if shot["kind"] == "drawer-deps":
+            # A task nobody is working on: no branch panel or live pane,
+            # so the drawer shows its criteria and the dependency chain
+            # (task-202), scrolled to the Waiting on section.
+            card = page.locator("#board .card").filter(has_text=shot["cardTitle"]).first
+            card.click(position={"x": 10, "y": 10})
+            page.wait_for_selector('#drawer[aria-hidden="false"]')
+            page.wait_for_selector('[data-section="waitingOn"]')
+            page.evaluate(
+                "() => document.querySelector('[data-section=\"waitingOn\"]')"
+                ".scrollIntoView({block: 'center'})"
+            )
         if shot["kind"] == "theater":
             page.click("#drawer-pane-theater-toggle")
             page.wait_for_selector("#theater.open")
@@ -634,7 +689,7 @@ def build_parser():
     parser.add_argument(
         "--only", action="append", metavar="NAME", default=None,
         help="shoot only this image (repeatable): board-light, board-dark, "
-             "drawer-pane, session-theater, view-needs-you-light, "
+             "drawer-pane, drawer-deps, session-theater, view-needs-you-light, "
              "view-fleet-dark, ... (see the fixture's shots).")
     parser.add_argument(
         "--keep", action="store_true",
@@ -769,7 +824,7 @@ def _display_path(path):
 def _card_title(fixture, shot):
     """The card a drawer/theater shot opens, looked up from the fixture
     by project + task id so the shot spec names ids, not prose."""
-    if shot["kind"] not in ("drawer", "theater"):
+    if shot["kind"] not in ("drawer", "drawer-deps", "theater"):
         return None
     project = next(p for p in fixture["projects"] if p["name"] == shot["project"])
     return next(t["title"] for t in project["tasks"] if t["id"] == shot["task"])

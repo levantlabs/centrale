@@ -12,6 +12,7 @@ import copy
 import datetime
 import http.server
 import json
+import math
 import mimetypes
 import os
 import re
@@ -340,6 +341,31 @@ def normalize_refresh_interval(raw):
     return raw
 
 
+# task-170.3: how long an agent must have been idle (finished, idle or no
+# hook yet) before a dialog on its pane or an undelivered message reads as
+# PARKED rather than as a turn that is about to continue.
+DEFAULT_PARKED_AFTER_SECONDS = 180
+MIN_PARKED_AFTER_SECONDS = 10
+
+
+def normalize_parked_after(raw):
+    """Normalize the projects.json 'parkedAfterSeconds' key: missing/None
+    is DEFAULT_PARKED_AFTER_SECONDS, otherwise a whole number of seconds
+    >= MIN_PARKED_AFTER_SECONDS (malformed present value is an error, like
+    refreshIntervalSeconds)."""
+    if raw is None:
+        return DEFAULT_PARKED_AFTER_SECONDS
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        raise ConfigError(
+            f"projects.json: parkedAfterSeconds must be a whole number of seconds, got {raw!r}"
+        )
+    if raw < MIN_PARKED_AFTER_SECONDS:
+        raise ConfigError(
+            f"projects.json: parkedAfterSeconds must be at least {MIN_PARKED_AFTER_SECONDS}, got {raw!r}"
+        )
+    return raw
+
+
 SPAWN_PROMPT_PLACEHOLDER = "task_id"
 
 
@@ -540,6 +566,7 @@ def load_config(path=None):
     harvest_config = normalize_harvest_config(raw.get("harvest"))
     session_preview_config = normalize_session_preview_config(raw.get("sessionPreview"))
     refresh_interval_seconds = normalize_refresh_interval(raw.get("refreshIntervalSeconds"))
+    parked_after_seconds = normalize_parked_after(raw.get("parkedAfterSeconds"))
     subprocess_timeout_seconds = normalize_subprocess_timeout(raw.get("subprocessTimeoutSeconds"))
     spawn_prompt = normalize_spawn_prompt(raw.get("spawnPrompt"))
 
@@ -586,6 +613,7 @@ def load_config(path=None):
         "harvest": harvest_config,
         "sessionPreview": session_preview_config,
         "refreshIntervalSeconds": refresh_interval_seconds,
+        "parkedAfterSeconds": parked_after_seconds,
         "subprocessTimeoutSeconds": subprocess_timeout_seconds,
         "spawnPrompt": spawn_prompt,
         "zeroConfig": zero_config,
@@ -1500,6 +1528,14 @@ def _agent_event_key(project, task_id):
     return (project, str(task_id).upper())
 
 
+# The orchestrator-wait line for each public state worth waking for.
+AGENT_STATE_MESSAGES = {
+    "finished": "finished (ready to review)",
+    "waiting": "waiting for input",
+    "idle": "idle (turn ended, may need input)",
+}
+
+
 def _set_agent_event_locked(key, state, kind):
     """Update badge and notification atomically; caller holds the badge lock."""
     previous = _agent_events.get(key) or {}
@@ -1507,6 +1543,8 @@ def _set_agent_event_locked(key, state, kind):
         "state": state, "agentKind": kind, "lastEventAt": time.time(),
         "agent": previous.get("agent") or kind or "unknown",
     }
+    if previous.get("firedAt") is not None:
+        _agent_events[key]["firedAt"] = previous["firedAt"]
     public_state = "idle" if kind == "codex" and state == "finished" else state
     previous_state = previous.get("state")
     if previous.get("agentKind") == "codex" and previous_state == "finished":
@@ -1514,13 +1552,15 @@ def _set_agent_event_locked(key, state, kind):
     changed = public_state != previous_state
     _agent_events[key]["stateSince"] = (time.time() if changed else previous.get("stateSince"))
     if changed:
+        # task-201: kind and session identity let a restarted server
+        # restore this state only onto the same tmux session instance.
+        details = {"agentKind": kind} if kind else {}
+        created = (fleet_history.sessions.get(key) or {}).get("created")
+        if created is not None:
+            details["created"] = str(created)
         fleet_history.append(*key, _agent_events[key]["agent"], public_state,
-                             timestamp=_agent_events[key]["stateSince"])
-        message = {
-            "finished": "finished (ready to review)",
-            "waiting": "waiting for input",
-            "idle": "idle (turn ended, may need input)",
-        }.get(public_state)
+                             timestamp=_agent_events[key]["stateSince"], **details)
+        message = AGENT_STATE_MESSAGES.get(public_state)
         if message:
             orchestrator.publish(*key, message)
 
@@ -1565,7 +1605,8 @@ def _schedule_codex_wait_locked(key):
     timer.start()
 
 
-def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None):
+def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None,
+                       fired_at=None):
     """Records an agent lifecycle event for (project, taskId). Raises
     ValueError for a state not in AGENT_STATES or a non-null agent kind
     not in AGENT_KINDS -- Handler._handle_agent_event turns that into a
@@ -1576,6 +1617,12 @@ def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None
     previously known kind is retained; every built-in spawn/resume puts
     it in CENTRALE_EVENT_URL, so any subsequent event can restore both
     state and kind after a server restart without persistent storage.
+
+    ``fired_at`` (task-201) is when the hook fired, epoch seconds. A
+    hook that found the server down retries in the background, so two
+    retried events can arrive in either order; one fired before the
+    last applied event, or before a spawn/resume cleared the task, is
+    stale and dropped. Callers that omit it keep arrival order.
     """
     if state not in AGENT_STATES:
         raise ValueError(f"invalid state: {state!r}")
@@ -1584,6 +1631,14 @@ def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None
     with _agent_events_lock:
         key = _agent_event_key(project, task_id)
         previous = _agent_events.get(key) or {}
+        if fired_at is not None:
+            # Same machine, same clock; clamp so a bogus future stamp
+            # cannot shadow every later event.
+            fired_at = min(fired_at, time.time())
+            if fired_at < (previous.get("firedAt") or 0):
+                return
+            previous["firedAt"] = fired_at
+            _agent_events[key] = previous
         if agent_name is not None:
             previous["agent"] = agent_name
             _agent_events[key] = previous
@@ -1677,7 +1732,8 @@ def clear_agent_event(project, task_id, agent_name=None):
                 if key in fleet_history.sessions:
                     record_session_ended(*key)
                 fleet_history.last_survey = time.monotonic()
-            _agent_events[key] = {"agent": agent_name}
+            # A retried hook from the retired session fired before now.
+            _agent_events[key] = {"agent": agent_name, "firedAt": time.time()}
 
 
 def _reset_agent_events():
@@ -1810,12 +1866,17 @@ def _load_board_inputs(path):
             return copy.deepcopy(cached[1])
         _project_board_inputs.pop(key, None)
         list_data = run_backlog(["task", "list", "--json"], cwd=path)
-        ready_data = run_backlog(["task", "list", "--ready", "--json"], cwd=path)
-        for data, command in ((list_data, "task list --json"),
-                              (ready_data, "task list --ready --json")):
-            if not isinstance(data, dict) or data.get("schemaVersion") != 1:
-                raise BacklogError(f"unsupported or missing schemaVersion from `{command}`")
+        if not isinstance(list_data, dict) or list_data.get("schemaVersion") != 1:
+            raise BacklogError("unsupported or missing schemaVersion from `task list --json`")
         tasks = list_data.get("tasks") or []
+        # task-199: readiness is backlog's own isReady on each listed task
+        # (since backlog 1.51), not a second `task list --ready` run. A list
+        # without it must fail loudly, never read as "nothing is ready".
+        for t in tasks:
+            if not isinstance(t, dict) or not isinstance(t.get("isReady"), bool):
+                raise BacklogError(
+                    "missing isReady on a task from `task list --json` "
+                    "(backlog 1.51 or newer required)")
         cacheable = True
         titles = {}
         if any(str(t.get("milestone") or "").strip() for t in tasks):
@@ -1824,7 +1885,7 @@ def _load_board_inputs(path):
             except BacklogError:
                 # Preserve best-effort milestone display, but retry next poll.
                 cacheable = False
-        value = (list_data, ready_data, titles)
+        value = (list_data, titles)
         if cacheable and signature is not None and signature == _backlog_signature(key):
             _project_board_inputs[key] = (signature, copy.deepcopy(value))
         return value
@@ -2207,7 +2268,7 @@ def latest_discard_times(repo_path):
 
 
 def _load_project_board(config, project):
-    """Fetch and merge task list + ready list for a single project. Never
+    """Fetch and merge the task list for a single project. Never
     raises: failures are captured as an "error" field on the result."""
     import harvest  # local import: avoids a circular import at module load
     import spawn  # local import: avoids a circular import at module load
@@ -2228,13 +2289,12 @@ def _load_project_board(config, project):
         return result
 
     try:
-        list_data, ready_data, milestone_titles = _load_board_inputs(path)
+        list_data, milestone_titles = _load_board_inputs(path)
     except BacklogError as exc:
         result["error"] = str(exc)
         return result
 
     tasks = list_data.get("tasks") or []
-    ready_ids = {t.get("id") for t in (ready_data.get("tasks") or [])}
 
     # One `git for-each-ref` call for the whole project (never one per
     # task) to flag which tasks have an unmerged task/<id> branch. main's
@@ -2277,7 +2337,7 @@ def _load_project_board(config, project):
     for task in tasks:
         merged = dict(task)
         task_id = merged.get("id")
-        merged["ready"] = task_id in ready_ids
+        merged["ready"] = merged["isReady"]
         has_branch = task_id in spawn_branch_ids
         merged["hasSpawnBranch"] = has_branch
         merged.update(get_agent_lifecycle(name, task_id))
@@ -2470,6 +2530,140 @@ def observe_fleet_sessions(sessions, config, surveyed_at=None):
             fleet_history.sessions[key] = {"created": created, "observedAt": surveyed_at}
 
 
+RESTORABLE_AGENT_STATES = ("finished", "idle", "waiting")
+
+
+def restore_agent_states(config, sessions):
+    """Boot-time restore of live sessions' badges from the journal (task-201).
+
+    A restart forgets every hook-reported state, and hook state cannot be
+    re-derived from tmux. The fleet journal already recorded each change,
+    so a still-live session gets its last state back -- but only a settled
+    one (finished, idle, waiting: "working" is exactly the state a missed
+    event leaves wrong), and only onto the same tmux session instance: the
+    row must not predate the session's creation, and a row that recorded
+    the session's creation time must name this one. Anything else stays
+    unknown, as before. Restoring writes no journal row and publishes
+    nothing; announce_restart_states does the announcing. Returns the
+    restored keys. Owner-approval exception: see decision-5.
+    """
+    restored = []
+    for session in sessions:
+        project, task_id = _parse_session_project_and_task(session.get("name", ""), config)
+        if project is None:
+            continue
+        key = _agent_event_key(project["name"], task_id)
+        try:
+            created = float(session.get("created"))
+        except (TypeError, ValueError):
+            continue
+        row = fleet_history.last_agent_state(*key)
+        if row.get("state") not in RESTORABLE_AGENT_STATES or row["timestamp"] < created:
+            continue
+        if row.get("created") is not None and str(row["created"]) != str(session.get("created")):
+            continue
+        kind = row.get("agentKind") if row.get("agentKind") in AGENT_KINDS else None
+        state = row["state"]
+        if state == "idle":
+            # Only a codex turn end is published as idle; keep the raw form.
+            state, kind = "finished", "codex"
+        with _agent_events_lock:
+            if _agent_events.get(key, {}).get("state"):
+                continue  # a hook already reported this session's present
+            _agent_events[key] = {
+                "state": state, "agentKind": kind, "agent": row["agent"],
+                "stateSince": row["timestamp"], "lastEventAt": row["timestamp"],
+                "firedAt": row["timestamp"],
+            }
+        restored.append(key)
+    return restored
+
+
+def announce_restart_states(config, sessions):
+    """Publish one orchestrator-wait line per live session at boot.
+
+    History is per process, so every pre-restart cursor 409s; the
+    recovery is a fresh wait without ``after``, which starts at this
+    process's first line -- these. That call hears every live session in
+    its project once: the restored state, or that the state is unknown.
+    """
+    for session in sessions:
+        project, task_id = _parse_session_project_and_task(session.get("name", ""), config)
+        if project is None:
+            continue
+        state = get_agent_state(project["name"], task_id)
+        message = AGENT_STATE_MESSAGES.get(state)
+        if message:
+            message = f"{message} (state before the server restart)"
+        else:
+            message = (f"{state} after the server restart" if state != "unknown" else
+                       "state unknown after the server restart (no hook event since; "
+                       "check the session)")
+        orchestrator.publish(project["name"], task_id, message)
+
+
+def parked_status(config, session, state, since, deliveries, now=None):
+    """PARKED evidence for one live session, or None (task-170.3).
+
+    Claude's Notification hook already yields "waiting", but the cases
+    that cost hours fire no hook: a startup modal (no hook has ever
+    fired), a dialog that appears AFTER the Stop hook, a held inbound
+    message, and everything on codex, which has no Notification hook. So
+    PARKED is derived on read, never stored: the agent has sat in
+    finished/idle/unknown for at least parkedAfterSeconds AND either its
+    pane shows a dialog or the latest delivery attempt to it, made during
+    this session, was not confirmed. A finished agent with a clean pane
+    and nothing pending is never flagged. `waiting` is excluded: that is
+    already the permission item. `session` is the list_sessions row,
+    `since` the epoch the current state began (None: the session's start).
+
+    Returns {"reason", "since", "lastLine", "dialog"}; lastLine is the
+    pane's last non-blank line (None when the pane cannot be read or
+    sessionPreview is off), the answer to "what is it stuck on"."""
+    if state not in ("finished", "idle", "unknown"):
+        return None
+    now = time.time() if now is None else now
+    try:
+        created = float(session.get("created"))
+    except (TypeError, ValueError):
+        created = None
+    began = since if since is not None else created
+    if began is None or now - began < config.get("parkedAfterSeconds", DEFAULT_PARKED_AFTER_SECONDS):
+        return None
+    project, task_id = _parse_session_project_and_task(session.get("name", ""), config)
+    if project is None:
+        return None
+    key = (project["name"], task_id.upper())
+    pending = None
+    for row in deliveries:
+        if (row.get("project"), str(row.get("task", "")).upper()) != key:
+            continue
+        stamp = _inbox_timestamp(row.get("time"))
+        if stamp is None or (created is not None and stamp < created):
+            continue  # an earlier session's message
+        if pending is None or stamp >= pending[0]:
+            pending = (stamp, row)
+    undelivered = pending[1] if pending and pending[1].get("outcome") != "delivered" else None
+    dialog, last_line = None, None
+    if session_preview_mode(config) != "off":
+        try:
+            lines = capture_session_pane(session["name"], MAX_SESSION_PANE_LINES)
+            dialog = detect_pane_dialog(lines)
+            shown = [line.strip() for line in lines if line.strip()]
+            last_line = shown[-1] if shown else None
+        except PaneCaptureError:
+            pass
+    if dialog is None and undelivered is None:
+        return None
+    reasons = []
+    if dialog is not None:
+        reasons.append("dialog on the pane")
+    if undelivered is not None:
+        reasons.append("message not delivered (" + str(undelivered.get("outcome")) + ")")
+    return {"reason": " + ".join(reasons), "since": began,
+            "lastLine": last_line, "dialog": dialog}
+
+
 def get_fleet(config, window=fleet.DEFAULT_WINDOW):
     surveyed_at = time.monotonic()
     sessions = list_sessions(strict=True)
@@ -2502,6 +2696,10 @@ def get_fleet(config, window=fleet.DEFAULT_WINDOW):
                         deliverySkippedLines=skipped, deliveryError=None)
     except (OSError, UnicodeError) as exc:
         snapshot.update(messages=[], deliverySkippedLines=0, deliveryError=str(exc))
+    sessions_by_name = {s.get("name"): s for s in sessions}
+    for a in agents:
+        a["parked"] = parked_status(config, sessions_by_name[a["session"]], a["state"],
+                                    a["stateSince"], entries)
     snapshot["sessionPreviewMode"] = session_preview_mode(config)
     snapshot["needsYou"], snapshot["needsYouErrors"] = fleet_inbox(config, snapshot, entries)
     return snapshot
@@ -2546,6 +2744,10 @@ def fleet_inbox(config, snapshot, deliveries):
                         capturedAt=time.time())
             except PaneCaptureError as exc:
                 errors.append(f"{project}/{task_id}: {exc}")
+        elif a.get("parked"):
+            add("parked", project, task_id, a["agent"], a["parked"]["since"],
+                "Agent state " + a["state"] + " + " + a["parked"]["reason"],
+                text=a["parked"]["lastLine"] or "", lastLine=a["parked"]["lastLine"])
         elif a["state"] == "idle":
             # A live Centrale worker writes its report on its own worktree,
             # not main. Never restore a finished badge from durable history.
@@ -3112,12 +3314,39 @@ def read_delivery_log(project=None, task=None, limit=DEFAULT_DELIVERY_LOG_LIMIT)
     return (entries if limit is None else entries[-limit:]), skipped
 
 
+def codex_pane_has_composer(lines):
+    """Normal full-screen or inline Codex footer beside its composer."""
+    tail = [line.strip() for line in lines if line.strip()][-12:]
+    return (any(line.startswith("›") for line in tail)
+            and any("? for shortcuts" in line
+                    or re.match(r"^\S.+ · (?:/|~/)", line) for line in tail))
+
+
+def codex_resume_loading(lines):
+    """Codex renders a composer before its resumed conversation loads."""
+    return next((line.strip() for line in lines if re.fullmatch(
+        r"Resuming session(?:…|\.\.\.)?", line.strip(), re.IGNORECASE)), None)
+
+
 def detect_pane_dialog(lines):
     """The line that shows a dialog is occupying the pane, or None.
 
     A heuristic over the rendered text, pinned against real claude and
     codex captures -- see the note on _DIALOG_FOOTER_RE. Only the bottom
     DELIVERY_DIALOG_REGION_LINES non-blank lines count."""
+    loading = codex_resume_loading(lines)
+    if loading:
+        return loading
+    # task-195: picker rows are unnumbered, and tall pickers place the
+    # heading above the usual footer region. Ignore old headings when a
+    # normal conversation composer/shortcut footer follows them.
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if re.fullmatch(r"(?:Resume (?:a previous )?session|Working directory\s*[·•]\s*resume)",
+                        stripped, re.IGNORECASE):
+            if codex_pane_has_composer(lines[index + 1:]):
+                continue
+            return stripped
     region = [line.strip() for line in lines if line.strip()][-DELIVERY_DIALOG_REGION_LINES:]
     for line in reversed(region):
         if _DIALOG_FOOTER_RE.match(line):
@@ -3183,6 +3412,14 @@ def _delivery_lock_for(name):
         return _delivery_session_locks.setdefault(name, threading.Lock())
 
 
+def _delivery_pane_dialog(name, lines):
+    # Inline Codex may leave its loading marker in scrollback. Confirm
+    # that marker on the current screen; keep scrollback for echo counts.
+    if codex_resume_loading(lines):
+        lines = capture_session_pane(name, 0)
+    return detect_pane_dialog(lines)
+
+
 def deliver_message(name, text):
     """Paste `text` into session `name` and confirm it arrived. Returns a
     dict with "outcome" -- "delivered", "no-session", "dialog", "no-echo"
@@ -3207,12 +3444,12 @@ def deliver_message(name, text):
     with _delivery_lock_for(name):
         try:
             before = capture_session_pane(name, DELIVERY_CAPTURE_LINES)
+            dialog = _delivery_pane_dialog(name, before)
         except PaneCaptureError as exc:
             if exc.status == 404:
                 return {"outcome": "no-session", "reason": f"no live session {name}"}
             return {"outcome": "tmux-error", "reason": str(exc)}
 
-        dialog = detect_pane_dialog(before)
         if dialog is not None:
             return {
                 "outcome": "dialog",
@@ -3248,7 +3485,11 @@ def deliver_message(name, text):
             if _delivery_clock() >= deadline:
                 break
 
-        dialog = detect_pane_dialog(last)
+        try:
+            dialog = _delivery_pane_dialog(name, last)
+        except PaneCaptureError as exc:
+            return {"outcome": "no-session" if exc.status == 404 else "tmux-error",
+                    "reason": f"text was sent but the current pane check failed: {exc}"}
         if dialog is not None:
             return {
                 "outcome": "dialog",
@@ -3416,12 +3657,22 @@ def enrich_sessions_with_files(sessions, config):
     """
     import spawn  # local import: avoids a circular import at module load
 
+    deliveries = None
     for session in sessions:
         project, task_id_lower = _parse_session_project_and_task(session.get("name", ""), config)
         if project is None:
             continue
         session["project"] = project["name"]
         session.update(get_agent_lifecycle(project["name"], task_id_lower))
+        lifecycle = get_fleet_lifecycle(project["name"], task_id_lower)
+        if lifecycle["state"] in ("finished", "idle", "unknown"):
+            if deliveries is None:
+                try:
+                    deliveries = read_delivery_log(limit=None)[0]
+                except (OSError, UnicodeError):
+                    deliveries = []
+            session["parked"] = parked_status(config, session, lifecycle["state"],
+                                              lifecycle["stateSince"], deliveries)
         wt_dir = spawn.worktree_dir(config, project["name"], task_id_lower)
         files, total = _collect_touched_files(wt_dir)
         if files is None:
@@ -4267,10 +4518,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_error_json(400, "malformed request body")
             return
         state = body.get("state")
+        fired_at = body.get("firedAt")
+        if fired_at is not None and (type(fired_at) not in (int, float)
+                                     or not math.isfinite(fired_at)):
+            self._send_error_json(400, "firedAt must be epoch seconds")
+            return
 
         try:
             record_agent_event(project_name, task_id, state, agent_kind=agent_kind,
-                               agent_name=agent_name)
+                               agent_name=agent_name, fired_at=fired_at)
         except ValueError as exc:
             self._send_error_json(400, str(exc))
             return
@@ -5890,6 +6146,19 @@ def main():
     # a restart; one with no task branch behind it has outlived its reason.
     for message in stale_task_lock_messages(spawn.release_stale_task_locks(config)):
         print(f"Centrale: {message}", file=sys.stderr)
+
+    # task-201: before the first request, so a fresh orchestrator-wait
+    # hears every live session's state as this process's first lines.
+    if config["capabilities"]["tmux"]:
+        try:
+            sessions = list_sessions()
+        except (BacklogError, OSError, subprocess.SubprocessError) as exc:
+            print(f"Centrale: could not list sessions to restore agent states: {exc}",
+                  file=sys.stderr)
+        else:
+            observe_fleet_sessions(sessions, config)
+            restore_agent_states(config, sessions)
+            announce_restart_states(config, sessions)
 
     import harvest  # local import: avoids a circular import at module load
 

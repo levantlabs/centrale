@@ -448,11 +448,10 @@ class AgentsDocQuotesTheCodeTests(unittest.TestCase):
     def test_every_resume_family_default_is_named_in_the_doc(self):
         """The resume tiers' family defaults, read out of spawn.resume().
 
-        Tier 2 is a chain of literals inside that function (task-115
-        added the codex one beside claude's), and the doc lists them
-        by hand. Collecting the `cmd = [...]` literals the function
-        assigns is enough to notice a new family, or a changed flag,
-        that the list was never told about.
+        The doc lists each command prefix by hand. Codex's executable
+        and verified UUID are dynamic (task-195); render those as the
+        documented family name and UUID placeholder. Behavioral identity
+        checks live in test_spawn, not this source-shape contract.
         """
         import spawn
 
@@ -468,9 +467,14 @@ class AgentsDocQuotesTheCodeTests(unittest.TestCase):
             for e in elts:
                 if isinstance(e, ast.Starred):
                     break
-                if not (isinstance(e, ast.Constant) and isinstance(e.value, str)):
+                if isinstance(e, ast.Constant) and isinstance(e.value, str):
+                    head.append(e.value)
+                elif isinstance(e, ast.Name) and e.id == "conversation_id":
+                    head.append("<UUID>")
+                elif ast.unparse(e) == "agent_cmd[0]":
+                    head.append("codex")
+                else:
                     return None
-                head.append(e.value)
             return head or None
 
         defaults = [
