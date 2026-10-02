@@ -133,6 +133,10 @@ degrades to an error banner instead of taking the board down. A card also
 shows how many of its acceptance criteria are checked (`3/5`), in amber on a
 Done task that left some unchecked. → [docs/board.md](docs/board.md#using-the-board)
 
+**Check on your agents from a phone.** An opt-in, read-only status page;
+setup, firewall and add-to-home-screen steps (with a screenshot):
+[docs/operations.md](docs/operations.md#checking-status-from-a-phone).
+
 **Three views over your running agents.** Tabs above the board open **Needs
 you** (an inbox of what only a person can do: a permission dialog or menu
 you answer in place with arrows and Enter or a click, an agent that went idle

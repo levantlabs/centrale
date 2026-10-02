@@ -608,6 +608,16 @@
       "theme": "light",
       "project": "my-app",
       "task": "TASK-2"
+    },
+    {
+      "name": "status-page-light",
+      "kind": "phone",
+      "theme": "light"
+    },
+    {
+      "name": "status-page-dark",
+      "kind": "phone",
+      "theme": "dark"
     }
   ]
 }

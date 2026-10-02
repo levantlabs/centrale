@@ -158,6 +158,7 @@ class OrchestratorHttpTests(unittest.TestCase):
         with mock.patch.object(server, "list_sessions", return_value=[{
                 "name": spawn.session_name(self.project, "TASK-2"), "created": 1}]), \
              mock.patch.object(server, "read_delivery_log", return_value=([], 0)), \
+             mock.patch.dict(server._owner_cache, {"at": None, "items": [], "errors": [], "running": False}), \
              mock.patch.object(server, "_task_view_or_none", return_value={
                  "task": {"status": "In Progress", "finalSummary": ""}}):
             status, body, _ = self.request("/api/fleet")

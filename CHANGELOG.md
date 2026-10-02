@@ -23,6 +23,54 @@ would protect is the shape of `projects.json`, the `/api` endpoints
 documented in [docs/api.md](docs/api.md), and what a spawned agent is
 handed.
 
+## v0.5.0 — status page for your phone
+
+You can now check on your agents from a phone, and a few startup and
+slowness bugs are gone.
+
+Tested against **`backlog` v1.53.0**, unchanged from v0.4.0.
+
+**New:**
+
+- **An opt-in, read-only status page for your phone.** Switch on "Read-only
+  status page" in Settings (or set `statusPage` in `projects.json`) and
+  Centrale serves a phone-sized Fleet page on its own port (`7421`): the
+  summary bar, a card per busy project with each agent's state and how long
+  it has been in it, a Needs-you count and the Activity feed, refreshing
+  itself in the phone's light or dark theme. It has no buttons and its
+  listener has no route that changes anything. It listens on every network
+  interface, behind a secret key that Centrale generates into its state
+  directory (never into `projects.json` or a repo); every request without
+  the key gets a 404. Settings, the startup log and `python3 server.py
+  --check` print the ready-made links, and the `<hostname>.local` link is
+  labelled as home Wi-Fi only. It is plain HTTP: treat the link like a
+  password and never port-forward it to the internet. Setup, firewall,
+  Tailscale and SSH-forwarding recipes and add-to-home-screen steps:
+  [docs/operations.md](docs/operations.md#checking-status-from-a-phone).
+- **The dashboard itself still binds `127.0.0.1` only.** The status page is
+  a separate listener, off unless you switch it on, and read-only: it
+  serves nothing but its own page, one data document and a few static
+  files, and shares no routes with the dashboard.
+
+**Changed:**
+
+- **Needs-you owner-question checks no longer stall the board.** The check
+  re-reads a worker's task only when its file changed, and runs in the
+  background, which removes a 7-9 second stall every 30 seconds on large
+  boards. This is a third measured exception to deriving state fresh on
+  every read, written down in [MANIFESTO.md](MANIFESTO.md).
+- **The release scan also fails on private IPv4 addresses and the
+  machine's hostname** (except after `github.com/`), for people cutting
+  their own releases.
+
+**Fixed:**
+
+- **Started as `python3 server.py`, Centrale no longer runs two copies of
+  itself.** Sibling modules used to load a second, empty copy of the
+  server, so the status page showed every agent as unknown, spawns were
+  missing from the history, and the merge, spawn and discard locks were
+  not shared. The running module is now registered, so there is one.
+
 ## v0.4.0 — parked agents, restart-safe states
 
 Agents that are stuck now say so, the board shows more of what a task

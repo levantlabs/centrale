@@ -88,6 +88,51 @@
   }
   C.byId("settings-session-preview-toggle").addEventListener("change", syncSettingsReplyToggle);
 
+  // task-212: the read-only status page's switch, port and bind, and
+  // what the server says about it now: listening (with the links to
+  // open), or why not.
+  function populateStatusPage(page) {
+    page = page || { enabled: false, port: 7421, bind: null, running: false, error: null, links: [] };
+    C.byId("settings-status-page-toggle").checked = !!page.enabled;
+    C.byId("settings-status-page-port").value = page.port;
+    C.byId("settings-status-page-bind").value = page.bind || "";
+    var state = C.byId("settings-status-page-state");
+    var list = C.byId("settings-status-page-links");
+    C.clearChildren(list);
+    if (!page.enabled) {
+      state.textContent = "Off: nothing listens beyond this machine's own dashboard.";
+      return;
+    }
+    if (!page.running) {
+      state.textContent = "Not listening" + (page.error ? ": " + page.error : "") + ". The dashboard is unaffected.";
+      return;
+    }
+    // task-216: labelledLinks carries each link's note (the .local form is
+    // home Wi-Fi only); an older server sends bare links only.
+    var links = page.labelledLinks || (page.links || []).map(function (url) { return { url: url, label: null }; });
+    state.textContent = links.length ? "Listening. Open one of these on your phone (each carries the key):"
+      : "Listening, but this machine has no network address to link to right now.";
+    links.forEach(function (link) {
+      var kids = [C.h("a", { text: link.url, attrs: { href: link.url, target: "_blank", rel: "noreferrer" } })];
+      if (link.label) kids.push(C.h("span", { text: " (" + link.label + ")", className: "settings-hint" }));
+      list.appendChild(C.h("li", { children: kids }));
+    });
+  }
+
+  // Only a changed status page is sent, so a save that never touched it
+  // writes nothing new into projects.json.
+  function statusPagePayload() {
+    var before = (lastSettingsData && lastSettingsData.statusPage) || { enabled: false, port: 7421, bind: null };
+    var portText = String(C.byId("settings-status-page-port").value || "").trim();
+    var next = {
+      enabled: C.byId("settings-status-page-toggle").checked,
+      port: /^[0-9]+$/.test(portText) ? Number(portText) : portText,
+      bind: String(C.byId("settings-status-page-bind").value || "").trim()
+    };
+    if (next.enabled === !!before.enabled && next.port === before.port && next.bind === (before.bind || "")) return null;
+    return next;
+  }
+
   function populateSettingsForm(data) {
     lastSettingsData = data;
     C.byId("settings-harvest-mode-toggle").checked = data.harvestMode === "auto";
@@ -97,6 +142,7 @@
     C.byId("settings-session-reply-toggle").checked = data.sessionPreviewMode === "interact";
     syncSettingsReplyToggle();
     C.byId("settings-refresh-interval").value = data.refreshIntervalSeconds;
+    populateStatusPage(data.statusPage);
 
     var container = C.byId("settings-check-commands");
     // task-185: a save re-renders the cards; keep the ones left open open.
@@ -741,6 +787,8 @@
     // untouched one leaves projects.json's "agents" key exactly as is
     // (present or absent).
     if (settingsAgentsDirty) body.agents = settingsAgentsPayload();
+    var statusPage = statusPagePayload();
+    if (statusPage) body.statusPage = statusPage;
 
     fetch("/api/settings", {
       method: "POST",

@@ -309,6 +309,26 @@
         <div class="settings-field-error" id="settings-error-refreshIntervalSeconds" hidden></div>
       </div>
 
+      <div class="settings-section" id="settings-status-page-section">
+        <label class="toggle-field" for="settings-status-page-toggle">
+          <span class="switch">
+            <input type="checkbox" id="settings-status-page-toggle">
+            <span class="track"><span class="knob"></span></span>
+          </span>
+          Read-only status page, for checking on agents from a phone
+        </label>
+        <div class="settings-hint">Off by default. When on, a separate page listens on the port below on <em>every</em> network interface of this machine, not just this one, and answers only requests carrying the secret key Centrale generates (kept in its state directory, never in <code>projects.json</code>). It shows agent states and times, the Activity feed and a Needs-you count -- never pane text, messages, settings or any action. Anyone holding one of the links below can read it: treat a link like a password. See <code>docs/operations.md</code>, "Checking status from a phone".</div>
+        <div class="settings-field-error" id="settings-error-statusPage.enabled" hidden></div>
+        <label class="settings-label" for="settings-status-page-port" style="margin-top: 10px;">Status page port</label>
+        <input type="number" id="settings-status-page-port" class="settings-input" min="1" max="65535" step="1">
+        <div class="settings-field-error" id="settings-error-statusPage.port" hidden></div>
+        <label class="settings-label" for="settings-status-page-bind" style="margin-top: 10px;">Listen only on this interface or address (advanced)</label>
+        <input type="text" id="settings-status-page-bind" class="settings-input" placeholder="empty = all interfaces; e.g. tailscale0 or 192.0.2.10">
+        <div class="settings-field-error" id="settings-error-statusPage.bind" hidden></div>
+        <div class="settings-hint" id="settings-status-page-state"></div>
+        <ul class="settings-status-links" id="settings-status-page-links"></ul>
+      </div>
+
       <div class="settings-section">
         <div class="settings-label">Per-project settings</div>
         <div class="settings-hint" style="margin-top: 0; margin-bottom: 8px;">

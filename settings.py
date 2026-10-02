@@ -20,6 +20,7 @@ import threading
 from pathlib import Path
 
 import server
+import status_page
 
 DEFAULT_REFRESH_INTERVAL_SECONDS = 10
 MIN_REFRESH_INTERVAL_SECONDS = 5
@@ -91,6 +92,7 @@ def current_settings(config):
         "lockSpawnedTaskFiles": config.get("lockSpawnedTaskFiles", True) is not False,
         "agentEntries": agent_entries(config),
         "projects": projects,
+        "statusPage": status_page.status(config),
     }
 
 
@@ -162,6 +164,36 @@ def _validate_refresh_interval(value):
     if value < MIN_REFRESH_INTERVAL_SECONDS:
         return f"must be at least {MIN_REFRESH_INTERVAL_SECONDS}"
     return None
+
+
+def _validate_status_page(value, config):
+    """task-212: a partial {"enabled", "port", "bind"} for the read-only
+    status page. Returns (fields, the complete settings to store)."""
+    if not isinstance(value, dict):
+        raise SettingsError('statusPage must be an object such as {"enabled": true, "port": 7421}')
+    merged = status_page.status_config(config)
+    fields = {}
+    if "enabled" in value:
+        if not isinstance(value["enabled"], bool):
+            fields["statusPage.enabled"] = "must be true or false"
+        merged["enabled"] = value["enabled"]
+    if "port" in value:
+        err = status_page.validate_port(value["port"])
+        if err:
+            fields["statusPage.port"] = err
+        elif value["port"] == config.get("port"):
+            fields["statusPage.port"] = f"must differ from the dashboard's own port {config.get('port')}"
+        merged["port"] = value["port"]
+    if "bind" in value:
+        bind = value["bind"].strip() if isinstance(value["bind"], str) else value["bind"]
+        err = status_page.validate_bind(bind)
+        if err:
+            fields["statusPage.bind"] = err
+        merged["bind"] = bind or None
+    unknown = set(value) - {"enabled", "port", "bind"}
+    for name in sorted(unknown):
+        fields[f"statusPage.{name}"] = "unknown setting"
+    return fields, merged
 
 
 def _validate_check_command(value):
@@ -700,6 +732,11 @@ def apply_settings(config, body, path=None, port=None):
         add_fields, add_project = _validate_add_project(body.get("addProject"), config)
         fields.update(add_fields)
 
+    status_page_settings = None
+    if "statusPage" in body:
+        status_fields, status_page_settings = _validate_status_page(body.get("statusPage"), config)
+        fields.update(status_fields)
+
     if fields:
         raise ValidationError(fields)
 
@@ -718,12 +755,14 @@ def apply_settings(config, body, path=None, port=None):
         default_agent, remove_project, add_project, session_preview_mode,
         agents_map,
         project_settings,
+        status_page_settings,
     )
     _apply_to_live_config(
         config, body, harvest_mode, refresh_interval, check_commands,
         default_agent, remove_project, add_project, session_preview_mode,
         agents_map,
         project_settings,
+        status_page_settings,
     )
 
     result = current_settings(config)
@@ -736,6 +775,7 @@ def _write_whitelisted_changes(
     default_agent, remove_project, add_project, session_preview_mode=None,
     agents_map=None,
     project_settings=None,
+    status_page_settings=None,
 ):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -819,6 +859,19 @@ def _write_whitelisted_changes(
         raw_projects.append({"name": add_project["name"], "path": add_project["path"]})
         raw["projects"] = raw_projects
 
+    if status_page_settings is not None:
+        # task-212: on/off, a port and an optional bind restriction. The
+        # key is never written here; it lives in the state directory.
+        raw_status = raw.get("statusPage")
+        raw_status = dict(raw_status) if isinstance(raw_status, dict) else {}
+        raw_status["enabled"] = status_page_settings["enabled"]
+        raw_status["port"] = status_page_settings["port"]
+        if status_page_settings["bind"]:
+            raw_status["bind"] = status_page_settings["bind"]
+        else:
+            raw_status.pop("bind", None)
+        raw["statusPage"] = raw_status
+
     try:
         _atomic_write_json(path, raw)
     except OSError as exc:
@@ -858,6 +911,7 @@ def _apply_to_live_config(
     default_agent, remove_project, add_project, session_preview_mode=None,
     agents_map=None,
     project_settings=None,
+    status_page_settings=None,
 ):
     if agents_map is not None:
         # Same canonical shape server.normalize_agents_map produces, so
@@ -885,6 +939,8 @@ def _apply_to_live_config(
         config["requireAgentAssignment"] = body["requireAgentAssignment"]
     if "lockSpawnedTaskFiles" in body:
         config["lockSpawnedTaskFiles"] = body["lockSpawnedTaskFiles"]
+    if status_page_settings is not None:
+        config["statusPage"] = dict(status_page_settings)
     if "removeProject" in body:
         config["projects"] = [p for p in config.get("projects", []) if p["name"] != remove_project]
     if "checkCommands" in body:

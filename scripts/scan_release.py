@@ -93,6 +93,7 @@ import argparse
 import getpass
 import os
 import re
+import socket
 import subprocess
 import sys
 from collections import namedtuple
@@ -172,6 +173,19 @@ IDENTITY_RULES = [
     Rule("email-address", "identity",
          re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b"),
          "an email address"),
+    # task-213: a LAN address says where the author's network is and what
+    # is on it. Only the three RFC 1918 ranges match, so the documentation
+    # blocks (192.0.2/24, 198.51.100/24, 203.0.113/24), loopback and
+    # 0.0.0.0 are allowed by construction. The lookarounds keep it from
+    # firing inside a longer dotted number (a four-part version string
+    # embedded in a five-part one) or on a fifth octet.
+    Rule("private-ipv4", "identity",
+         re.compile(
+             r"(?<![\d.])(?:10\.(?:25[0-5]|2[0-4]\d|1?\d?\d)"
+             r"|172\.(?:1[6-9]|2\d|3[01])"
+             r"|192\.168)"
+             r"(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){2}(?!\.?\d)"),
+         "a private (RFC 1918) network address"),
 ]
 
 # A derived login name from this set would match ordinary prose in every
@@ -423,6 +437,51 @@ def derived_identity_rules(root):
     return rules, used, skipped
 
 
+def hostname_terms():
+    """This machine's hostname as the names a leak would use: the short
+    label and, when different, the fully qualified form."""
+    try:
+        full = socket.gethostname().strip()
+    except OSError:
+        return []
+    if not full:
+        return []
+    terms = [full]
+    short = full.split(".", 1)[0]
+    if short and short != full:
+        terms.append(short)
+    return terms
+
+
+# task-213: the hostname can coincide with a public name -- here it is
+# also the GitHub organisation in the clone URL, the header link and a
+# test constant. A hostname hit directly after the host part of a GitHub
+# URL is that public path, not the machine, so it is not matched.
+_AFTER_GITHUB_HOST = r"(?<!github\.com/)(?<!github\.com:)"
+
+
+def hostname_rules():
+    rules, used, skipped = [], [], []
+    seen = set()
+    for term in hostname_terms():
+        key = term.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if (len(term) < 4 or key in GENERIC_ACCOUNT_NAMES
+                or key.split(".", 1)[0] in GENERIC_ACCOUNT_NAMES | {"localhost"}):
+            skipped.append(term)
+            continue
+        used.append(term)
+        rules.append(Rule(
+            "machine-hostname", "identity",
+            re.compile(r"(?<![A-Za-z0-9])" + _AFTER_GITHUB_HOST
+                       + re.escape(term) + r"(?![A-Za-z0-9])", re.IGNORECASE),
+            "the hostname of the machine this snapshot was built on",
+        ))
+    return rules, used, skipped
+
+
 def _safe(func):
     def call():
         try:
@@ -615,6 +674,15 @@ def build_rules(root):
     if skipped:
         lines.append("identity terms too generic to search for, skipped: "
                      + ", ".join(repr(t) for t in skipped))
+
+    host_rules, host_used, host_skipped = hostname_rules()
+    rules.extend(host_rules)
+    if host_used:
+        lines.append("hostname derived from this machine: "
+                     + ", ".join(repr(t) for t in host_used))
+    if host_skipped:
+        lines.append("hostname too generic to search for, skipped: "
+                     + ", ".join(repr(t) for t in host_skipped))
 
     names, source = load_private_names(root)
     rules.extend(private_name_rules(names))

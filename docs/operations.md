@@ -32,8 +32,13 @@ configured `port`, it reports whether that process is behind the checkout it run
 from (see [Restarting after a change](#restarting-after-a-change): a
 `[WARN]` naming the commit it loaded and the one now at `HEAD`, or a
 `[PASS]` that it is running its checkout's current code; nothing at all
-when nothing is listening). It never starts a server or binds a port, so it's
-safe to run anytime, including while a real Centrale instance is already up.
+when nothing is listening). With the [read-only status
+page](#checking-status-from-a-phone) turned on, it also says whether that
+page's port can be listened on (or is already served by the running Centrale)
+and prints the page's links, creating its key if it has none yet. It never
+starts a server -- it only test-binds the status page's port for an instant,
+and binds nothing at all with the page off -- so it's safe to run anytime,
+including while a real Centrale instance is already up.
 Exits `0` if nothing `[FAIL]`ed (a `[WARN]` alone — no tmux, a restricted
 codex sandbox, or one project not set up yet — doesn't fail it, matching
 how Centrale itself degrades: everything else still works), `1` otherwise.
@@ -55,7 +60,8 @@ instead of a raw traceback.
 
 The server binds to `127.0.0.1` only and has no authentication of any kind.
 Do not expose it on a network interface, port-forward it, or run it anywhere
-other than your own machine.
+other than your own machine. To see your agents from a phone, turn on the
+separate, read-only [status page](#checking-status-from-a-phone) instead.
 
 Binding `127.0.0.1` keeps the *network* out, but it does not keep *web pages*
 out: every site you visit while Centrale runs can send it requests from your
@@ -89,6 +95,100 @@ script, an agent's notify hook) can drive it freely — none of them send
 URL you already give them. See "Request requirements" in
 [docs/api.md](api.md#request-requirements) for the exact rules a script
 needs to satisfy.
+
+### Checking status from a phone
+
+The dashboard never leaves `127.0.0.1`. What can is a **separate, read-only
+status page**: the Fleet view laid out for a phone -- the summary bar, one
+card per busy project with its capacity ring and each agent's state, how long
+it has been in it and which agent it is, a Needs-you count with a short list,
+and the Activity feed -- refreshing itself, in the phone's light or dark
+theme. It has no buttons, and the listener behind it has no route that could
+change anything: no pane text, no messages, no settings, no spawn, merge or
+any other action (decision-6 in the development board records exactly what it
+exposes).
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="img/status-page-dark.png">
+  <img alt="The read-only status page on a phone: summary bar, Needs you count, a card per project with each agent's state, and the Activity feed" src="img/status-page-light.png" width="390">
+</picture>
+
+*The status page at phone width, from the synthetic screenshot fixture.*
+
+**Turning it on.** In Settings, switch on "Read-only status page" and save
+(or set `statusPage` in `projects.json`, see
+[configuration](configuration.md#setup--configuration), and restart). It
+listens on port `7421` by default on **every network interface** of the
+machine, so it keeps working when DHCP hands out a new address or the machine
+is on several networks at once. The first time, Centrale generates a secret
+key and keeps it in its state directory (`$XDG_STATE_HOME/centrale/status-page.key`,
+`~/.local/state/centrale/status-page.key` by default, or wherever
+`CENTRALE_STATUS_KEY_FILE` points), never in `projects.json` or any repo.
+Every request must carry it; without it the page answers 404 like any
+unknown address. Settings, the startup log and `python3 server.py --check`
+print the ready-made links, one per network address the machine has right
+now plus a `<hostname>.local` form, for example (container and virtual
+bridges -- `docker*`, `br-*`, `veth*`, `virbr*`, `cni*`, `flannel*`,
+`podman*`, `lxc*`, `lxd*` -- get no link, since no phone can reach them,
+though the page still listens on them unless `bind` says otherwise):
+
+```text
+http://192.0.2.10:7421/?key=<key>
+http://myhost.local:7421/?key=<key>  (home Wi-Fi only; works on Apple devices; not over a VPN)
+```
+
+The `.local` link carries that note everywhere the links are shown (Settings,
+the startup log and `--check`); numeric links carry none. `.local` names use
+mDNS, which does not cross a VPN and which Android resolves unreliably even
+on Wi-Fi, so away from home or on Android use a numeric link.
+
+Open one on the phone and bookmark it (or add it to the home screen); the
+page keeps the key for its own refreshes. If the port is taken or the bind
+fails, the dashboard still starts, and the reason is in the log, in Settings
+and in `--check`. Advanced: "Listen only on this interface or address"
+(`statusPage.bind`) narrows the listener to one interface (`tailscale0`,
+`wg0`) or one address (`127.0.0.1` for the SSH recipe below).
+
+> **Security warning.** While it is on, anyone who can reach that port *and*
+> has the link can read your project names, task ids, agent names and states.
+> They can change nothing, but treat the link like a password: do not share
+> it, and do not post a screenshot of Settings. The page is plain HTTP, so on
+> a network you do not trust (café or hotel Wi-Fi) the link can be read off
+> the air -- use one of the encrypted paths below instead. **Never
+> port-forward it from your router to the internet.** To rotate the key,
+> delete the key file and switch the page off and on (or restart Centrale);
+> old links then stop working.
+
+Pick your path to it:
+
+- **Home Wi-Fi, or a VPN into your home network** (your router's WireGuard
+  or OpenVPN server): with the phone on that network, open the link for the
+  machine's LAN address. Nothing else to set up.
+- **Tailscale** (or NetBird, ZeroTier): install it on this machine and on the
+  phone, then open the link for the machine's tailnet address (`100.x.y.z`,
+  listed with the others once Tailscale is up) or its MagicDNS name. To keep
+  the page off the LAN entirely, set the bind to `tailscale0`.
+- **SSH port forwarding**: set the bind to `127.0.0.1`, so only this machine
+  can reach the page, and from a phone SSH app (Termius, Blink) forward a
+  local port to it: `ssh -L 7421:127.0.0.1:7421 you@this-machine`. Then open
+  `http://127.0.0.1:7421/?key=<key>` on the phone.
+
+**Firewall.** If the machine runs a firewall, it must allow incoming TCP on
+the status page port (`7421` unless you changed it). macOS asks the first
+time whether `python3` may accept incoming connections: allow it. On Linux
+with ufw: `sudo ufw allow 7421/tcp` (or your configured port), ideally
+limited to the networks you use, for example
+`sudo ufw allow from 192.0.2.0/24 to any port 7421 proto tcp`.
+
+**Add it as an app.** Open the link once, then save it to the phone or
+computer; the saved icon keeps the full link, key included.
+
+- Android, Chrome: menu, *Add to Home screen*. Over plain `http` it opens in
+  Chrome; a wrapper app such as Hermit or Native Alpha gives a full-screen
+  app instead.
+- iPhone, Safari: Share, *Add to Home Screen*.
+- Mac, Safari: File, *Add to Dock*.
+- Chrome on a computer: menu, *Cast, save and share*, *Create shortcut*.
 
 ### Restarting after a change
 
@@ -536,7 +636,8 @@ This is the reproducible manual check to run against a real repository
 
 `docs/img/` holds the images the README and the docs lead with —
 `board-light.png`, `board-dark.png`, `drawer-pane.png`, `drawer-deps.png`,
-`session-theater.png` and the `view-*` set. They are generated, not hand-taken:
+`session-theater.png`, the `view-*` set and the phone-width
+`status-page-light.png` / `status-page-dark.png`. They are generated, not hand-taken:
 
 ```bash
 python3 scripts/screenshots.py
@@ -1006,6 +1107,13 @@ replaces the manual pass with a check that runs every time. It reads the
   `/Users/<account>`), anything shaped like a real email address, and the
   login name plus `git config user.name` / `user.email` of the machine the
   snapshot is built on;
+- **network details** (task-213) — private IPv4 addresses (`10/8`,
+  `172.16/12`, `192.168/16`) and the machine's own hostname, derived at
+  scan time like the login name. Documentation addresses (`192.0.2.0/24`,
+  `198.51.100.0/24`, `203.0.113.0/24`), loopback and `0.0.0.0` are
+  allowed, so use one of those in examples. A hostname hit directly after
+  `github.com/` or `github.com:` is ignored, because a machine can share
+  its name with the public GitHub organisation;
 - **private project names** — the repos on your dashboard whose names must
   not appear in public.
 

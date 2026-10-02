@@ -6401,6 +6401,11 @@ class StaticSplitContractTests(unittest.TestCase):
         on_disk = sorted(
             n for n in os.listdir(STATIC_DIR) if n.endswith(".js")
         )
+        # task-212: the read-only status page is a second document with
+        # its own one script, loaded by static/phone.html.
+        with open(os.path.join(STATIC_DIR, "phone.html"), encoding="utf-8") as f:
+            self.assertIn('<script src="/static/phone.js{{KEY_QUERY}}"></script>', f.read())
+        on_disk.remove("phone.js")
         self.assertEqual(on_disk, sorted(FRONTEND_FILES))
         self.assertNotIn("app.js", on_disk)
 

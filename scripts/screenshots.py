@@ -3,7 +3,8 @@
 
 The images the README and docs lead with -- board-light.png,
 board-dark.png, drawer-pane.png, drawer-deps.png, session-theater.png and the
-view-{needs-you,fleet,timeline}-{light,dark}.png set -- were hand-taken
+view-{needs-you,fleet,timeline}-{light,dark}.png set and the phone-width
+status-page-{light,dark}.png -- were hand-taken
 until now, so they drifted silently as the UI moved and nobody could
 tell how stale they were. This script re-shoots them all the same way
 every time.
@@ -77,6 +78,17 @@ DEFAULT_OUT_DIR = os.path.join(REPO_ROOT, "docs", "img")
 # so they live here as one pair rather than at each call site.
 VIEWPORT = {"width": 1440, "height": 900}
 DEVICE_SCALE_FACTOR = 2
+
+# The status page's shots (task-217) are phone-sized, not desktop-sized:
+# a common modern phone's CSS viewport, shot at the same scale factor.
+PHONE_VIEWPORT = {"width": 390, "height": 844}
+
+# The status page demands a key on every request. This is a placeholder,
+# never a real one: the listener below is a throwaway one on 127.0.0.1
+# that is handed this string directly, so the real key file in the state
+# directory is never read, created or shown. (The address bar is outside
+# the screenshot either way.)
+PLACEHOLDER_KEY = "EXAMPLE-KEY-not-a-real-key"
 
 # The app's own theme key (see the bootstrap script at the top of
 # static/index.html): setting it before any script runs is how a shot
@@ -564,11 +576,26 @@ def shoot(context_factory, shot, out_dir, expected_cards, Image):
     context = context_factory(shot["theme"])
     try:
         page = context.new_page()
-        if shot.get("height"):
+        if shot["kind"] == "phone":
+            page.set_viewport_size(dict(PHONE_VIEWPORT))
+        elif shot.get("height"):
             # Needs you stacks its cards; a taller frame shows the owner
             # question under the permission dialog.
             page.set_viewport_size({"width": VIEWPORT["width"], "height": shot["height"]})
         page.goto(shot["url"], wait_until="domcontentloaded")
+        if shot["kind"] == "phone":
+            # Painted once the first poll has filled the agent cards and
+            # the "updated" line has left its "Loading" placeholder.
+            page.wait_for_selector("#phone-cards .fleet-agent")
+            page.wait_for_function(
+                "() => { var el = document.getElementById('phone-updated');"
+                " return !!el && !/loading/i.test(el.textContent); }"
+            )
+            page.wait_for_timeout(400)
+            freeze(page)
+            page.screenshot(path=path, full_page=True)
+            quantize(path, Image)
+            return path
         wait_for_board(page, expected_cards)
 
         if shot["kind"] == "view":
@@ -755,6 +782,16 @@ def main(argv=None):
         print(f"sandbox: {sandbox}")
         print(f"serving: {url}")
 
+    # The status page's own listener (task-212), for the phone shots only:
+    # the real StatusServer class, on an ephemeral 127.0.0.1 port, with the
+    # placeholder key. No state-directory key file is touched.
+    import status_page
+    status_httpd = status_page.StatusServer(
+        dict(config, refreshIntervalSeconds=10), PLACEHOLDER_KEY, 0, bind="127.0.0.1")
+    status_thread = threading.Thread(target=status_httpd.serve_forever, daemon=True)
+    status_thread.start()
+    status_url = "http://127.0.0.1:%d/?key=%s" % (status_httpd.server_address[1], PLACEHOLDER_KEY)
+
     expected_cards = sum(len(p["tasks"]) for p in fixture["projects"])
     frozen_ms = int(fixture["clock"]["pageNowEpoch"]) * 1000
     executable = os.environ.get("CENTRALE_SCREENSHOT_CHROMIUM") or None
@@ -781,7 +818,7 @@ def main(argv=None):
 
                 for shot in shots:
                     spec = dict(shot)
-                    spec["url"] = url
+                    spec["url"] = status_url if shot["kind"] == "phone" else url
                     spec.setdefault("cardTitle", _card_title(fixture, shot))
                     written.append(shoot(context_factory, spec, args.out, expected_cards, Image))
                     print(f"wrote {_display_path(written[-1])}")
@@ -790,6 +827,8 @@ def main(argv=None):
     finally:
         httpd.shutdown()
         httpd.server_close()
+        status_httpd.shutdown()
+        status_httpd.server_close()
         if args.keep:
             print(f"sandbox kept at {sandbox}")
         else:

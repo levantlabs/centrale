@@ -1,4 +1,5 @@
 """Fleet history persistence and HTTP snapshots, with isolated files and no CLI work."""
+import copy
 import http.client
 import json
 import os
@@ -500,3 +501,173 @@ class FleetTests(unittest.TestCase):
             server.record_session_started('app', 'TASK-1', 'helper')
             self.assertEqual(server.get_agent_state('app', 'TASK-1'), 'working')
         server._reset_agent_events()
+
+
+class OwnerQuestionReuseTests(unittest.TestCase):
+    """task-215: a worker's task is re-read only when its source changed,
+    and a request never waits on the owner-question re-check."""
+
+    LABEL = "needs-owner-approval"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        reuse = mock.patch.dict(server._task_view_reuse, clear=True)
+        reuse.start()
+        self.addCleanup(reuse.stop)
+        self.config = {"projects": [{"name": "app", "path": "/repo"}], "worktreeRoot": self.tmp.name}
+        self.project = self.config["projects"][0]
+        self.tasks = Path(self.tmp.name) / "app-task-1" / "backlog" / "tasks"
+        self.tasks.mkdir(parents=True)
+        self.file = self.tasks / "task-1 - Choose-a-date.md"
+        self.file.write_text("---\nid: TASK-1\n---\nQuestion one?\n")
+        self.report = {"id": "TASK-1", "title": "Choose a date", "status": "In Progress",
+                       "labels": [self.LABEL], "comments": [{"index": 1, "body": "Question one?"}]}
+
+    def backlog(self):
+        return mock.patch.object(server, "run_backlog", side_effect=lambda args, cwd: {
+            "schemaVersion": 1, "task": copy.deepcopy(self.report)})
+
+    def view(self):
+        return server._branch_task_view(self.config, self.project, "TASK-1", reuse=True)
+
+    def pinned_times(self):
+        """Report every stat with fixed mtime_ns/ctime_ns, so only the
+        size or the path can tell an edit apart (a same-second edit on a
+        coarse-timestamp filesystem; a rename keeps mtime)."""
+        real_stat = os.stat
+        def stat(path, *args, **kwargs):
+            st = real_stat(path, *args, **kwargs)
+            return SimpleNamespace(st_ino=st.st_ino, st_size=st.st_size, st_mode=st.st_mode,
+                                   st_mtime_ns=1_000_000_000, st_ctime_ns=1_000_000_000)
+        return mock.patch.object(server.os, "stat", side_effect=stat)
+
+    def test_unchanged_task_file_costs_no_backlog_run_and_changed_content_rereads(self):
+        with self.backlog() as backlog, \
+             mock.patch.object(server, "run_git", side_effect=AssertionError("unexpected git")):
+            self.assertEqual(self.view()["task"]["comments"][0]["body"], "Question one?")
+            self.view()["task"]["comments"].clear()  # callers get copies
+            self.assertEqual(self.view()["task"]["comments"][0]["body"], "Question one?")
+            self.assertEqual(backlog.call_count, 1)
+            self.file.write_text("---\nid: TASK-1\n---\nQuestion two, longer?\n")
+            self.report["comments"] = [{"index": 1, "body": "Question two?"}]
+            self.assertEqual(self.view()["task"]["comments"][0]["body"], "Question two?")
+            self.assertEqual(backlog.call_count, 2)
+
+    def test_same_second_edit_that_changes_size_rereads(self):
+        with self.backlog() as backlog, self.pinned_times():
+            self.view()
+            self.view()
+            self.assertEqual(backlog.call_count, 1)
+            self.file.write_text("---\nid: TASK-1\n---\nQuestion one? And a second line.\n")
+            self.view()
+            self.assertEqual(backlog.call_count, 2)
+
+    def test_retitle_renames_the_file_and_reads_as_changed(self):
+        with self.backlog() as backlog, self.pinned_times():
+            self.view()
+            renamed = self.tasks / "task-1 - Choose-a-ship-date.md"
+            os.rename(self.file, renamed)  # same inode, size and (pinned) times
+            self.view()
+            self.assertEqual(backlog.call_count, 2)
+            self.view()
+            self.assertEqual(backlog.call_count, 2)
+
+    def test_unlocatable_task_file_and_failed_reads_are_never_reused(self):
+        with self.backlog() as backlog:
+            (self.tasks / "task-1 - Duplicate.md").write_text("x")  # two candidates: no single file
+            self.view()
+            self.view()
+            self.assertEqual(backlog.call_count, 2)
+            (self.tasks / "task-1 - Duplicate.md").unlink()
+            backlog.side_effect = server.BacklogError("board unreadable")
+            self.assertIsNone(self.view())
+            backlog.side_effect = lambda args, cwd: {"schemaVersion": 1, "task": self.report}
+            self.assertIsNotNone(self.view())
+            self.assertEqual(backlog.call_count, 4)
+
+    def test_branch_without_a_worktree_is_reused_until_its_tip_moves(self):
+        import contextlib
+        import spawn
+        (Path(self.tmp.name) / "app-task-1").rename(Path(self.tmp.name) / "elsewhere")
+        tip = ["a" * 40]
+        snapshots = []
+
+        @contextlib.contextmanager
+        def snapshot(repo, ref):
+            snapshots.append(ref)
+            yield self.tmp.name, None
+
+        with self.backlog() as backlog, \
+             mock.patch.object(server, "run_git", side_effect=lambda args, cwd: subprocess.CompletedProcess(
+                 args, 0, tip[0] + "\n", "")), \
+             mock.patch.object(spawn, "checkout_state", return_value={"kind": "none", "path": None}), \
+             mock.patch.object(spawn, "detached_snapshot", side_effect=snapshot):
+            self.view()
+            self.view()
+            self.assertEqual((backlog.call_count, len(snapshots)), (1, 1))
+            tip[0] = "b" * 40
+            self.view()
+            self.assertEqual((backlog.call_count, len(snapshots)), (2, 2))
+
+    def test_expired_window_serves_last_result_and_refreshes_once_in_background(self):
+        board = {"projects": [{"name": "app", "tasks": [
+            {"id": "TASK-1", "status": "In Progress", "labels": []}]}]}
+        snapshot = {"agents": [{"project": "app", "taskId": "TASK-1", "state": "working",
+                                "agent": "claude", "session": "centrale-app-task-1"}],
+                    "timestamp": 200000}
+        release, started = threading.Event(), threading.Event()
+        calls = []
+
+        def backlog(args, cwd):
+            calls.append(args)
+            if len(calls) > 1:
+                started.set()
+                self.assertTrue(release.wait(10))
+            return {"schemaVersion": 1, "task": copy.deepcopy(self.report)}
+
+        def texts(result):
+            return [i["text"] for i in result[0] if i["kind"] == "owner"]
+
+        journal_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(journal_dir.cleanup)
+        import fleet
+        journal = fleet.Journal(Path(journal_dir.name) / "h.jsonl", clock=lambda: 200000)
+        with (mock.patch.object(server, "OWNER_QUESTIONS_TTL", 30.0),
+              mock.patch.dict(server._owner_cache, {"at": None, "items": [], "errors": [],
+                                                    "running": False}),
+              mock.patch.object(server, "get_board", return_value=board),
+              mock.patch.object(server, "fleet_history", journal),
+              mock.patch.object(server, "run_backlog", side_effect=backlog)):
+            # The first call after startup computes inline.
+            self.assertEqual(texts(server.fleet_inbox(self.config, snapshot, [])), ["Question one?"])
+            # The worker asks a new question; the window then expires.
+            self.file.write_text("---\nid: TASK-1\n---\nShip Friday instead?\n")
+            self.report["comments"].append({"index": 2, "body": "Ship Friday instead?"})
+            server._owner_cache["at"] -= 31
+            began = time.monotonic()
+            first = server.fleet_inbox(self.config, snapshot, [])
+            self.assertTrue(started.wait(10))
+            for _ in range(5):  # polls during the refresh never start another
+                self.assertEqual(texts(server.fleet_inbox(self.config, snapshot, [])), ["Question one?"])
+            self.assertLess(time.monotonic() - began, 5)
+            self.assertEqual(texts(first), ["Question one?"])
+            release.set()
+            server._owner_cache["thread"].join(10)
+            self.assertEqual(len(calls), 2)
+            self.assertFalse(server._owner_cache["running"])
+            # Within the bound plus one background run, the new question shows.
+            self.assertEqual(texts(server.fleet_inbox(self.config, snapshot, [])),
+                             ["Ship Friday instead?"])
+            self.assertEqual(len(calls), 2)
+
+    def test_a_failed_background_refresh_shows_an_error_not_the_old_questions(self):
+        with (mock.patch.object(server, "OWNER_QUESTIONS_TTL", 30.0),
+              mock.patch.dict(server._owner_cache, {"at": time.monotonic() - 31, "running": False,
+                                                    "items": [{"kind": "owner", "text": "Old?"}],
+                                                    "errors": []}),
+              mock.patch.object(server, "_owner_questions", side_effect=RuntimeError("boom"))):
+            self.assertEqual(server._owner_questions_cached(self.config, {})[0], [{"kind": "owner", "text": "Old?"}])
+            server._owner_cache["thread"].join(10)
+            self.assertEqual(server._owner_questions_cached(self.config, {}),
+                             ([], ["owner questions unavailable: boom"]))

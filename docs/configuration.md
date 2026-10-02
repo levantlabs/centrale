@@ -249,6 +249,22 @@ Fields:
   merge — it just fails that one call the same way a non-zero exit would
   (see `checkTimeoutSeconds` below for the one deliberate exception, which
   needs much more headroom).
+- `statusPage` (optional) — the opt-in, read-only status page for checking
+  on agents from a phone (see "Checking status from a phone" in
+  [docs/operations.md](operations.md#checking-status-from-a-phone), which
+  has the security warning and setup recipes). An object:
+  `{"enabled": true, "port": 7421}`, plus an optional `"bind"`. Off when
+  omitted. `enabled` (boolean, default `false`) starts a separate HTTP
+  listener that serves only that page, its data and its static files;
+  `port` (default `7421`, must differ from `port`) is where; it listens on
+  every network interface unless `bind` names one interface (`"tailscale0"`)
+  or one address (`"127.0.0.1"`). There is no key here: Centrale generates
+  one the first time the page is on and keeps it in its state directory
+  (`$XDG_STATE_HOME/centrale/status-page.key`, overridable with
+  `CENTRALE_STATUS_KEY_FILE`), and every request must carry it. A malformed
+  value is rejected at startup; a port that cannot be listened on is not --
+  Centrale starts without the page and says why. The Settings view changes
+  it live.
 - `spawnPrompt` (optional) — the prompt template every spawned agent is
   given (see "Spawning an agent" in [docs/agents.md](agents.md#spawning-an-agent) for the built-in text). Omit it to
   use the built-in default, which is what you want unless you have a
@@ -395,6 +411,10 @@ subset of `projects.json`:
 3. **Board auto-refresh interval** — `refreshIntervalSeconds`, a whole
    number of seconds, minimum 5. Purely client-side; changing it doesn't
    affect a countdown already in progress, only the one after it.
+   Below it, **Read-only status page** — `statusPage`'s switch, port and
+   optional interface or address. Saving starts, stops or moves the
+   listener at once, then shows whether it is listening (or why not) and
+   the links to open on a phone.
 4. **Agents** — a collapsed section ("Agents (N configured, default:
    …)") that, once expanded, edits the `agents` map itself (see "Setup /
    configuration") — the file-edit alternative for adding your own agent
@@ -527,7 +547,8 @@ The pointer uses the configured Centrale port; re-run setup after changing it.
   "checkCommands": {"<project>": "<command>" | null, ...}, "defaultAgent",
   "agents": ["<name>", ...], "requireAgentAssignment": bool, "lockSpawnedTaskFiles": bool, "agentEntries": [{"name", "cmd": [argv],
   "cmdText", "promptSuffix": str | null, "builtin": bool, "onPath": bool},
-  ...], "projects": [{"name", "path"}, ...]}` — the
+  ...], "projects": [{"name", "path"}, ...], "statusPage": {"enabled",
+  "port", "bind", "running", "error", "links", "labelledLinks"}}` — the
   current value of every whitelisted setting, plus `agents` (every
   configured agent name, sorted), `agentEntries` (the full map in
   `projects.json` order, for the Agents editor: `cmdText` is the
@@ -537,9 +558,12 @@ The pointer uses the configured Centrale port; re-run setup after changing it.
   `PATH` lookup of `argv[0]`) and `projects` (every configured project's
   name/path, for the Projects list).
 - `POST /api/settings` accepts a partial version of that same shape.
-  Besides the original three, seven more keys are whitelisted:
+  Besides the original three, eight more keys are whitelisted:
   - `sessionPreviewMode` (`"interact"` | `"view"` | `"off"`) — the live
     session pane / reply tier; written to `sessionPreview.mode`.
+  - `statusPage` (`{"enabled", "port", "bind"}`, each optional) — the
+    read-only status page; written to `statusPage` and applied to the
+    running listener at once. The key is never accepted or written.
   - `requireAgentAssignment` (boolean) — see the Fields list above;
     anything but a JSON boolean is a 400.
   - `lockSpawnedTaskFiles` (boolean) — see the Fields list above;
@@ -567,7 +591,7 @@ The pointer uses the configured Centrale port; re-run setup after changing it.
     project" above; `initBacklog` defaults to `false` if omitted and must be
     a boolean. The existing API key now opts into both Backlog and Centrale setup.
 
-  Any of these nine top-level fields may be omitted, leaving that setting
+  Any of these ten top-level fields may be omitted, leaving that setting
   untouched. Responds with the same shape, updated, on success (200). A
   validation failure responds 400 with `{"error", "fields": {"<field
   name>": "<reason>", ...}}` — dotted for a per-project, per-add or

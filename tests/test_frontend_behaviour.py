@@ -8740,3 +8740,185 @@ class ParkedBadgeBehaviourTests(unittest.TestCase):
             with self.subTest(case):
                 self.assertEqual([b["text"] for b in self.out[case]["badges"]], ["finished"])
                 self.assertEqual(self.out[case]["lines"], [])
+
+
+# ---------------------------------------------------------------------
+# The read-only status page (task-212)
+# ---------------------------------------------------------------------
+
+PHONE_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var NOW = 1790784000;
+var SNAP = {
+  kind: "centrale-status", timestamp: NOW, window: 7200, refreshIntervalSeconds: 15,
+  projects: [{ name: "atlas", maxAgents: 3, agentCount: 2 }, { name: "orbit", maxAgents: null, agentCount: 0 }],
+  agents: [
+    { project: "atlas", taskId: "TASK-1", agent: "codex", state: "waiting", stateSince: NOW - 600, parked: false },
+    { project: "atlas", taskId: "TASK-2", agent: "sonnet", state: "working", stateSince: NOW - 60, parked: true }
+  ],
+  history: [
+    { project: "atlas", taskId: "TASK-1", agent: "codex", state: "waiting", timestamp: NOW - 600 },
+    { project: "atlas", taskId: "TASK-2", agent: "sonnet", state: "working", timestamp: NOW - 60 },
+    { project: "orbit", taskId: "TASK-9", agent: "claude", state: "merged", timestamp: NOW - 3500 }
+  ],
+  needsYou: { count: 2, unavailable: 1, items: [
+    { kind: "permission", project: "atlas", taskId: "TASK-1", agent: "codex", since: NOW - 300 },
+    { kind: "owner", project: "atlas", taskId: "TASK-4", agent: "claude", since: NOW - 900 }] },
+  historyUnavailable: false
+};
+["phone-updated", "phone-error", "phone-pulse", "phone-needs", "phone-cards", "phone-feed"].forEach(function (id) {
+  var el = document.createElement("div"); el.id = id; ELEMENTS[id] = el;
+});
+function find(node, cls, out) {
+  out = out || [];
+  if (node.className && String(node.className).split(" ").indexOf(cls) !== -1) out.push(node);
+  node.childNodes.forEach(function (c) { find(c, cls, out); });
+  return out;
+}
+var timers = [], urls = [], answer = { ok: true, status: 200, body: SNAP };
+global.setTimeout = function (fn, ms) { var t = { fn: fn, ms: ms }; timers.push(t); return t; };
+global.clearTimeout = function () {};
+global.setInterval = function () { return 0; };
+window.location = { search: "?key=abc%2Bdef" };
+global.fetch = function (url, opts) {
+  urls.push({ url: url, opts: opts });
+  var a = answer;
+  return Promise.resolve({ ok: a.ok, status: a.status, json: function () { return Promise.resolve(a.body); } });
+};
+var C = loadFrontend(["dom.js", "fleet.js", "phone.js"]);
+(async function () {
+  await settle();
+  var doc = function (id) { return document.getElementById(id); };
+  var out = {
+    url: urls[0].url, credentials: urls[0].opts.credentials,
+    updated: doc("phone-updated").textContent,
+    errorHidden: doc("phone-error").hidden,
+    live: find(doc("phone-pulse"), "fleet-pulse-num")[0].textContent,
+    merges: find(doc("phone-pulse"), "fleet-pulse-num")[1].textContent,
+    needsCount: find(doc("phone-needs"), "phone-needs-count")[0].textContent,
+    needsKinds: find(doc("phone-needs"), "phone-needs-kind").map(function (n) { return n.textContent; }),
+    needsNote: find(doc("phone-needs"), "phone-warn").map(function (n) { return n.textContent; }),
+    cards: find(doc("phone-cards"), "fleet-card").map(function (c) { return c.getAttribute("data-project"); }),
+    ring: find(doc("phone-cards"), "fleet-ring-count")[0].textContent,
+    rows: find(doc("phone-cards"), "fleet-agent").map(function (r) {
+      return [r.getAttribute("data-task"), find(r, "fleet-agent-state")[0].textContent,
+              find(r, "fleet-agent-since")[0].textContent, find(r, "fleet-agent-name")[0].textContent];
+    }),
+    quiet: find(doc("phone-cards"), "fleet-quiet")[0].textContent,
+    feed: find(doc("phone-feed"), "fleet-feed-item").map(function (n) { return n.textContent; }),
+    buttons: [doc("phone-pulse"), doc("phone-needs"), doc("phone-cards"), doc("phone-feed")].reduce(function (n, root) {
+      return n + root.querySelectorAll("button, a, input, textarea, select").length; }, 0),
+    nextPollMs: timers[timers.length - 1].ms
+  };
+  // A failed poll keeps the last snapshot on screen and says so.
+  answer = { ok: false, status: 404, body: { error: "not found" } };
+  await C.phone.poll(); await settle();
+  out.failedError = doc("phone-error").textContent;
+  out.failedStillShows = find(doc("phone-cards"), "fleet-card").length;
+  console.log(JSON.stringify(out));
+})();
+"""
+
+
+@js_harness.requires_node
+class PhoneStatusPageTests(unittest.TestCase):
+    def result(self):
+        return js_harness.cached_driver(self, PHONE_DRIVER_JS)
+
+    def test_it_polls_its_one_route_with_the_key_from_its_own_url(self):
+        out = self.result()
+        self.assertEqual(out["url"], "/api/status?key=abc%2Bdef")
+        self.assertEqual(out["credentials"], "omit")
+        self.assertEqual(out["nextPollMs"], 15000)
+
+    def test_summary_cards_needs_you_and_activity(self):
+        out = self.result()
+        self.assertEqual((out["live"], out["merges"]), ("2", "1"))
+        self.assertEqual(out["cards"], ["atlas"])
+        self.assertEqual(out["ring"], "2/3")
+        self.assertEqual(out["rows"], [["TASK-1", "waiting", "10m", "codex"],
+                                       ["TASK-2", "working · parked", "1m", "sonnet"]])
+        self.assertEqual(out["quiet"], "No agents: orbit")
+        self.assertEqual(out["needsCount"], "2")
+        self.assertEqual(out["needsKinds"], ["permission dialog", "owner question"])
+        self.assertIn("1 check could not run", out["needsNote"][0])
+        self.assertEqual(len(out["feed"]), 3)
+        self.assertIn("TASK-2 working · atlas", out["feed"][0])
+        self.assertTrue(out["updated"].startswith("Updated "))
+        self.assertTrue(out["errorHidden"])
+
+    def test_it_offers_no_control_at_all(self):
+        self.assertEqual(self.result()["buttons"], 0)
+
+    def test_a_failed_poll_keeps_the_last_snapshot_and_says_so(self):
+        out = self.result()
+        self.assertIn("the link's key was not accepted", out["failedError"])
+        self.assertIn("Showing what was true at", out["failedError"])
+        self.assertEqual(out["failedStillShows"], 1)
+
+
+SETTINGS_STATUS_PAGE_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+global.setTimeout = function () { return 0; };
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "settings.js"]);
+wireSettingsShell();
+C.showToast = function () {};
+C.doRefresh = function () {};
+C.syncDrawerPanePolling = function () {};
+var page = { enabled: false, port: 7421, bind: null, running: false, error: null, links: [] };
+var saves = [];
+global.fetch = function (url, opts) {
+  var body = opts && opts.body ? JSON.parse(opts.body) : null;
+  if (body) {
+    saves.push(body);
+    if (body.statusPage) page = { enabled: true, port: body.statusPage.port, bind: null, running: true, error: null,
+      links: ["http://192.0.2.10:7500/?key=k", "http://workstation.local:7500/?key=k"],
+      labelledLinks: [{ url: "http://192.0.2.10:7500/?key=k", label: null },
+                      { url: "http://workstation.local:7500/?key=k", label: "home Wi-Fi only; works on Apple devices; not over a VPN" }] };
+  }
+  return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({
+    harvestMode: "click", sessionPreviewMode: "interact", refreshIntervalSeconds: 10,
+    checkCommands: {}, defaultAgent: "claude", agents: ["claude"], requireAgentAssignment: true,
+    lockSpawnedTaskFiles: true, agentEntries: [], projects: [], statusPage: page
+  }); } });
+};
+var byId = function (id) { return document.getElementById(id); };
+var out = {};
+byId("settings-open").click();
+settle().then(function () {
+  out.offState = byId("settings-status-page-state").textContent;
+  byId("settings-save").click();
+  return settle();
+}).then(function () {
+  out.untouchedSaveHasIt = "statusPage" in saves[0];
+  byId("settings-status-page-toggle").checked = true;
+  byId("settings-status-page-port").value = "7500";
+  byId("settings-save").click();
+  return settle();
+}).then(function () {
+  out.sent = saves[1].statusPage;
+  out.onState = byId("settings-status-page-state").textContent;
+  out.links = byId("settings-status-page-links").querySelectorAll("a").map(function (a) { return a.getAttribute("href"); });
+  out.items = byId("settings-status-page-links").querySelectorAll("li").map(function (li) { return li.textContent; });
+  process.stdout.write(JSON.stringify(out));
+});
+"""
+
+
+@js_harness.requires_node
+class SettingsStatusPageTests(unittest.TestCase):
+    """task-212: the read-only status page's Settings section."""
+
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, SETTINGS_STATUS_PAGE_DRIVER_JS, timeout=30)
+
+    def test_an_untouched_section_is_not_sent(self):
+        self.assertIn("Off", self.out["offState"])
+        self.assertIs(self.out["untouchedSaveHasIt"], False)
+
+    def test_turning_it_on_sends_it_and_shows_the_links(self):
+        self.assertEqual(self.out["sent"], {"enabled": True, "port": 7500, "bind": ""})
+        self.assertIn("Listening", self.out["onState"])
+        self.assertEqual(self.out["links"], ["http://192.0.2.10:7500/?key=k", "http://workstation.local:7500/?key=k"])
+        self.assertEqual(self.out["items"], [
+            "http://192.0.2.10:7500/?key=k",
+            "http://workstation.local:7500/?key=k (home Wi-Fi only; works on Apple devices; not over a VPN)"])

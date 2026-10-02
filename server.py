@@ -1,7 +1,8 @@
 """Centrale backend: config loading, board aggregation, and a small stdlib
 HTTP server exposing the JSON API described in docs/api.md.
 
-Python 3.12, standard library only. Binds 127.0.0.1 only.
+Python 3.12, standard library only. Binds 127.0.0.1 only; the one exception
+is the opt-in, read-only status page in status_page.py (task-212, decision-6).
 """
 
 from __future__ import annotations
@@ -27,6 +28,15 @@ import threading
 import time
 import urllib.parse
 import uuid
+
+# task-214: started as `python3 server.py` this module is `__main__`, and
+# every sibling that does `import server` (spawn, harvest, settings,
+# browser, status_page) would otherwise load this file a second time as a
+# separate module with its own empty in-memory state -- its own fleet
+# journal, agent events, lifecycle locks and exception classes. Register
+# the running module under its import name before anything can import it.
+if __name__ == "__main__":
+    sys.modules.setdefault("server", sys.modules[__name__])
 
 import orchestrator
 import fleet
@@ -569,6 +579,8 @@ def load_config(path=None):
     parked_after_seconds = normalize_parked_after(raw.get("parkedAfterSeconds"))
     subprocess_timeout_seconds = normalize_subprocess_timeout(raw.get("subprocessTimeoutSeconds"))
     spawn_prompt = normalize_spawn_prompt(raw.get("spawnPrompt"))
+    import status_page  # local import: avoids a circular import at module load
+    status_page_config = status_page.normalize_config(raw.get("statusPage"), port)
 
     projects = []
     for entry in raw.get("projects") or []:
@@ -616,6 +628,7 @@ def load_config(path=None):
         "parkedAfterSeconds": parked_after_seconds,
         "subprocessTimeoutSeconds": subprocess_timeout_seconds,
         "spawnPrompt": spawn_prompt,
+        "statusPage": status_page_config,
         "zeroConfig": zero_config,
     }
 
@@ -2072,7 +2085,7 @@ def _task_view_or_none(cwd, task_id):
     return None
 
 
-def _branch_task_view(config, project, task_id):
+def _branch_task_view(config, project, task_id, reuse=False):
     """The task as its own `task/<id>` branch has it -- GET /api/task's
     "branchTask" -- read from wherever that branch actually lives
     (task-79), or None when there's nothing to read.
@@ -2098,28 +2111,91 @@ def _branch_task_view(config, project, task_id):
     task with no branch costs exactly one `git rev-parse --verify` and
     nothing else -- no worktree listing, no snapshot, no second backlog
     call. A "centrale" kind whose directory is gone (a hand-deleted
-    worktree git still lists) reads as nothing, exactly as before."""
+    worktree git still lists) reads as nothing, exactly as before.
+
+    reuse=True (fleet_inbox only) skips the backlog run while the
+    source is unchanged; see _task_view_reuse below."""
     import spawn  # local import: avoids a circular import at module load
 
     wt_dir = spawn.worktree_dir(config, project["name"], task_id)
     if os.path.isdir(wt_dir):
-        return _task_view_or_none(wt_dir, task_id)
+        return _checkout_task_view(wt_dir, task_id, reuse)
 
     repo_path = project["path"]
     branch = spawn.branch_name(task_id)
-    if not _task_branch_exists(repo_path, branch):
+    tip = _branch_tip_sha(repo_path, branch)
+    if tip is None:
         return None
 
     state = spawn.checkout_state(config, project, task_id)
     kind = state.get("kind")
     if kind == "external" and state.get("path"):
-        return _task_view_or_none(state["path"], task_id)
+        return _checkout_task_view(state["path"], task_id, reuse)
     if kind == "none":
-        with spawn.detached_snapshot(repo_path, branch) as (snapshot, error):
-            if error is not None:
-                return None
-            return _task_view_or_none(snapshot, task_id)
+        def read():
+            with spawn.detached_snapshot(repo_path, branch) as (snapshot, error):
+                if error is not None:
+                    return None
+                return _task_view_or_none(snapshot, task_id)
+        if not reuse:
+            return read()
+        # A parked branch only changes by a commit: its tip is the signature.
+        return _reused_task_view(("branch", repo_path, task_id), tip, read)
     return None
+
+
+# task-215: fleet_inbox's owner-question and idle-report reads are one
+# `backlog task view` per live worker, which loads the whole board (~1 s
+# on a large one). Everything they use lives in that task's own file, so
+# a view is reused while its source is unchanged: the task file, located
+# by ID on every check (a retitle renames it, so the path is part of the
+# signature) and stat'ed, never parsed; or, for a branch checked out
+# nowhere, its tip commit. No signature, no reuse; failed reads are never
+# stored. GET /api/task's branchTask never reuses.
+_task_view_reuse = {}
+_task_view_reuse_lock = threading.Lock()
+
+
+def _task_file_signature(checkout, task_id):
+    """(path, inode, size, mtime_ns, ctime_ns) of task_id's file in
+    `checkout`, or None when it cannot be located or stat'ed."""
+    import spawn  # local import: avoids a circular import at module load
+
+    path = spawn.task_file_path(checkout, task_id)
+    if path is None:
+        return None
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (path, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _reused_task_view(key, signature, read):
+    """read()'s envelope, or a copy of the last one stored under `key`
+    when it was read at the same `signature`. None signature: read()."""
+    if signature is None:
+        return read()
+    with _task_view_reuse_lock:
+        hit = _task_view_reuse.get(key)
+        if hit is not None and hit[0] == signature:
+            return copy.deepcopy(hit[1])
+    data = read()
+    with _task_view_reuse_lock:
+        if data is None:
+            _task_view_reuse.pop(key, None)
+        else:
+            # Taken before the read: an edit during it reads as changed next time.
+            _task_view_reuse[key] = (signature, copy.deepcopy(data))
+    return data
+
+
+def _checkout_task_view(checkout, task_id, reuse=False):
+    if not reuse:
+        return _task_view_or_none(checkout, task_id)
+    return _reused_task_view(("checkout", os.path.realpath(checkout), task_id),
+                             _task_file_signature(checkout, task_id),
+                             lambda: _task_view_or_none(checkout, task_id))
 
 
 def _dirty_paths_from_status(porcelain_output):
@@ -2664,7 +2740,10 @@ def parked_status(config, session, state, since, deliveries, now=None):
             "lastLine": last_line, "dialog": dialog}
 
 
-def get_fleet(config, window=fleet.DEFAULT_WINDOW):
+def get_fleet(config, window=fleet.DEFAULT_WINDOW, arm_input=True):
+    """The fleet snapshot behind GET /api/fleet. arm_input=False is the
+    read-only status page's call (task-212): its pane reads must never
+    arm POST /api/session-input the way a dashboard read does."""
     surveyed_at = time.monotonic()
     sessions = list_sessions(strict=True)
     observe_fleet_sessions(sessions, config, surveyed_at)
@@ -2701,7 +2780,7 @@ def get_fleet(config, window=fleet.DEFAULT_WINDOW):
         a["parked"] = parked_status(config, sessions_by_name[a["session"]], a["state"],
                                     a["stateSince"], entries)
     snapshot["sessionPreviewMode"] = session_preview_mode(config)
-    snapshot["needsYou"], snapshot["needsYouErrors"] = fleet_inbox(config, snapshot, entries)
+    snapshot["needsYou"], snapshot["needsYouErrors"] = fleet_inbox(config, snapshot, entries, arm_input)
     return snapshot
 
 
@@ -2715,17 +2794,20 @@ def _inbox_timestamp(value):
 
 
 OWNER_QUESTIONS_TTL = 30.0
-_owner_cache = {"at": None, "items": [], "errors": []}
+# task-215: "running" is the single-flight flag for the background refresh;
+# _owner_refresh_lock serialises every computation (inline first call and
+# background refreshes alike). TTL <= 0 means no cache: compute inline.
+_owner_cache = {"at": None, "items": [], "errors": [], "running": False}
 _owner_cache_lock = threading.Lock()
+_owner_refresh_lock = threading.Lock()
 
 
-def fleet_inbox(config, snapshot, deliveries):
+def fleet_inbox(config, snapshot, deliveries, arm_input=True):
     """Derive attention signals afresh; historical failures are never live verdicts."""
     import spawn
     items, errors = [], []
     projects = {p["name"]: p for p in config.get("projects", [])}
     agents = {(a["project"], a["taskId"]): a for a in snapshot["agents"]}
-    reports = {}
 
     def add(kind, project, task_id, agent, since, signal, **details):
         items.append(dict(kind=kind, project=project, taskId=task_id, agent=agent or "unknown",
@@ -2738,7 +2820,8 @@ def fleet_inbox(config, snapshot, deliveries):
                 lines = capture_session_pane(a["session"], MAX_SESSION_PANE_LINES)
                 dialog = detect_pane_dialog(lines)
                 if dialog:
-                    record_pane_capture(a["session"])
+                    if arm_input:
+                        record_pane_capture(a["session"])
                     add("permission", project, task_id, a["agent"], a["stateSince"],
                         "Waiting hook + pane dialog: " + dialog, lines=lines,
                         capturedAt=time.time())
@@ -2752,9 +2835,8 @@ def fleet_inbox(config, snapshot, deliveries):
             # A live Centrale worker writes its report on its own worktree,
             # not main. Never restore a finished badge from durable history.
             cwd = spawn.worktree_dir(config, project, task_id)
-            data = _task_view_or_none(cwd, task_id)
+            data = _checkout_task_view(cwd, task_id, reuse=True)
             task = (data or {}).get("task")
-            reports[(project, task_id)] = task
             if not isinstance(task, dict):
                 errors.append(f"{project}/{task_id}: completion report unavailable")
             elif task.get("status") != "Done" and not (task.get("finalSummary") or "").strip():
@@ -2798,14 +2880,77 @@ def fleet_inbox(config, snapshot, deliveries):
 
     # Owner questions change at human speed, but finding them reads the
     # board and each live worker's branch. Recompute at most every
-    # OWNER_QUESTIONS_TTL seconds rather than on every few-second poll.
-    now = time.monotonic()
+    # OWNER_QUESTIONS_TTL seconds rather than on every few-second poll, and
+    # never on a request's time after the first (task-215): an expired
+    # window serves the last result and refreshes it in the background.
+    owner_items, owner_errors = _owner_questions_cached(config, agents)
+    items.extend(owner_items)
+    errors.extend(owner_errors)
+    return items, errors
+
+
+def _owner_questions_cached(config, agents):
+    if OWNER_QUESTIONS_TTL <= 0:
+        return _owner_questions(config, agents)
     with _owner_cache_lock:
-        if _owner_cache["at"] is not None and now - _owner_cache["at"] < OWNER_QUESTIONS_TTL:
-            items.extend(_owner_cache["items"])
-            errors.extend(_owner_cache["errors"])
-            return items, errors
-    first_item, first_error = len(items), len(errors)
+        known = _owner_cache["at"] is not None
+        start = (known and not _owner_cache["running"]
+                 and time.monotonic() - _owner_cache["at"] >= OWNER_QUESTIONS_TTL)
+        if start:
+            _owner_cache["running"] = True
+        result = list(_owner_cache["items"]), list(_owner_cache["errors"])
+    if start:
+        thread = threading.Thread(target=_background_owner_refresh, args=(config, agents),
+                                  name="owner-questions", daemon=True)
+        _owner_cache["thread"] = thread
+        try:
+            thread.start()
+        except RuntimeError:
+            with _owner_cache_lock:
+                _owner_cache["running"] = False
+            raise
+    if known:
+        return result
+    # The first call after startup computes inline, so Needs you is right
+    # on first load rather than empty; concurrent first callers share it.
+    with _owner_refresh_lock:
+        with _owner_cache_lock:
+            known = _owner_cache["at"] is not None
+        if not known:
+            _refresh_owner_questions(config, agents)
+    with _owner_cache_lock:
+        return list(_owner_cache["items"]), list(_owner_cache["errors"])
+
+
+def _background_owner_refresh(config, agents):
+    try:
+        with _owner_refresh_lock:
+            _refresh_owner_questions(config, agents)
+    finally:
+        with _owner_cache_lock:
+            _owner_cache["running"] = False
+
+
+def _refresh_owner_questions(config, agents):
+    at = time.monotonic()
+    try:
+        items, errors = _owner_questions(config, agents)
+    except Exception as exc:  # a background thread has no request to fail
+        # Show that the answer is unknown, never the last one as current.
+        items, errors = [], [f"owner questions unavailable: {exc}"]
+    with _owner_cache_lock:
+        _owner_cache.update(at=at, items=items, errors=errors)
+
+
+def _owner_questions(config, agents):
+    """Owner-question items and errors for every configured project.
+    `agents` maps (project, taskId) to the live fleet agent rows."""
+    items, errors = [], []
+    projects = {p["name"]: p for p in config.get("projects", [])}
+
+    def add(kind, project, task_id, agent, since, signal, **details):
+        items.append(dict(kind=kind, project=project, taskId=task_id, agent=agent or "unknown",
+                          since=since, signal=signal, **details))
 
     # The tab badge polls even on Board: share its cached task listing
     # instead of spawning another list command per labelled project.
@@ -2830,19 +2975,16 @@ def fleet_inbox(config, snapshot, deliveries):
                         task.get("status") == "Done" or label not in (task.get("labels") or [])):
                     continue
                 a = agents.get((project, task_id), {})
-                if (project, task_id) in reports:
-                    report = reports[(project, task_id)]
-                else:
-                    branch = _branch_task_view(config, p, task_id)
-                    # List rows omit comments and finalSummary. Read detail only
-                    # for labelled or branch-bearing tasks, preferring the
-                    # worker branch where new questions are written (task-191).
-                    detail = branch or _task_view_or_none(p["path"], task_id)
-                    report = (detail or {}).get("task")
-                    if not isinstance(report, dict):
-                        errors.append(f"{project}/{task_id}: owner question unavailable")
+                # Unchanged worker task files cost no backlog run (task-215).
+                branch = _branch_task_view(config, p, task_id, reuse=True)
+                # List rows omit comments and finalSummary. Read detail only
+                # for labelled or branch-bearing tasks, preferring the
+                # worker branch where new questions are written (task-191).
+                detail = branch or _checkout_task_view(p["path"], task_id, reuse=True)
+                report = (detail or {}).get("task")
                 if not isinstance(report, dict):
-                    continue  # the failed idle-report check already exposed an error
+                    errors.append(f"{project}/{task_id}: owner question unavailable")
+                    continue
                 if (label not in (report.get("labels") or [])
                         or report.get("status") == "Done"
                         or (report.get("finalSummary") or "").strip()):
@@ -2859,8 +3001,6 @@ def fleet_inbox(config, snapshot, deliveries):
                     title=title, text=question or title)
         except BacklogError as exc:
             errors.append(f"{project}: owner questions unavailable: {exc}")
-    with _owner_cache_lock:
-        _owner_cache.update(at=now, items=items[first_item:], errors=errors[first_error:])
     return items, errors
 
 
@@ -4366,6 +4506,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except settings.SettingsError as exc:
             self._send_error_json(exc.status, str(exc))
             return
+        if "statusPage" in body:
+            import status_page  # local import: avoids a circular import at module load
+
+            # task-212: turning the page on, off or onto another port takes
+            # effect now; a listen failure is in the reported status.
+            status_page.apply(self.config)
+            result["statusPage"] = status_page.status(self.config)
 
         self._send_json(200, result)
 
@@ -5983,6 +6130,13 @@ def run_doctor_check(config_path=None):
         if not projects:
             check("WARN", "no projects configured -- add one from the settings gear in the UI")
 
+    # task-212: the read-only status page is off unless configured; when it
+    # is, say whether its address can be had, as startup would.
+    import status_page  # local import: avoids a circular import at module load
+
+    for level, message in status_page.doctor_check(config):
+        check(level, message)
+
     for project in projects:
         name, proj_path = project["name"], project["path"]
         if not os.path.isdir(proj_path):
@@ -6182,12 +6336,19 @@ def main():
     # above it (bind failure, tmux warning, boot sweep) appear immediately
     # since stderr is unbuffered.
     print(f"Centrale serving on http://{address[0]}:{address[1]}", flush=True)
+    import status_page  # local import: avoids a circular import at module load
+
+    # task-212: the opt-in read-only listener starts only once the
+    # dashboard itself is up, and a failure to bind it is reported here
+    # and nowhere fatal -- the dashboard keeps serving either way.
+    status_page.apply(config)
     try:
         server.serve_forever()
     except (KeyboardInterrupt, _TerminateRequested):
         pass
     finally:
         auto_harvest_thread.stop()
+        status_page.stop()
         server.server_close()
 
 

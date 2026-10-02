@@ -20,7 +20,7 @@ a session, before the code. A constitution nobody rereads is decoration.
 
 Centrale stores no task state of its own. The board, the live sessions, the
 branch states and the merge verdicts are re-derived on every request from the
-`backlog` CLI, from `git` and from `tmux`, with two measured exceptions below.
+`backlog` CLI, from `git` and from `tmux`, with three measured exceptions below.
 No database, no synced copy of a task, no cache of what a branch looked like.
 Delete Centrale and no task data is lost, because none of it was ever here.
 
@@ -49,7 +49,7 @@ recursive `backlog/` file metadata is unchanged. Each request validates that
 metadata; an unreadable tree or a failed reload never certifies the last
 answer as current. Concurrent readers share a load, and CLI children run at
 low priority where the platform supports it. Git, tmux, lifecycle enrichment,
-task-detail reads and merge gates remain fresh. This is a disposable display
+the task panel's reads and merge gates remain fresh. This is a disposable display
 optimization, never another source of task truth.
 
 The second exception is what a restart may remember (task-201, decision-5).
@@ -61,6 +61,13 @@ the fleet journal, which already records every change. It gets it back only
 when the row is not older than the tmux session's creation time and names
 the same session instance. A session that was working, or was recreated
 under the same name, still shows that Centrale does not know.
+
+The third is the Needs-you check of each worker's task (task-215,
+decision-7). Backlog loads the whole board to show one task, so checking
+eight workers every 30 seconds stalled a request for seven seconds. A
+worker's task is now re-read only when its file has changed, a renamed file
+counts as changed, and the re-check runs in the background, so no request
+waits on it. A failed read shows an error, never the last answer.
 
 ## Gates over trust
 

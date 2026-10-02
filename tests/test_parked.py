@@ -115,6 +115,7 @@ class ParkedSurfacesTests(unittest.TestCase):
                  "parked": {"reason": "dialog on the pane", "since": NOW - 600,
                             "lastLine": "Press enter to continue", "dialog": "x"}}
         with mock.patch.object(server, "get_board", return_value={"projects": []}), \
+             mock.patch.dict(server._owner_cache, {"at": None, "items": [], "errors": [], "running": False}), \
              mock.patch.object(server, "_task_view_or_none", side_effect=AssertionError("idle report read")):
             items, _ = server.fleet_inbox({**CONFIG, "worktreeRoot": "/nowhere"},
                                           {"agents": [agent], "timestamp": NOW}, [])

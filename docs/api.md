@@ -19,7 +19,11 @@ worktree, a tmux session, a git branch, `projects.json` — and aren't safe to
 fire blind against a repo you care about).
 
 The server binds `127.0.0.1` only and has no authentication of any kind — see
-"Running it" in [docs/operations.md](operations.md#running-it).
+"Running it" in [docs/operations.md](operations.md#running-it). The one
+thing that can listen beyond it is the opt-in, read-only status page, on a
+separate port with its own small surface: see
+[The read-only status page](#the-read-only-status-page-a-separate-listener)
+at the end.
 
 ## Request requirements
 
@@ -991,6 +995,13 @@ curl -s 'http://127.0.0.1:7420/api/fleet?window=7200'
     Whoever records the owner decision removes the label. `since` is the board
     task update time (creation time as fallback), explicitly identified as such
     because label-added time is unavailable.
+    Owner items are recomputed at most every 30 seconds. Only the first fleet
+    read after a server start waits for that; afterwards an expired window
+    returns the previous owner items (and their errors) immediately and
+    refreshes them on one background thread, so a new question appears
+    within 30 seconds plus one refresh. A worker's detail read is skipped
+    while its task file (path, inode, size, mtime, ctime) or, without a
+    worktree, its branch tip is unchanged since the last successful read.
 - Needs you is an optional registered view (`static/view-needs-you.js`); removing
   its script tag leaves Board and other views working. Its badge counts items
   (multiple signals for a task can produce multiple items), adds `+` when checks
@@ -1448,7 +1459,9 @@ curl -s 'http://127.0.0.1:7420/api/settings' | python3 -m json.tool
     {"name": "my-app", "path": "/home/user/code/my-app"},
     {"name": "centrale", "path": "/home/user/code/centrale"},
     {"name": "my-lib", "path": "/home/user/code/my-lib"}
-  ]
+  ],
+  "statusPage": {"enabled": false, "port": 7421, "bind": null,
+                 "running": false, "error": null, "links": [], "labelledLinks": []}
 }
 ```
 
@@ -1474,6 +1487,20 @@ reason to refuse anything.
 
 `projects` is name/path only — everything else about a project (`checkCommand`
 aside, exposed separately above) is out of scope for this endpoint.
+
+`statusPage` is the read-only status page (task-212): its three settings
+(`enabled`, `port`, `bind` — `null` for every interface) plus what this
+process knows now: `running` (its listener is up), `error` (why the last
+attempt to listen failed, else `null`) and `links` (with the page on: one
+`http://<address>:<port>/?key=<key>` per network address the machine has,
+except on container and virtual bridge interfaces (`docker*`, `br-*`,
+`veth*`, `virbr*`, `cni*`, `flannel*`, `podman*`, `lxc*`, `lxd*`) unless
+`bind` names one, then a `<hostname>.local` one; empty when off). The links carry the key,
+which this local-only endpoint is the one place to read it from. `links`
+stays a list of plain URL strings; `labelledLinks` (task-216, additive) is the
+same links in the same order as `{"url", "label"}`, where `label` is
+`"home Wi-Fi only; works on Apple devices; not over a VPN"` for the
+`<hostname>.local` link (mDNS does not cross a VPN) and `null` for numeric ones.
 
 ---
 
@@ -2416,6 +2443,7 @@ and `projects`, are not accepted back.
 | `agents` | `[{"name", "cmd", "promptSuffix"}, ...]` | The **whole** agents map, in the order it should be written — not a patch. `cmd` is an argv list of strings or one shell-quoted string (split with `shlex`, the exact inverse of `agentEntries`' `cmdText`), and must be non-empty. `promptSuffix` is optional (`null`/blank means none). Names must be unique case-insensitively (agent resolution lowercases both sides). The two built-in names (`claude`, `codex`) can be edited but not dropped, the map can't end up empty, and the current default agent must survive — or the same request must name a replacement. Whether `cmd[0]` exists on `PATH` is deliberately *not* validated; it becomes a `warnings` line instead (below). |
 | `removeProject` | string | A project name. Deletes only its `projects.json` entry — never the repo itself, never its worktrees/branches. Removing the *only* configured project is allowed: a board with zero projects is a supported state, the same one a first run shows. Refused (400) only while the removal would strand work Centrale is managing — a live agent session in that project, or a `task/*` branch not yet merged into the branch its checkout is on — and the reason names the session or branches in the way. |
 | `addProject` | `{"name", "path", "initBacklog": bool}` | Defaults to `false`; `true` opts into Backlog.md and Centrale setup, even if Backlog already exists. |
+| `statusPage` | `{"enabled": bool, "port": 1-65535, "bind": string \| null}`, each optional | The read-only status page. `port` must differ from the dashboard's own; `bind` is one interface name or address, empty/`null` for every interface. Any other key (a `key`, say) is a field error: the key is generated and stored by Centrale, never set here. Applied to the running listener at once; the response's `statusPage` says whether it is listening. Field errors are `"statusPage.<name>"`. |
 
 ```bash
 curl -s -X POST http://127.0.0.1:7420/api/settings \
@@ -2556,6 +2584,66 @@ status hint, not Centrale-owned task data.
 
 See `POST /api/agent-event` above for the exact request/response shape this
 resolves to.
+
+## The read-only status page (a separate listener)
+
+Off unless `statusPage.enabled` is true (see
+[configuration](configuration.md#setup--configuration) and "Checking status
+from a phone" in [docs/operations.md](operations.md#checking-status-from-a-phone)).
+When on, a second HTTP server, separate from everything above, listens on
+`statusPage.port` (`7421`) on every interface or the one `statusPage.bind`
+names. None of the routes in this document exist there. Its whole surface:
+
+| Request | Response |
+| --- | --- |
+| `GET /` | The phone page (`static/phone.html`), its asset URLs carrying the key |
+| `GET /api/status` | The status data below |
+| `GET /static/phone.js`, `/static/dom.js`, `/static/fleet.js`, `/static/styles.css`, `/static/favicon.svg`, `/favicon.ico` | Those files |
+| `HEAD` of any of these | The same headers, no body |
+| any other path | 404 `{"error": "not found"}` |
+| any other method | 405 `{"error": "this page is read-only"}`, `Allow: GET, HEAD` |
+
+Every request must carry `?key=<key>`, the key Centrale generated (compared in
+constant time); without it, or with a wrong one, every request -- any path,
+any method -- is the same 404 as an unknown path. So is a browser request
+labelled `Sec-Fetch-Site: cross-site` or `same-site`. Paths are matched
+exactly: nothing is resolved against the filesystem. Every response is
+`Cache-Control: no-store` with `nosniff`, `no-referrer` and a CSP that
+forbids framing.
+
+```bash
+curl -s 'http://127.0.0.1:7421/api/status?key=<key>' | python3 -m json.tool
+```
+
+```json
+{
+  "kind": "centrale-status",
+  "timestamp": 1790784000.0,
+  "window": 7200,
+  "refreshIntervalSeconds": 10,
+  "projects": [{"name": "my-app", "maxAgents": 3, "agentCount": 1}],
+  "agents": [{"project": "my-app", "taskId": "TASK-2", "agent": "claude",
+              "state": "waiting", "stateSince": 1790783400.0, "parked": false}],
+  "history": [{"project": "my-app", "taskId": "TASK-2", "agent": "claude",
+               "state": "waiting", "timestamp": 1790783400.0}],
+  "needsYou": {"count": 1, "unavailable": 0,
+               "items": [{"kind": "permission", "project": "my-app", "taskId": "TASK-2",
+                          "agent": "claude", "since": 1790783700.0}]},
+  "historyUnavailable": false
+}
+```
+
+It is an allowlist over the `GET /api/fleet` snapshot, field by field:
+`agents`, `history` and `projects` carry only what is shown above, `needsYou`
+only a count, up to 20 items (oldest first) of kind, task, agent and time, and
+`unavailable`, the number of Needs-you checks that could not run (never their
+text). Never pane lines, messages, owner-question text, signals, session
+names, harvest results or error text. The snapshot is taken without arming
+`POST /api/session-input` the way the dashboard's own read of a permission
+dialog does. A snapshot that cannot be built is 503 `{"error": "fleet status
+unavailable right now"}`, with no detail.
+
+---
 
 ## Static files (not JSON, listed for completeness)
 

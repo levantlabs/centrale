@@ -149,6 +149,90 @@ class IdentityTests(ScanTestCase):
         self.assertEqual(self.rule_names(self.findings()), ["home-path"])
 
 
+class NetworkAddressTests(ScanTestCase):
+    # Addresses are assembled at runtime for the same reason as the keys
+    # above: the suite scans this repository, this file included.
+    def ip(self, *octets):
+        return ".".join(str(o) for o in octets)
+
+    def test_each_private_range_fails(self):
+        for octets in ((10, 0, 0, 1), (10, 255, 3, 4), (172, 16, 0, 1),
+                       (172, 31, 255, 254), (192, 168, 1, 20)):
+            with self.subTest(addr=octets):
+                self.write("docs/a.md", f"host {self.ip(*octets)} here\n")
+                self.assertEqual(self.rule_names(self.findings()), ["private-ipv4"])
+
+    def test_documentation_loopback_and_unspecified_addresses_pass(self):
+        for octets in ((192, 0, 2, 7), (198, 51, 100, 7), (203, 0, 113, 7),
+                       (127, 0, 0, 1), (0, 0, 0, 0), (172, 15, 0, 1),
+                       (172, 32, 0, 1), (192, 169, 1, 1), (11, 0, 0, 1),
+                       (8, 8, 8, 8)):
+            with self.subTest(addr=octets):
+                self.write("docs/a.md", f"host {self.ip(*octets)}:8080\n")
+                self.assertEqual(self.findings(), [])
+
+    def test_a_longer_dotted_number_is_not_an_address(self):
+        self.write("a.txt", f"v{self.ip(1, 10, 0, 0, 1)} and {self.ip(10, 0, 0, 1, 5)}\n")
+        self.assertEqual(self.findings(), [])
+
+    def test_an_address_ending_a_sentence_still_fails(self):
+        self.write("a.md", f"Open {self.ip(192, 168, 0, 5)}.\nNext line\n")
+        self.assertEqual(self.rule_names(self.findings()), ["private-ipv4"])
+
+    def test_identity_exempt_paths_may_carry_addresses(self):
+        self.write("backlog/tasks/t.md", f"example {self.ip(192, 168, 1, 2)}\n")
+        self.assertEqual(self.findings(), [])
+
+
+class HostnameTests(ScanTestCase):
+    def findings_for_host(self, host):
+        with mock.patch.object(scan_release.socket, "gethostname",
+                               return_value=host):
+            rules, _used, _skipped = scan_release.hostname_rules()
+        return scan_release.scan(self.root, rules,
+                                 scan_release.walked_files(self.root))
+
+    def test_the_machine_hostname_fails_as_a_bare_word(self):
+        self.write("docs/a.md", "ssh into boxname-" + "7 or Boxname-7 now\n")
+        hits = self.findings_for_host("boxname-" + "7")
+        self.assertEqual(self.rule_names(hits), ["machine-hostname"])
+        self.assertEqual(len(hits), 2)   # case-insensitive: both spellings
+
+    def test_a_fqdn_also_searches_for_the_short_label(self):
+        self.write("a.md", "connect to shortbox now\n")
+        hits = self.findings_for_host("shortbox." + "lan.invalid")
+        self.assertEqual(self.rule_names(hits), ["machine-hostname"])
+
+    def test_a_hostname_equal_to_the_github_org_passes_inside_its_url(self):
+        host = "orgname" + "x"
+        self.write("README.md", f"git clone https://github.com/{host}/repo.git\n")
+        self.write("a.html", f'<a href="https://github.com/{host}/repo">x</a>\n')
+        self.write("b.md", f"git@github.com:{host}/repo.git\n")
+        self.assertEqual(self.findings_for_host(host), [])
+        self.write("c.md", f"my machine is {host}\n")
+        self.assertEqual(len(self.findings_for_host(host)), 1)
+
+    def test_a_substring_of_a_longer_word_is_not_a_hit(self):
+        self.write("a.md", "unboxnamed things\n")
+        self.assertEqual(self.findings_for_host("boxname"), [])
+
+    def test_generic_hostnames_never_become_rules(self):
+        for host in ("localhost", "ubuntu", "dev", "localhost.localdomain"):
+            with self.subTest(host=host):
+                with mock.patch.object(scan_release.socket, "gethostname",
+                                       return_value=host):
+                    rules, _used, skipped = scan_release.hostname_rules()
+                self.assertEqual(rules, [])
+                self.assertTrue(skipped)
+
+    def test_build_rules_reports_the_hostname_in_force(self):
+        with mock.patch.object(scan_release.socket, "gethostname",
+                               return_value="boxname-" + "9"):
+            rules, lines, _armed = scan_release.build_rules(self.root)
+        self.assertTrue(any(r.name == "machine-hostname" for r in rules))
+        self.assertTrue(any("hostname derived" in l for l in lines))
+
+
 class PrivateProjectNameTests(ScanTestCase):
     def test_a_configured_name_fails_wherever_it_appears(self):
         self.write("tests/test_x.py", '{"project": "acmeinternal"}\n')
@@ -368,7 +452,8 @@ class DerivedIdentityTests(unittest.TestCase):
 class AllowlistTests(unittest.TestCase):
     def test_every_entry_names_a_real_rule_and_carries_a_reason(self):
         known = {r.name for r in scan_release.CREDENTIAL_RULES + scan_release.IDENTITY_RULES}
-        known |= {"private-project-name", "machine-account", "git-email", "git-name"}
+        known |= {"private-project-name", "machine-account", "git-email", "git-name",
+              "machine-hostname"}
         self.assertTrue(scan_release.ALLOWLIST)
         for rule_name, pattern, reason in scan_release.ALLOWLIST:
             self.assertIn(rule_name, known, f"{rule_name} matches no rule")

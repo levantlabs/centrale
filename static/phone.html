@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="light dark">
+<title>Centrale status</title>
+<!-- task-212: the read-only status page, served only by status_page.py's
+     own listener. {{KEY_QUERY}} is replaced with "?key=<key>" as it is
+     served, because that listener answers nothing without the key. The
+     theme follows the phone's own setting through styles.css's
+     prefers-color-scheme rules; there is no toggle to remember. -->
+<link rel="icon" href="/static/favicon.svg{{KEY_QUERY}}">
+<link rel="stylesheet" href="/static/styles.css{{KEY_QUERY}}">
+</head>
+<body class="phone-page">
+<main class="phone-root">
+  <header class="phone-head">
+    <h1>Centrale</h1>
+    <span class="phone-updated" id="phone-updated" aria-live="polite">Loading…</span>
+  </header>
+  <div class="view-error phone-error" id="phone-error" role="status" hidden></div>
+  <div id="phone-pulse"></div>
+  <div id="phone-needs"></div>
+  <div id="phone-cards" class="fleet-root"></div>
+  <div id="phone-feed"></div>
+  <footer class="phone-foot">Read-only. Nothing on this page can change Centrale.</footer>
+</main>
+<script src="/static/dom.js{{KEY_QUERY}}"></script>
+<script src="/static/fleet.js{{KEY_QUERY}}"></script>
+<script src="/static/phone.js{{KEY_QUERY}}"></script>
+</body>
+</html>
