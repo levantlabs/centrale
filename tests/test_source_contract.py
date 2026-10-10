@@ -446,7 +446,7 @@ class AgentsDocQuotesTheCodeTests(unittest.TestCase):
             "changed and the chapter still names the old size (task-139)" % phrase)
 
     def test_every_resume_family_default_is_named_in_the_doc(self):
-        """The resume tiers' family defaults, read out of spawn.resume().
+        """The resume tiers' family defaults, read out of spawn._resume_launch().
 
         The doc lists each command prefix by hand. Codex's executable
         and verified UUID are dynamic (task-195); render those as the
@@ -457,9 +457,11 @@ class AgentsDocQuotesTheCodeTests(unittest.TestCase):
 
         with open(spawn.__file__, "r", encoding="utf-8") as f:
             source = f.read()
+        # task-207: the tiers live in _resume_launch, which resume() and a
+        # resume on a machine (remote.resume_on_machine) share.
         resume = next(
             node for node in ast.walk(ast.parse(source))
-            if isinstance(node, ast.FunctionDef) and node.name == "resume")
+            if isinstance(node, ast.FunctionDef) and node.name == "_resume_launch")
         # task-183: each default now ends in `*agent_cmd[1:]` (the
         # agent's own arguments); the fixed part is the constants before it.
         def fixed_part(elts):

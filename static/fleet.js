@@ -102,7 +102,8 @@
   var KINDS = {
     spawn: ["work", "starting"], working: ["work", "working"], waiting: ["wait", "waiting"],
     idle: ["idle", "idle"], finished: ["review", "ready to review"],
-    "merge blocked": ["block", "merge blocked"], unknown: ["unknown", "unknown"]
+    "merge blocked": ["block", "merge blocked"], unknown: ["unknown", "unknown"],
+    unreachable: ["unreachable", "unreachable"]
   };
 
   function stateInfo(state) {

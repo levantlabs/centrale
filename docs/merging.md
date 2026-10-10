@@ -298,3 +298,47 @@ Centrale never gets confused by a branch that's already gone — but a merge
 that happens outside Centrale was never checked against those six gates
 (including `checkCommand` running against the *merged* tree), so it's
 un-certified: nothing here can tell you it passed a check it never ran.
+
+### Tasks on another machine
+
+A task placed on a worker -- a project lists the machines its tasks may run
+on, and each task's location is derived from where its worktree or branch
+is (see [Where a task is](configuration.md#where-a-task-is)) -- keeps its
+session, worktree and branch on that worker, while `main` and every merge
+stay on this machine (the hub). The location is read fresh under the task's
+lock before the gates run; a task found in two places is refused, naming
+both, and nothing is merged. The gates read the state where it is, never
+the hub's absence of it (task-208):
+
+- **No live session** asks the worker's tmux, and **worktree clean** reads
+  `git status --porcelain` in the worker's worktree. A branch checked out
+  anywhere else in the worker's project repository refuses as an external
+  checkout, named `<machine>:<path>`.
+- **Task done** reads the branch's committed task from the hub's fetched
+  copy (`refs/remotes/<machine>/task/<id>`), fetched for this evaluation and
+  pinned to the tip the worker just reported; a fetch that brings anything
+  else back refuses.
+- **Merge clean** and **checkCommand** run on the worker, in a throwaway
+  detached worktree cut at the hub's base commit, which is pushed there and
+  pinned first. The worker refuses when its base or the branch is not at the
+  pinned commits. `checkCommand` runs under `timeout -k` on the worker
+  (`checkTimeoutSeconds`, then a 10 s grace before KILL), so a hung check is
+  killed there, children included, rather than only its ssh client here;
+  anything still running in the scratch directory is swept before it is
+  removed.
+- Before merging, the hub re-reads its base branch and the worker's tip and
+  refuses (`pinsUnchanged`) if either moved since the gates ran. The merge
+  is of the pinned commit; `main` is then pushed back and the worker's
+  worktree and branch removed (recorded as owed if the worker stops
+  answering at that moment).
+- The board-side adopt-Done and discard-board-edit offers are not available
+  for a task on a machine.
+
+**Discard** and **Abandon** fetch first and survey the worker's worktree
+under the task's lock, so the confirm names what is actually there; the
+recovery tag is cut on the hub from the fetched tip before anything is
+removed on the worker.
+
+A worker that does not answer disables Merge, Discard, Abandon, End session
+and Resume with the reason; the server refuses them with its own stated
+reason too. Nothing there is ended, merged or removed on a guess.

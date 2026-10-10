@@ -113,6 +113,10 @@
           <div id="sessions-list" class="sidebar-list"></div>
           <button type="button" id="harvest-all-btn" class="btn btn-sm" title="Merge every task/&lt;id&gt; branch across all projects whose safety gates all pass">Merge all ready</button>
         </div>
+        <div class="sidebar-section">
+          <div class="sidebar-section-header"><span class="sidebar-section-title">Machines</span></div>
+          <div id="machines-list" class="sidebar-list"></div>
+        </div>
       </nav>
 
       <div id="sidebar-footer" class="sidebar-full-only">
@@ -369,6 +373,34 @@
           <div id="settings-projects-list"></div>
         </div>
       </details>
+
+      <div class="settings-section" id="settings-machines-section">
+        <div class="settings-label">Machines</div>
+        <div class="settings-hint">Other Linux machines that can run project tasks over SSH.</div>
+        <div id="settings-machines-list"></div>
+        <button type="button" id="settings-add-machine-btn" class="btn btn-sm">Add a machine</button>
+        <div class="settings-hint">Machine changes apply live. If a status connection cannot start, Save shows a warning to fix it and restart Centrale.</div>
+        <div id="settings-machine-editor" hidden>
+          <div class="settings-label" id="settings-machine-editor-title">Add a machine</div>
+          <label class="settings-label" for="settings-machine-name">Name</label>
+          <input class="settings-input" id="settings-machine-name" placeholder="e.g. box-d">
+          <label class="settings-label" for="settings-machine-ssh">SSH target</label>
+          <input class="settings-input" id="settings-machine-ssh" placeholder="e.g. user@box-d">
+          <label class="settings-label" for="settings-machine-repo-root">Repository root on machine</label>
+          <input class="settings-input" id="settings-machine-repo-root" placeholder="e.g. ~/repos">
+          <label class="settings-label" for="settings-machine-worktree-root">Worktree root on machine</label>
+          <input class="settings-input" id="settings-machine-worktree-root" placeholder="e.g. ~/worktrees">
+          <label class="settings-label" for="settings-machine-max-agents">Max agents on this machine</label>
+          <input class="settings-input" id="settings-machine-max-agents" type="number" min="1" step="1" placeholder="blank = no limit">
+          <label class="settings-label" for="settings-machine-tmux-socket">tmux socket name (optional)</label>
+          <input class="settings-input" id="settings-machine-tmux-socket" placeholder="blank = default tmux server">
+          <div class="settings-hint">A project's limit counts its agents everywhere; this machine's limit counts agents from every project here. A spawn must fit under both.</div>
+          <div class="settings-field-error" id="settings-error-machines" hidden></div>
+          <button type="button" id="settings-machine-save" class="btn btn-sm">Save machine</button>
+          <button type="button" id="settings-machine-cancel" class="btn btn-sm">Cancel</button>
+        </div>
+        <pre id="settings-machine-check-results" class="settings-machine-check-results" hidden></pre>
+      </div>
 
       <div class="settings-section">
         <div class="settings-label">Add a project</div>

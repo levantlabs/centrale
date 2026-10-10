@@ -79,11 +79,12 @@ def current_settings(config):
     max_agents = {p["name"]: p.get("maxAgents") for p in config.get("projects", [])}
     worktree_links = {p["name"]: list(p.get("worktreeLinks") or []) for p in config.get("projects", [])}
     projects = [{"name": p["name"], "path": p.get("path", "")} for p in config.get("projects", [])]
-    return {
+    result = {
         "harvestMode": (config.get("harvest") or {}).get("mode", "click"),
         "sessionPreviewMode": server.session_preview_mode(config),
         "refreshIntervalSeconds": config.get("refreshIntervalSeconds", DEFAULT_REFRESH_INTERVAL_SECONDS),
         "checkCommands": check_commands,
+        "workerCheck": {p["name"]: p.get("workerCheck") for p in config.get("projects", [])},
         "maxAgents": max_agents,
         "worktreeLinks": worktree_links,
         "defaultAgent": config.get("defaultAgent") or server.DEFAULT_AGENT_NAME,
@@ -94,6 +95,20 @@ def current_settings(config):
         "projects": projects,
         "statusPage": status_page.status(config),
     }
+    if config.get("machines"):
+        # task-206: only with machines configured, so a one-machine
+        # setup's settings are exactly what they were.
+        result["machines"] = [m["name"] for m in config["machines"]]
+        # task-224: per-task placement -- the machines each project's tasks
+        # may run on besides the hub, and where a spawn naming none goes.
+        result["projectMachines"] = {p["name"]: list(p.get("machines") or [])
+                                     for p in config.get("projects", [])}
+        result["defaultMachine"] = {p["name"]: p.get("defaultMachine") or server.HUB
+                                    for p in config.get("projects", [])}
+    # task-228: keep the old names-only field for project pickers; the
+    # editor needs the complete definitions even on an empty install.
+    result["machineEntries"] = [dict(m) for m in config.get("machines") or []]
+    return result
 
 
 def agent_entries(config):
@@ -615,6 +630,11 @@ def apply_settings(config, body, path=None, port=None):
     current default agent must still be in it, or the same request must
     pick a new one; the response additionally carries "warnings", one
     line per saved agent whose executable isn't on PATH),
+    "projectMachines" (task-224: {project: [machine names]} -- the
+    machines its tasks may run on besides the hub; removing one is
+    refused while the project still has a task worktree or task branch
+    there, see machines.machines_removal_refusal) and "defaultMachine"
+    ({project: "hub" or one of its machines}),
     "removeProject" (a project name -- removes that entry from
     projects.json only, never touches the repo itself; refused only
     while that project has a live session or an unmerged spawn branch
@@ -673,6 +693,7 @@ def apply_settings(config, body, path=None, port=None):
     known_names = {p["name"] for p in config.get("projects", [])}
     project_settings = {}
     for key, normalizer in (
+        ("workerCheck", server.normalize_project_worker_check),
         ("maxAgents", server.normalize_project_max_agents),
         ("worktreeLinks", server.normalize_project_worktree_links),
     ):
@@ -692,6 +713,19 @@ def apply_settings(config, body, path=None, port=None):
             except server.ConfigError as exc:
                 fields[field] = str(exc).removeprefix("projects.json: ")
         project_settings[key] = normalized
+
+    machine_entries = None
+    if "machines" in body:
+        try:
+            machine_entries = server.normalize_machines(body["machines"])
+        except server.ConfigError as exc:
+            fields["machines"] = str(exc).removeprefix("projects.json: ")
+
+    # task-224: a project's machines and default machine (doc-3 revision
+    # 5). Removing a machine is refused while the project still has a task
+    # there -- checked, written and applied under the project's launch
+    # lock, so no spawn lands there between the check and the save.
+    _validate_project_machines(body, config, known_names, fields, project_settings, machine_entries)
 
     agents_map = None
     if "agents" in body:
@@ -740,6 +774,101 @@ def apply_settings(config, body, path=None, port=None):
     if fields:
         raise ValidationError(fields)
 
+    import machines  # local import: same reason server.py imports it lazily
+    import spawn  # local import: same reason server.py imports it lazily
+
+    by_name = {p["name"]: p for p in config.get("projects", [])}
+    machine_locks = []
+    removed_machines = ({m["name"] for m in config.get("machines") or []} -
+                        {m["name"] for m in machine_entries}) if machine_entries is not None else set()
+    affected = set(project_settings.get("machines") or {})
+    if removed_machines:
+        affected.update(p["name"] for p in config.get("projects", [])
+                        if removed_machines.intersection(p.get("machines") or []))
+    for name in sorted(affected):
+        lock = spawn.project_launch_lock(name)
+        lock.acquire()
+        machine_locks.append(lock)
+    try:
+        for name, value in (project_settings.get("machines") or {}).items():
+            removed = [m for m in by_name[name].get("machines") or [] if m not in value]
+            err = machines.machines_removal_refusal(config, by_name[name], removed)
+            if err:
+                fields[f"projectMachines.{name}"] = err
+        for project in config.get("projects", []):
+            removed = sorted(removed_machines.intersection(project.get("machines") or []))
+            if removed:
+                err = machines.machines_removal_refusal(config, project, removed)
+                if err:
+                    fields["machines"] = (fields.get("machines", "") + f" {project['name']}: {err}").strip()
+        if fields:
+            raise ValidationError(fields)
+        return _apply_validated(
+            config, body, path, port, harvest_mode, refresh_interval, check_commands,
+            default_agent, remove_project, add_project, session_preview_mode,
+            agents_map, project_settings, status_page_settings,
+            machine_entries,
+        )
+    finally:
+        for lock in reversed(machine_locks):
+            lock.release()
+
+
+def _validate_project_machines(body, config, known_names, fields, project_settings, machine_entries=None):
+    """The "projectMachines" and "defaultMachine" fields (task-224), into
+    project_settings["machines"] / ["defaultMachine"] keyed by project. A
+    default must be among the machines the same save leaves the project
+    with; one that a save would leave dangling is refused, never dropped."""
+    if "projectMachines" not in body and "defaultMachine" not in body:
+        return
+    submitted = body.get("projectMachines", {})
+    defaults = body.get("defaultMachine", {})
+    if not isinstance(submitted, dict):
+        raise SettingsError("projectMachines must be an object mapping project name to a list of machine names")
+    if not isinstance(defaults, dict):
+        raise SettingsError('defaultMachine must be an object mapping project name to "hub" or a machine name')
+    by_name = {p["name"]: p for p in config.get("projects", [])}
+    machines_out, defaults_out = {}, {}
+    for key, values in (("projectMachines", submitted), ("defaultMachine", defaults)):
+        for name in values:
+            if not isinstance(name, str) or name not in known_names:
+                fields[f"{key}.{name}"] = "unknown project"
+    for name, value in submitted.items():
+        if name not in known_names:
+            continue
+        try:
+            machines_out[name] = server.normalize_project_machines(
+                value, machine_entries if machine_entries is not None else config.get("machines") or [],
+                f"projects.{name}.machines")
+        except server.ConfigError as exc:
+            fields[f"projectMachines.{name}"] = str(exc).removeprefix("projects.json: ")
+    for name in sorted(set(submitted) | set(defaults)):
+        if name not in known_names or f"projectMachines.{name}" in fields:
+            continue
+        allowed = machines_out.get(name, by_name[name].get("machines") or [])
+        if name in defaults:
+            try:
+                defaults_out[name] = server.normalize_project_default_machine(
+                    defaults[name], allowed, f"projects.{name}.defaultMachine")
+            except server.ConfigError as exc:
+                fields[f"defaultMachine.{name}"] = str(exc).removeprefix("projects.json: ")
+        else:
+            current = by_name[name].get("defaultMachine")
+            if current and current not in allowed:
+                fields[f"defaultMachine.{name}"] = (
+                    f"'{current}' is the default machine and would no longer be one of the "
+                    "project's machines -- pick another default in the same save")
+    if machines_out:
+        project_settings["machines"] = machines_out
+    if defaults_out:
+        project_settings["defaultMachine"] = defaults_out
+
+
+def _apply_validated(
+    config, body, path, port, harvest_mode, refresh_interval, check_commands,
+    default_agent, remove_project, add_project, session_preview_mode,
+    agents_map, project_settings, status_page_settings, machine_entries,
+):
     # addProject's backlog-init step is a real side effect (it can run
     # `backlog init` against the target repo), so it only happens once
     # every other field in the request is already known-valid -- keeping
@@ -756,6 +885,7 @@ def apply_settings(config, body, path=None, port=None):
         agents_map,
         project_settings,
         status_page_settings,
+        machine_entries,
     )
     _apply_to_live_config(
         config, body, harvest_mode, refresh_interval, check_commands,
@@ -763,6 +893,7 @@ def apply_settings(config, body, path=None, port=None):
         agents_map,
         project_settings,
         status_page_settings,
+        machine_entries,
     )
 
     result = current_settings(config)
@@ -776,6 +907,7 @@ def _write_whitelisted_changes(
     agents_map=None,
     project_settings=None,
     status_page_settings=None,
+    machine_entries=None,
 ):
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -872,6 +1004,19 @@ def _write_whitelisted_changes(
             raw_status.pop("bind", None)
         raw["statusPage"] = raw_status
 
+    if machine_entries is not None:
+        old = {m["name"] for m in (raw.get("machines") or []) if isinstance(m, dict) and isinstance(m.get("name"), str)}
+        current = {m["name"] for m in machine_entries}
+        removed = old - current
+        raw["machines"] = machine_entries
+        for project in raw.get("projects", []):
+            if not isinstance(project, dict):
+                continue
+            if isinstance(project.get("machines"), list):
+                project["machines"] = [m for m in project["machines"] if m not in removed]
+            if project.get("defaultMachine") in removed:
+                project.pop("defaultMachine", None)
+
     try:
         _atomic_write_json(path, raw)
     except OSError as exc:
@@ -912,6 +1057,7 @@ def _apply_to_live_config(
     agents_map=None,
     project_settings=None,
     status_page_settings=None,
+    machine_entries=None,
 ):
     if agents_map is not None:
         # Same canonical shape server.normalize_agents_map produces, so
@@ -941,6 +1087,13 @@ def _apply_to_live_config(
         config["lockSpawnedTaskFiles"] = body["lockSpawnedTaskFiles"]
     if status_page_settings is not None:
         config["statusPage"] = dict(status_page_settings)
+    if machine_entries is not None:
+        removed = {m["name"] for m in config.get("machines") or []} - {m["name"] for m in machine_entries}
+        config["machines"] = [dict(m) for m in machine_entries]
+        for project in config.get("projects", []):
+            project["machines"] = [m for m in project.get("machines") or [] if m not in removed]
+            if project.get("defaultMachine") in removed:
+                project["defaultMachine"] = None
     if "removeProject" in body:
         config["projects"] = [p for p in config.get("projects", []) if p["name"] != remove_project]
     if "checkCommands" in body:
@@ -950,7 +1103,8 @@ def _apply_to_live_config(
     for key, values in (project_settings or {}).items():
         for project in config.get("projects", []):
             if project["name"] in values:
-                project[key] = list(values[project["name"]]) if key == "worktreeLinks" else values[project["name"]]
+                value = values[project["name"]]
+                project[key] = list(value) if key in ("worktreeLinks", "machines") else value
     if add_project is not None:
         config.setdefault("projects", []).append({
             "name": add_project["name"],
@@ -960,6 +1114,8 @@ def _apply_to_live_config(
             "checkTimeoutSeconds": server.DEFAULT_CHECK_TIMEOUT_SECONDS,
             "maxAgents": None,
             "worktreeLinks": [],
+            "machines": [],
+            "defaultMachine": None,
         })
 
 

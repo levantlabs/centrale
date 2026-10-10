@@ -120,6 +120,16 @@
       if (hasError) {
         chip.appendChild(C.h("span", { className: "warn-mark", text: "⚠" }));
       }
+      // task-207: a project with machines shows how old the hub's copy of
+      // its task branches from each one is; only such projects carry
+      // "fetches" (task-224: one per machine the project lists).
+      ((project && project.fetches) || []).forEach(function (entry) {
+        var fetch = fetchAge(entry);
+        chip.appendChild(C.h("span", {
+          className: "proj-fetch" + (entry.error ? " stale" : ""),
+          text: fetch.text, title: fetch.title
+        }));
+      });
       var openBtn = C.h("button", {
         className: "chip-open-board",
         text: "⧉",
@@ -133,6 +143,24 @@
       chip.appendChild(openBtn);
       container.appendChild(chip);
     });
+  }
+
+  // task-207: "↓12s" for a project's last task/* fetch from its machine,
+  // "↓?" when none has succeeded since the server started.
+  function fetchAge(fetch) {
+    var age = fetch.fetchAgeSeconds;
+    var text, when;
+    if (age === null || age === undefined) {
+      text = "↓?";
+      when = "not fetched since the server started";
+    } else {
+      var short = age < 60 ? age + "s" : age < 3600 ? Math.floor(age / 60) + "m" : Math.floor(age / 3600) + "h";
+      text = "↓" + short;
+      when = "fetched " + short + " ago";
+    }
+    var title = "Task branches from machine " + fetch.machine + ": " + when;
+    if (fetch.error) title += " — last fetch failed: " + fetch.error;
+    return { text: text, title: title };
   }
 
   function renderErrorBanners() {
@@ -314,6 +342,17 @@
     var pChip = C.h("span", { className: "proj-chip", text: project.name });
     C.applyStyle(pChip, pStyle);
     meta.appendChild(pChip);
+    // task-210: only a task that runs on another machine names it.
+    if (task.machine) {
+      meta.appendChild(C.h("span", { className: "machine-chip", text: task.machine, title: "Runs on " + task.machine + " at " + task.worktree }));
+    }
+
+    // task-225: a task found in two places names both, and why its actions are off.
+    var conflictReason = C.locationConflictReason(task);
+    if (conflictReason) {
+      meta.appendChild(C.h("span", { className: "machine-chip location-conflict",
+        text: "in " + task.location.conflict.join(" + "), title: conflictReason }));
+    }
 
     if (task.priority) {
       meta.appendChild(C.h("span", {
@@ -480,6 +519,10 @@
       if (!live && !display.noTmux && display.plan && display.plan.needsPick) {
         footer.appendChild(C.renderSpawnAgentPicker(task, project.name, task.id, display.plan));
       }
+      // task-225: a project with machines picks where a fresh spawn runs.
+      var machinePlan = !live && !display.noTmux ? C.spawnMachinePlan(task, project.name, task.id) : null;
+      if (machinePlan) footer.classList.add("card-footer-wrap");
+      if (machinePlan) footer.appendChild(C.renderSpawnMachinePicker(machinePlan, project.name, task.id));
       footer.appendChild(spawnBtn);
       // At the project's agent cap the button is disabled and its tooltip
       // says why; repeating that on every card of the project was noise.
@@ -541,7 +584,7 @@
           // task-81: disabled (with the external reason as its title)
           // while the branch is checked out outside Centrale -- see
           // harvestButtonDisplay. No click handler in that case.
-          var hDisplay = C.harvestButtonDisplay(hState, task);
+          var hDisplay = C.harvestButtonDisplay(hState, task, project.name);
           var harvestBtn = C.h("button", { className: "btn btn-sm spawn-inline", text: hDisplay.text });
           harvestBtn.disabled = hDisplay.disabled;
           harvestBtn.title = hDisplay.title;
@@ -559,7 +602,7 @@
       if (hState && (hState.status === "error" || hState.status === "success" || hState.status === "blocked")) {
         card.appendChild(C.renderHarvestStatusLine(hState));
       }
-      if (cState && (cState.status === "error" || cState.status === "success")) {
+      if (cState && (cState.status === "error" || cState.status === "success" || cState.status === "confirm")) {
         card.appendChild(C.renderCleanupStatusLine(cState));
       }
     }

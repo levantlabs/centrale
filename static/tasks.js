@@ -529,7 +529,10 @@
     },
     parked: { className: "agent-badge agent-badge-parked", text: "PARKED" },
     "likely-finished": { className: "agent-badge agent-badge-likely-finished", text: "likely finished" },
-    unknown: { className: "agent-badge agent-badge-unknown", text: "state unknown" }
+    unknown: { className: "agent-badge agent-badge-unknown", text: "state unknown" },
+    // task-210: its machine did not answer -- distinct from unknown, which
+    // is an agent we could read but that has reported nothing.
+    unreachable: { className: "agent-badge agent-badge-unreachable", text: "machine unreachable", title: "This agent runs on a machine Centrale cannot reach right now; its state is not being read." }
   };
 
   // These states describe what a particular agent SESSION is doing, not a
@@ -620,6 +623,42 @@
       " from under a live agent. End the session first (the button is right above).";
   }
 
+  // task-208: the sentence Merge, Abandon, Discard, End session and
+  // Resume are disabled with while the machine a task runs on is not
+  // answering, or null -- always null for a task on this machine, and
+  // with no machines configured. task-224: the machine is the task's own
+  // (its derived location, "machine" on the board's task), not its
+  // project's. Read from the board's own reachability report on every
+  // render, so the actions come back by themselves on the first refresh
+  // that reaches the machine. The server refuses the same actions with
+  // its own stated reason regardless.
+  // task-225: a task's location is a conflict when its worktree or branch
+  // exists in more than one place (the hub, a machine, or two machines).
+  // Returns the sentence the actions are disabled with, naming every place,
+  // or null for a task with one location or none.
+  function locationConflictReason(task) {
+    var places = task && task.location && task.location.conflict;
+    if (!places || !places.length) return null;
+    return "This task is in two places at once: " + places.join(" and ") +
+      ". Spawn, Resume, Merge, Abandon, Discard and End session are disabled until one" +
+      " copy is removed -- Centrale will not guess which one is the real one.";
+  }
+
+  function machineBlockReason(projectName, taskId) {
+    var task = findTask(projectName, taskId);
+    // task-225: a task found in two places is acted on in neither.
+    var conflict = locationConflictReason(task);
+    if (conflict) return conflict;
+    var name = task && task.machine;
+    if (!name) return null;
+    var row = (C.boardData.machines || []).find(function (m) { return m.name === name; });
+    if (!row || row.reach === "reachable") return null;
+    var why = row.reach === "unreachable" ? "is unreachable" : "did not answer clearly";
+    return "Machine " + name + " " + why + (row.error ? " (" + row.error + ")" : "") +
+      ". Merge, Abandon, Discard, End session and Resume need it, so they are disabled" +
+      " until it answers again -- nothing there is ended or removed on a guess.";
+  }
+
   // The board's own copy of a project, by name -- the one lookup the
   // three functions below (and the drawer's refresh, task-126) all
   // start from. Always resolved against C.boardData rather than held,
@@ -698,6 +737,8 @@
   C.isFirstColumnStatus = isFirstColumnStatus;
   C.isTmuxAvailable = isTmuxAvailable;
   C.liveSessionBlockReason = liveSessionBlockReason;
+  C.machineBlockReason = machineBlockReason;
+  C.locationConflictReason = locationConflictReason;
   C.milestoneChipLabel = milestoneChipLabel;
   C.parkedBranch = parkedBranch;
   C.parseSessionTask = parseSessionTask;

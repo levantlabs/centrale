@@ -76,6 +76,19 @@ def make_config(projects):
 
 
 class ConfigLoadingTests(unittest.TestCase):
+    def test_project_reconcile_check_loads_separately_from_merge_gate(self):
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fixture:
+            json.dump({"projects": [{"name": "my-app", "path": "/repos/my-app",
+                                    "checkCommand": "npm test",
+                                    "reconcileCheck": "Run focused tests only."}]}, fixture)
+            path = fixture.name
+        try:
+            project = server.load_config(path=path)["projects"][0]
+        finally:
+            os.remove(path)
+        self.assertEqual(project["checkCommand"], "npm test")
+        self.assertEqual(project["reconcileCheck"], "Run focused tests only.")
+
     def test_project_spawn_settings_default_and_load(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as fixture:
             json.dump({"projects": [
@@ -2516,10 +2529,11 @@ class HooksSettingsPayloadTests(unittest.TestCase):
         def command_for(hook_name):
             return payload["hooks"][hook_name][0]["hooks"][0]["command"]
 
-        self.assertEqual(command_for("UserPromptSubmit"), f"python3 {notify} working")
-        self.assertEqual(command_for("PreToolUse"), f"python3 {notify} working")
-        self.assertEqual(command_for("Notification"), f"python3 {notify} notification")
-        self.assertEqual(command_for("Stop"), f"python3 {notify} finished")
+        # task-226: each hook also names the point it is registered for.
+        self.assertEqual(command_for("UserPromptSubmit"), f"python3 {notify} working UserPromptSubmit")
+        self.assertEqual(command_for("PreToolUse"), f"python3 {notify} working PreToolUse")
+        self.assertEqual(command_for("Notification"), f"python3 {notify} notification Notification")
+        self.assertEqual(command_for("Stop"), f"python3 {notify} finished Stop")
 
     def test_payload_suppresses_auto_mode_setup_and_accepts_cross_session_messages(self):
         # task-170.1: spawned agents never get the "Teach auto mode"
@@ -2527,6 +2541,12 @@ class HooksSettingsPayloadTests(unittest.TestCase):
         payload = server.hooks_settings_payload()
         self.assertEqual(payload["skillOverrides"], {"auto-mode-setup": "off"})
         self.assertEqual(payload["crossSessionInbound"], "accept")
+
+    def test_payload_turns_off_prompt_suggestions(self):
+        # task-241: spawned panes never show a suggested next prompt; the
+        # owner's own sessions keep theirs (this is the --settings layer).
+        for sink in ("http", "tmux"):
+            self.assertIs(server.hooks_settings_payload(sink)["promptSuggestionEnabled"], False)
 
     def test_payload_is_json_serializable(self):
         payload = server.hooks_settings_payload()
@@ -3093,6 +3113,25 @@ class PidsWithCwdUnderTests(unittest.TestCase):
     def test_returns_empty_list_without_proc(self):
         with mock.patch("os.path.isdir", return_value=False):
             self.assertEqual(server._pids_with_cwd_under("/anything"), [])
+
+    def test_leaves_codexs_shared_app_server_daemon_alone(self):
+        # task-222: a fake daemon -- a copy of `sleep` placed at the path
+        # Codex installs its daemon under -- with its cwd in the worktree
+        # is skipped; an ordinary process beside it is still found.
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as home:
+            bindir = os.path.join(home, "packages", "app-server-daemon",
+                                  "releases", "0.160.1-x86_64-unknown-linux-musl", "bin")
+            os.makedirs(bindir)
+            fake = os.path.join(bindir, "codex")
+            shutil.copy(shutil.which("sleep"), fake)
+            daemon = subprocess.Popen([fake, "300"], cwd=d)
+            self.addCleanup(lambda: daemon.poll() is None and (daemon.kill(), daemon.wait(timeout=5)))
+            _wait_until_cwd(daemon.pid, d)
+            ordinary = self._spawn_sleeping(d)
+            self.assertEqual(server._pids_with_cwd_under(d), [ordinary.pid])
+            server.kill_pids_with_cwd_under(d)
+            ordinary.wait(timeout=5)
+            self.assertIsNone(daemon.poll())
 
     def test_kill_pids_with_cwd_under_signals_and_returns_the_found_pids(self):
         with tempfile.TemporaryDirectory() as d:
@@ -4102,6 +4141,35 @@ class HttpApiTests(unittest.TestCase):
         # task-1 can never resolve to task-10 (see capture_session_pane).
         self.assertEqual(calls, [["capture-pane", "-p", "-t", "=centrale-my-app-task-9:", "-S", "-40"]])
 
+    def test_get_session_pane_uses_worker_control_capture(self):
+        self.config["projects"][0]["machines"] = ["box-d"]
+        self.addCleanup(self.config["projects"][0].pop, "machines")
+        location = mock.Mock(conflict=False, machine="box-d")
+        capture = mock.Mock(return_value=["worker prompt", "reply here"])
+        server.remote_task_pane_capture[("box-d", "my-app", "TASK-9")] = capture
+        self.addCleanup(server.remote_task_pane_capture.clear)
+        with mock.patch.object(server, "task_location", return_value=location), \
+             mock.patch.object(server, "run_tmux", side_effect=AssertionError("hub tmux used")):
+            status, body = self._get("/api/session-pane?project=my-app&task=TASK-9")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["lines"], ["worker prompt", "reply here"])
+        capture.assert_called_once_with(40)
+        self.assertIsNotNone(server.pane_capture_age(("centrale-my-app-task-9", "box-d")))
+        self.assertIsNone(server.pane_capture_age("centrale-my-app-task-9"))
+
+    def test_get_session_pane_does_not_fall_back_to_hub_when_worker_capture_is_missing(self):
+        self.config["projects"][0]["machines"] = ["box-d"]
+        self.addCleanup(self.config["projects"][0].pop, "machines")
+        location = mock.Mock(conflict=False, machine="box-d")
+        server.remote_pane_capture[("my-app", "TASK-9")] = lambda _: ["wrong worker"]
+        self.addCleanup(server.remote_pane_capture.clear)
+        with mock.patch.object(server, "task_location", return_value=location), \
+             mock.patch.object(server, "run_tmux", side_effect=AssertionError("hub tmux used")):
+            status, body = self._get("/api/session-pane?project=my-app&task=TASK-9")
+        self.assertEqual(status, 503, body)
+        self.assertIn("worker pane capture is unavailable", body["error"])
+        self.assertIsNone(server.pane_capture_age(("centrale-my-app-task-9", "box-d")))
+
     def test_get_session_pane_resolves_dotted_subtask_id_via_task59_encoding(self):
         calls = []
         with mock.patch.object(server, "run_tmux", side_effect=self._pane_run_tmux("hi\n", calls)):
@@ -4238,6 +4306,54 @@ class HttpApiTests(unittest.TestCase):
         # The text itself travels ONLY as load-buffer's stdin.
         self.assertEqual(stdins, ["-yes; go Enter", None, None])
         self.assertNotIn("-yes; go Enter", [a for call in calls for a in call])
+
+    def test_post_session_input_sends_worker_text_as_bracketed_paste_then_enter(self):
+        import machines
+
+        self.config["projects"][0]["machines"] = ["box-d"]
+        self.config["machines"] = [{"name": "box-d", "tmuxSocket": "stand-in"}]
+        self.addCleanup(self.config["projects"][0].pop, "machines")
+        self.addCleanup(self.config.pop, "machines")
+        location = mock.Mock(conflict=False, machine="box-d")
+        server.record_pane_capture(("centrale-my-app-task-9", "box-d"))
+        self._pin_buffer("reply-1")
+        answer = machines.MachineResult(machines.ANSWERED, 0, "", "", "box-d")
+        with mock.patch.object(server, "task_location", return_value=location), \
+             mock.patch.object(machines, "run_on_machine", return_value=answer) as run, \
+             mock.patch.object(server, "run_tmux", side_effect=AssertionError("hub tmux used")):
+            status, body = self._reply("/api/session-input", {
+                "project": "my-app", "taskId": "TASK-9", "text": "continue"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(run.call_args_list, [
+            mock.call(self.config, "box-d", ["tmux", "-L", "stand-in", "load-buffer", "-b", "reply-1", "-"], input="continue"),
+            mock.call(self.config, "box-d", ["tmux", "-L", "stand-in", "paste-buffer", "-d", "-p", "-b", "reply-1", "-t", "=centrale-my-app-task-9:"], input=None),
+            mock.call(self.config, "box-d", ["tmux", "-L", "stand-in", "send-keys", "-t", "=centrale-my-app-task-9:", "Enter"], input=None),
+        ])
+
+    def test_hub_capture_does_not_arm_a_worker_reply(self):
+        self.config["projects"][0]["machines"] = ["box-d"]
+        self.addCleanup(self.config["projects"][0].pop, "machines")
+        server.record_pane_capture("centrale-my-app-task-9")
+        location = mock.Mock(conflict=False, machine="box-d")
+        with mock.patch.object(server, "task_location", return_value=location), \
+             mock.patch.object(server, "run_tmux", side_effect=AssertionError("hub tmux used")):
+            status, body = self._reply("/api/session-input", {
+                "project": "my-app", "taskId": "TASK-9", "text": "continue"})
+        self.assertEqual(status, 409, body)
+        self.assertIn("no fresh pane capture", body["error"])
+
+    def test_worker_reply_refuses_a_move_after_the_capture_gate(self):
+        self.config["projects"][0]["machines"] = ["box-d", "box-e"]
+        self.addCleanup(self.config["projects"][0].pop, "machines")
+        server.record_pane_capture(("centrale-my-app-task-9", "box-d"))
+        first = mock.Mock(conflict=False, machine="box-d")
+        moved = mock.Mock(conflict=False, machine="box-e")
+        with mock.patch.object(server, "task_location", side_effect=[first, moved]), \
+             mock.patch.object(server, "run_tmux", side_effect=AssertionError("hub tmux used")):
+            status, body = self._reply("/api/session-input", {
+                "project": "my-app", "taskId": "TASK-9", "text": "continue"})
+        self.assertEqual(status, 409, body)
+        self.assertIn("location changed", body["error"])
 
     def test_post_session_input_text_never_uses_send_keys_l_or_sleeps(self):
         # Belt and braces for the task-72 invariant: the only send-keys in
@@ -4643,6 +4759,15 @@ class HttpApiTests(unittest.TestCase):
              mock.patch.object(server, "run_backlog", side_effect=self._run_backlog_task_status("TASK-9", "Done")), \
              mock.patch("os.path.isdir", side_effect=lambda p: p in (self.my_app_dir, wt_dir)):
             status, body = self._post_json("/api/cleanup-branch", {"project": "my-app", "taskId": "TASK-9"})
+
+            self.assertEqual(status, 409)
+            self.assertEqual(body["discardedPaths"], [
+                "backlog/tasks/task-9 - Detect externally merged branches, replace Merge with informed cleanup.md",
+                "backlog/drafts/task-9.1 - Follow-up notes for cleanup edge cases.md",
+            ])
+            self.assertFalse(any(args[:2] == ("worktree", "remove") or args[:1] == ("branch",)
+                                 for args, _cwd in git_calls))
+            status, body = self._post_json("/api/cleanup-branch", {"project": "my-app", "taskId": "TASK-9", "force": True})
 
         self.assertEqual(status, 200)
         self.assertTrue(body["ok"])
@@ -6714,12 +6839,15 @@ class ExternalMergeDisabledContractTests(unittest.TestCase):
 
     def test_the_rule_reads_the_board_summary_and_no_client_state(self):
         display = region(
-            load_static("harvest.js"), "function harvestButtonDisplay(state, task)",
+            load_static("harvest.js"), "function harvestButtonDisplay(state, task, projectName)",
             "function harvestActionIsArmed(",
             invariant="the Merge button's display rule")
-        # The only inputs are the in-flight harvest state and the task
-        # itself; the map of remembered verdicts is not consulted.
+        # The only inputs are the in-flight harvest state, the task itself
+        # and (task-208) the board's own machine reachability for the
+        # task's machine (task-224: its derived location); the map of
+        # remembered verdicts is not consulted.
         self.assertIn("var ext = C.externalCheckout(task)", display)
+        self.assertIn("C.machineBlockReason(projectName, task.id)", display)
         self.assertNotIn("harvestStates", display)
         # ...and no module-level flag was introduced to carry it either,
         # in any frontend file or in the shell.

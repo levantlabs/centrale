@@ -157,7 +157,7 @@ server never leaks a traceback to the client. The status generally means:
 | 400 | Malformed input — a missing/invalid `project`, `taskId`, request body, or (for `/api/settings`) a field that failed validation. |
 | 403 | A request refused by the trust boundary — a `Host` that isn't a loopback name at the bound port, a `Sec-Fetch-Site` other than `same-origin`/`none`, or an `Origin`/`Referer` that isn't this server's own. `GET` and `POST` alike; see "Request requirements" above. (Also `/api/session-pane` and `/api/session-input` when `sessionPreview.mode` disables them.) |
 | 404 | The named project (or, for `/api/end-session`, the session) doesn't exist. Also: nothing to act on — no worktree *and* no branch for `/api/cleanup-branch`, `/api/discard-preview` and `/api/discard-attempt`, or no worktree for `/api/abandon-worktree`. |
-| 409 | A conflicting state — a session already live for that project+task, a task already Done, a `task/<id>` branch checked out in a worktree Centrale doesn't manage (`/api/spawn`, `/api/resume`, `/api/cleanup-branch`, `/api/discard-attempt` and `/api/abandon-worktree` all refuse this with the same sentence naming that checkout), a repository that moved since the preview a destructive confirm was armed from (`/api/discard-attempt`, `/api/abandon-worktree`), a branch that isn't fully merged yet (`/api/cleanup-branch`), or (`/api/cleanup-branch`, without `force`) a live process still running with its cwd under the worktree. Also `/api/deliver` when a dialog occupies the agent's pane. |
+| 409 | A conflicting state — a session already live for that project+task, a task already Done, a `task/<id>` branch checked out in a worktree Centrale doesn't manage (`/api/spawn`, `/api/resume`, `/api/cleanup-branch`, `/api/discard-attempt` and `/api/abandon-worktree` all refuse this with the same sentence naming that checkout), a repository that moved since the preview a destructive confirm was armed from (`/api/discard-attempt`, `/api/abandon-worktree`), a branch that isn't fully merged yet (`/api/cleanup-branch`), or (`/api/cleanup-branch`, without `force`) dirty files or a live process still running with its cwd under the worktree. Also `/api/deliver` when a dialog occupies the agent's pane. |
 | 504 | `POST /api/deliver` only: the text was sent to the agent's pane, but its echo never appeared (see that section). |
 | 500 | An unexpected failure in a subprocess Centrale fully controls (`git`, `tmux`, launching `backlog browser`) — the operation was attempted and didn't work, not a validation problem. |
 | 415 | A `POST` whose body isn't declared `Content-Type: application/json` — see "Request requirements" above. |
@@ -233,6 +233,44 @@ one project/task trimmed for length):
 Each project's `maxAgents` is its configured positive integer cap or `null`
 for no cap. The frontend derives the live count from `/api/sessions`; the
 server always checks tmux again when launching, independent of board cache.
+
+With `machines` configured in `projects.json` (and only then -- without
+them the response has no such key), the board also carries
+`"machines": [{"name": "box-b", "reach": "reachable", "error": null}]`, one
+entry per machine in config order, from that refresh's single batched
+round trip to each machine (task-206). `reach` is `"reachable"`,
+`"unreachable"` (ssh never ran the command: refused, timed out, or the
+refresh's per-machine budget ran out first) or `"unknown"` (the machine
+started answering and stopped); `error` says why when it is not
+reachable.
+
+Also only with `machines` configured (task-207, task-224): each project
+with `machines` of its own carries `"machines": ["box-b"]`,
+`"defaultMachine": "hub"` (or a machine name) and `"fetches": [{"machine":
+"box-b", "fetchedAt": "2026-10-06T04:30:12Z", "fetchAgeSeconds": 7,
+"error": null}]`, one per machine it lists -- the hub fetches every
+reachable machine's `task/*` branches into `refs/remotes/<machine>/task/*`
+on each board refresh, and this is the age of the last fetch that
+succeeded (`null` for both when none has since the server started) and the
+last attempt's error, if it failed.
+
+Each task of such a project carries `"location": {"machine": "hub" |
+"<name>" | null, "conflict": null | ["hub", "<name>", ...], "reach": null |
+"reachable" | "unreachable" | "unknown"}` -- where the task is, derived on
+this refresh (see [Where a task is](configuration.md#where-a-task-is)):
+from the hub's own worktrees and branches, the fetched refs, and each
+machine's project-repository worktree list read in that machine's one round
+trip. `machine` is `null` for a task with no worktree or branch anywhere
+(only Spawn applies); `conflict` lists both places for a task found in
+two, and its `alreadyMerged` is then `false` and its `branchCheckout`
+`{"kind": "unknown"}`. A task on a worker also carries `machine` and
+`worktree` (below), and its `branchCheckout` is read from that machine's
+project repository (`"unknown"` while it does not answer). The board also
+carries `"owedTeardowns": [...]`, the End sessions and cleanups a machine
+did not answer and that are retried when it does (see `POST
+/api/end-session`); each entry has `id`, `kind` (`"end-session"` or
+`"cleanup"`), `project`, `taskId`, `machine`, `requestedAt` and `reason`,
+plus `expectedTip` and `force` for a cleanup.
 
 Every task from `backlog task list --json` round-trips as-is (`id`, `title`,
 `status`, `priority`, `assignees`, `labels`, `milestone`, `ordinal`,
@@ -386,6 +424,15 @@ project's main checkout.
 **Params:** `project` (query, required), `id` (query, required — must match
 `^[A-Za-z]+-[0-9]+(\.[0-9]+)*$`, e.g. `TASK-2` or `TASK-2.1`).
 
+For a task on another machine the response also carries `machine` (its
+name) and `worktree` (the task's worktree path on that machine), as does
+the task's entry in `GET /api/board`; a hub task has neither key
+(task-210). A project with `machines` adds `location`, the same object as
+on the board (task-224), read here from the hub's own refs -- its
+worktrees, its branches and the copies fetched from each machine -- with
+no ssh; for a task on a worker, `branchTask` is read from the hub's
+fetched copy of its branch.
+
 ```bash
 curl -s 'http://127.0.0.1:7420/api/task?project=my-app&id=TASK-2' | python3 -m json.tool
 ```
@@ -473,6 +520,7 @@ curl -s 'http://127.0.0.1:7420/api/sessions' | python3 -m json.tool
       "project": "my-app",
       "agentState": "working",
       "agentKind": "claude",
+      "stateSince": 1788228900.5,
       "files": [
         "src/auth/session.py",
         "backlog/tasks/task-17 - Fix-session-expiry-race.md"
@@ -483,11 +531,24 @@ curl -s 'http://127.0.0.1:7420/api/sessions' | python3 -m json.tool
 }
 ```
 
+A session of a project on another machine (`machines` configured) is listed
+too, from that machine's tmux rather than this one's, with `machine`, its
+`worktree` path there, `attach` (the `ssh -t ... tmux attach` command),
+`reach` (`reachable` or `unreachable`) and `created: null` (the worker's
+session clock is not read). When `reach` is `unreachable` the row comes
+from the fleet journal (the tasks last seen running there), its
+`agentState` is `"unreachable"` and it carries no `files`. A hub session
+has none of these keys (task-210).
+
 A session whose agent is `finished`, `idle` or `unknown` also carries
 `parked`: `null`, or `{"reason", "since", "lastLine", "dialog"}` when it has
 been idle for `parkedAfterSeconds` with a dialog on its pane or an
 undelivered message (see `needsYou` under `GET /api/fleet`); the sidebar
 shows it as PARKED with the pane's last line.
+
+`stateSince` is when the agent entered its current `agentState` (Unix
+epoch seconds, as on `GET /api/fleet`), or `null` when no hook has reported
+one (task-226).
 
 `created` is the tmux session-creation timestamp as a Unix-epoch string
 (straight from `#{session_created}`), not milliseconds and not ISO-8601.
@@ -547,7 +608,12 @@ curl -s 'http://127.0.0.1:7420/api/session-pane?project=my-app&task=TASK-2' | py
 
 **Behavioral notes:**
 
-- **One tmux call per request**, `tmux capture-pane -p -t
+- For a task on a worker, the same endpoint serves the drawer and the
+  full-screen session view from that worker's subscribed tmux control
+  connection, matched by machine as well as project and task. If that
+  worker's connection has no capture, it answers 503 rather
+  than showing the hub's unrelated pane.
+- **One tmux call per local request**, `tmux capture-pane -p -t
   '=<session>:' -S -<lines>` through the injectable `run_tmux` boundary —
   no `list-sessions` preflight. The frontend polls
   this for the one task whose drawer is open, and only while that task
@@ -571,8 +637,8 @@ curl -s 'http://127.0.0.1:7420/api/session-pane?project=my-app&task=TASK-2' | py
   feature off disables the server side, not just the drawer section. Both
   `"view"` and `"interact"` allow it.
 - A successful capture also **arms `POST /api/session-input`** for that
-  session for the next 10 seconds (see that endpoint) — a reply is only
-  ever allowed against a pane this server has just captured.
+  session and machine for the next 10 seconds (see that endpoint) — a
+  reply is only allowed against a pane this server has just captured.
 - **`lines` is a ceiling, not a promise — the pane's height is the real
   limit.** Agent TUIs (Claude Code, Codex) run on tmux's *alternate
   screen*: they redraw a fixed viewport instead of letting output scroll
@@ -598,7 +664,9 @@ curl -s 'http://127.0.0.1:7420/api/session-pane?project=my-app&task=TASK-2' | py
 **Errors:** 400 for a missing `project` or an invalid/missing `task`. 403
 when `sessionPreview.mode` is `"off"`. 404 for an unknown project, or when
 there is no live session for that project+task (including no tmux server
-running at all). 500 if `tmux capture-pane` fails for any other reason.
+running at all). 409 if the task is found in two places. 503 if a worker's
+control capture is unavailable. 500 if local `tmux capture-pane` fails for
+any other reason.
 
 ## `POST /api/session-input`
 
@@ -664,7 +732,8 @@ to the input.
 
 **Behavioral notes:**
 
-- **tmux does the typing**, through the injectable `run_tmux` boundary, with
+- **tmux does the typing**, through the injectable `run_tmux` boundary on
+  the hub or `machines.run_on_machine` for a task on a worker, with
   the same exact-match target as `/api/session-pane` (`-t '=<session>:'`).
   Text goes by tmux's **bracketed-paste** path: `tmux load-buffer -b <buf> -`
   (the text on stdin, into a fresh uniquely named buffer — so a leading
@@ -674,7 +743,10 @@ to the input.
   application has requested that mode — Claude Code and codex both do;
   `-d` deletes the buffer once pasted), then a separate
   `tmux send-keys -t '=<session>:' Enter`. Each reply uses these three
-  subprocesses; sends are user actions, not a poll.
+  subprocesses; sends are user actions, not a poll. A worker uses its
+  configured `tmuxSocket` and the same three commands on that server. A
+  location change after capture refuses the reply rather than targeting
+  a different worker's same-named session.
 - **Why paste, not `send-keys -l`:** typing the text as an unmarked
   keystroke burst let agent TUIs *guess* it was a paste from inter-keystroke
   timing, and the Enter that arrived inside that guess window was absorbed
@@ -924,6 +996,16 @@ curl -s 'http://127.0.0.1:7420/api/fleet?window=7200'
 
 - `projects` includes empty projects; `maxAgents: null` means no configured
   limit. `agentCount` counts fresh live tmux sessions, independent of badges.
+- `machines` appears only with `machines` configured: the same
+  per-machine `{"name", "reach", "error"}` list as `GET /api/board`, from
+  this refresh's own round trip to each machine (task-206). In the fleet
+  snapshot each entry also carries `agentCount` and `maxAgents` (that
+  machine's live agents against its cap), and `hub: {"agentCount"}` counts
+  this machine's own -- each agent counted where its session runs
+  (task-224); a project with machines has `machines` in `projects`.
+  Agents on a machine are listed with `machine` and `worktree` (the path
+  there). One on a machine that is not reachable has `state:
+  "unreachable"`, distinct from `unknown` (task-210).
 - `agents` includes configured-project sessions only. `state` and `stateSince`
   come from this process's hook observations; duplicate hooks do not reset
   the start time. After restart a live session's settled state (`finished`,
@@ -1122,6 +1204,8 @@ message and nobody to race with. Under the task's lifecycle lock Centrale
 runs `backlog task edit <id> --comment <text> --comment-author <sender>` in
 the task's Centrale worktree and commits that one file on the task branch
 (`git commit --only -m "backlog: ruling on <id> from <sender>" -- <path>`):
+For a worker task, both the worktree and commit are on that worker; the
+worker's `backlog` CLI is resolved through its interactive shell.
 
 ```json
 {
@@ -1350,7 +1434,25 @@ line per live session in each project (task-201), so a wait **without
 ```
 
 The state is the one restored from the fleet journal (`finished`, `idle`,
-`waiting`) or `unknown`. Events fired during the restart follow as ordinary
+`waiting`) or `unknown`.
+
+With `machines` configured (task-209), a task whose agent runs on a worker
+is announced from the worker itself: at startup Centrale connects to every
+machine and reads each task pane's current state (waiting at most about
+8 seconds per machine) before publishing anything, so these lines come
+with the local ones and nothing precedes them:
+
+```text
+<cursor> TASK-4 working (read back from box-b after the server restart)
+<cursor> TASK-5 waiting for input (read back from box-b after the server restart)
+<cursor> TASK-6 state unknown after the server restart (no hook event on box-b since the session started)
+<cursor> TASK-7 box-b unreachable after the server restart; state unknown (ssh: connect to host box-b port 22: No route to host)
+```
+
+A read-back state is the pane's own current claim, so `working` is among
+them. A machine not reached in time is announced for each task the fleet
+journal last saw live on one of its projects; Centrale cannot list the
+others. Later changes on a reachable worker arrive as ordinary lines. Events fired during the restart follow as ordinary
 lines once their hook's retry lands. So the 409 recovery is: drop the
 cursor, wait without `after`, handle each announced session (read a
 `state unknown` worker's pane or task), then continue with the cursors as
@@ -1423,6 +1525,9 @@ not the server's only thread.
 ## `GET /api/settings`
 
 The current value of every setting `POST /api/settings` can change.
+`machineEntries` always contains the full configured machine definitions,
+including an empty list on a hub with no workers. The older `machines`
+field, when present, contains names for the per-project picker.
 
 ```bash
 curl -s 'http://127.0.0.1:7420/api/settings' | python3 -m json.tool
@@ -1465,10 +1570,16 @@ curl -s 'http://127.0.0.1:7420/api/settings' | python3 -m json.tool
 }
 ```
 
+`workerCheck` maps every project to its command/doc object or `null`; readiness checks run only on non-hub spawns.
+
 `checkCommands` maps every configured project name to its `checkCommand`, or
 `null` if it has none (no test gate). `maxAgents` maps each project name to
 its positive integer cap or `null`; `worktreeLinks` maps each project name
-to its array of repo-relative paths (empty when unset).
+to its array of repo-relative paths (empty when unset). With `machines`
+configured (only then), `machines` lists their names, `projectMachines` maps
+each project to the machines its tasks may run on besides this one, and
+`defaultMachine` maps each project to `"hub"` or the machine a spawn naming
+none goes to (task-224).
 `agents` is every key in the configured
 `agents` map (for a default-agent dropdown), not each entry's full command.
 `requireAgentAssignment` is `true` unless `projects.json` sets it to `false` —
@@ -1501,6 +1612,19 @@ stays a list of plain URL strings; `labelledLinks` (task-216, additive) is the
 same links in the same order as `{"url", "label"}`, where `label` is
 `"home Wi-Fi only; works on Apple devices; not over a VPN"` for the
 `<hostname>.local` link (mDNS does not cross a VPN) and `null` for numeric ones.
+
+---
+
+## `GET /api/machine-check?name=<machine>`
+
+Runs the selected configured worker's checks and returns its own formatted
+`--check` lines and counts as
+`{"name": "box-d", "counts": {"PASS": 15, "WARN": 2, "FAIL": 0}, "lines": ["[PASS] ...", ...]}`.
+Counts measure check results, including each multiline setup result once.
+Settings renders those counts above the lines.
+The checks include SSH reachability, tmux, git, Python, Backlog.md and agent
+CLI versions/logins, clock skew, and each project assigned to that machine.
+An unknown machine returns 404. This endpoint is read-only.
 
 ---
 
@@ -1570,8 +1694,14 @@ Claims a task, cuts (or reuses) a git worktree and branch for it, and starts
 a detached tmux session running the resolved coding agent. See "Spawning an
 agent" in [docs/agents.md](agents.md#spawning-an-agent) for the full six-step flow this triggers in `spawn.py`.
 
-**Body:** `{"project": "<name>", "taskId": "<id>", "agent": "<name>"}` —
-`agent` is optional (task-171).
+**Body:** `{"project": "<name>", "taskId": "<id>", "agent": "<name>",
+"machine": "<name>", "firstMessage": "<brief>"}` — `agent` is optional
+(task-171), as are `machine` (task-224, below) and `firstMessage` (task-218).
+When present, `firstMessage` must be a non-blank string of at most 8,000
+characters. It is included in the first launch prompt after the standard
+workflow text and agent suffix, on the hub or a configured worker. An invalid
+value returns **400** before spawn side effects. Omitting it leaves the prompt
+unchanged. The message is not stored on the task.
 
 ```bash
 curl -s -X POST http://127.0.0.1:7420/api/spawn \
@@ -1704,6 +1834,48 @@ task ID, or an unknown `agent`. 500
 for a `git worktree add` or `tmux new-session` failure. 502 if checking for
 an existing session (`tmux list-sessions`) fails unexpectedly.
 
+**Which machine** (task-224, doc-3 revision 5). `machine` is `"hub"` or
+one of the project's `machines`; anything else -- including any machine for
+a project with none -- is a **400** naming the allowed list (`machine
+'box-c' is not one of my-app's machines (allowed: hub, box-b)`), before any
+side effect. The task's location is read first, one round trip per machine
+the project lists ([Where a task is](configuration.md#where-a-task-is)):
+
+- a task found in two places is refused with **409**, naming both;
+- a task that already has a location (its worktree or branch is somewhere)
+  is spawned there, and a `machine` naming anywhere else is refused with
+  **409** (`TASK-7 is already on machine box-b ... not the hub`);
+- a task with no location goes to `machine`, else the project's
+  `defaultMachine`, else the hub.
+
+A project's `maxAgents` counts its live sessions on the hub and on every
+machine it lists; a machine's own `maxAgents` applies as well. Orchestrators
+use the same field (see the agent guide).
+
+**On a machine** (task-207, a task placed on one): the claim is
+committed on the hub's base branch exactly as above, then that branch is
+pushed to the machine's parked repository (`<repoRoot>/<project>/.git`) and the
+worktree is cut there at `<worktreeRoot>/<project>-<taskid>`, with the
+project's `worktreeLinks` pointing at `<repoRoot>/<project>/<path>`. The
+agent CLI is launched by its full path on that machine (found by an
+interactive shell there), codex's hook trust is probed on that machine,
+and the session carries no `CENTRALE_EVENT_URL` (a machine cannot reach
+this API; its hooks report through the tmux pane, task-209). The duplicate
+and `maxAgents` checks count that machine's sessions, and the machine's own
+`maxAgents` applies too. The response adds `machine`, `worktree` (the path
+on that machine, `~` unexpanded) and `spawnId`, and `attach` is an `ssh -t
+<target> tmux attach -t <name>` line. Errors name the machine and the step:
+503 when the machine is unreachable (nothing was claimed when that is
+found first), 502 for a failed push or a CLI not found there, and **504
+"outcome unknown"** when the connection ended before the machine confirmed
+the session -- it may be running, nothing is retried or rolled back, and a
+retry refuses with 409 while it is live. A launch that definitely failed
+removes the worktree (and branch) that spawn created. `POST /api/resume`
+behaves the same way; codex's verified conversation is looked up in that
+machine's `~/.codex/sessions`. A resume goes where the task is; its
+optional `machine` only places a task that has no location yet, with the
+same rules as a spawn.
+
 ## `POST /api/resume`
 
 Same validation, session naming, project cap and 409-on-duplicate as `/api/spawn`, but
@@ -1795,9 +1967,12 @@ prompt tells the agent to orient first — read the task's description, plan,
 and implementation notes via `backlog task view`, and review the branch's own
 log and diff against the base — then merge the repo's current base branch
 into the task branch (`git merge <base>`, never rebase), resolve every conflict textual and
-semantic, run the project's configured `checkCommand` (spelled out verbatim,
-or "see the project's AGENTS.md/README" when none is configured) until it
-passes, commit on the branch, and never merge into the base.
+semantic, follow the project's `reconcileCheck` instruction when configured;
+otherwise run its configured `checkCommand` (spelled out verbatim), or
+focused tests covering the changes and conflict resolution when neither is
+set. It then tells the agent to commit on the branch and never merge into
+the base. `reconcileCheck` changes only this prompt; gate 5 still uses
+`checkCommand`.
 
 Centrale itself performs **no merge or rebase** on this call — the only git
 it runs is the worktree lookup a plain resume runs. The ordinary gates
@@ -1918,6 +2093,17 @@ merge is still clean.
   unrelated dirt still present, `"unrelatedDirtyCount"` on a successful
   response says how many files were left untouched (omitted entirely, not
   `0`, when there were none).
+- **A task in two places** (task-224) is refused with 409 by a `POST`, and
+  its `GET` report fails `noLiveSession` naming both places; every route
+  below that acts on one task follows the task's derived location the same
+  way (End session, clean-up, Discard, Abandon and their preview).
+- **A task on a machine** (task-208) is evaluated on the worker; its reports
+  carry `"machine"`, and a `POST` adds a gate entry `"pinsUnchanged"` before
+  `"mainCheckoutClean"`: the hub's base branch and the worker's branch tip
+  are still the commits the gates evaluated, else nothing is merged. An
+  unreachable worker fails `noLiveSession` with that reason. `adoptDone`
+  and `discardMainTaskEdit` are refused (409) for such a task. See
+  [Tasks on another machine](merging.md#tasks-on-another-machine).
 - `"warnings"` appears on a successful-merge response if cleaning up the
   worktree or deleting the branch failed afterward — the merge itself is
   never undone for that; it's a non-fatal cleanup problem, not a failed
@@ -1959,10 +2145,36 @@ optional `"firedAt"`: when the hook fired, in epoch seconds (task-201).
 seconds when the server is unreachable; an event whose `firedAt` is older
 than the last applied one for the task (or than the spawn/resume that
 replaced its session) is accepted with `{"ok": true}` but ignored, so a
-retried event cannot overwrite a later state. (There
+retried event cannot overwrite a later state. An optional `"hook"` names
+the hook point that fired (`UserPromptSubmit`, `PreToolUse`, `Stop`, ...;
+letters only, at most 40, anything else is ignored). It is kept on the
+task's event and written to the fleet journal row of the state change it
+caused, so a state that looks wrong can be traced to the hook behind it
+(task-226). The worker `tmux` sink does not send it. (There
 was once a `?state=` query fallback for a reporter that could not send a
 body; it is gone, because it was also the one way a bodyless cross-origin
 form POST could drive this endpoint.)
+
+For Claude `working` events, the helper also forwards optional `tool_name`,
+`agent_id`, `prompt_id` and `session_id` from the hook payload (task-227).
+Each must be a 1–200 character identifier using ASCII letters, digits or
+`_.:/-`; missing or malformed fields are ignored without losing the event.
+Only those four payload fields are forwarded: never `tool_input`, prompt
+text or the transcript path. The server applies the same allowlist and
+writes provenance only on a Claude `working` state-change row in the
+existing fleet journal. `session_id` is replaced there by `session_id_hash`,
+the first 12 hexadecimal characters of SHA-256 over its UTF-8 value; the raw
+session ID is never stored in that journal. Other states and agent kinds
+carry no provenance. Retries retain the original fields and `firedAt`.
+
+Compare a trailing `PreToolUse` row with the preceding turn's `working`
+row: `agent_id` and a changed `session_id_hash` can expose a different source.
+This is diagnostic evidence only, not a new lifecycle rule. Consecutive
+`working` events remain deduplicated, the worker tmux sink carries no such
+fields, and old helpers or missing payloads leave them absent. A missing
+field does not establish that the event came from the main agent. No
+suggestion setting or hook is suppressed; the fix decision awaits a real
+instrumented occurrence.
 
 ```bash
 curl -s -X POST 'http://127.0.0.1:7420/api/agent-event?project=my-app&task=TASK-2' \
@@ -2021,6 +2233,23 @@ session" in [docs/agents.md](agents.md#ending-a-session).
 live session for that project+task. 500 if `tmux kill-session` itself fails.
 502 if checking for the session (`tmux list-sessions`) fails unexpectedly.
 
+**On a machine** (task-207; a task whose derived location is a machine,
+task-224 -- one found in two places is refused with 409 naming both): the
+session is ended on that machine, every
+window of it linked into another session there (task-209's control
+session) is killed by window id, and the orphan sweep runs there, by
+worktree, sparing Codex's per-user app-server daemon (recognised by its
+executable, never its directory). The response adds `machine` and
+`killedWindows`, and a `warnings` entry when the sweep could not run (no
+`python3` there). When the machine does not answer, or its answer is lost,
+the response is **202** `{"ok": false, "owed": true, "session", "machine",
+"owedId", "message"}`: the teardown is recorded as owed (in
+`CENTRALE_OWED_TEARDOWNS`, see [docs/configuration.md](configuration.md))
+and retried on the next board refresh that reaches the machine, or before
+that task's next spawn or resume. A retry ends only a session created
+before the request (allowing the checked clock skew); a newer one is left
+alone and the debt dropped.
+
 ## `POST /api/cleanup-branch`
 
 Removes a fully-merged `task/<id>` branch's worktree and deletes the branch
@@ -2055,11 +2284,22 @@ curl -s -X POST 'http://127.0.0.1:7420/api/cleanup-branch' \
 made writable again — nothing is spawned on the task any more — or `null`
 when it was not locked.
 
-`discardedPaths` lists every uncommitted/untracked path found in the
-worktree (dequoted — see `server.dequote_git_path` — so a spaced Backlog.md
-filename shows up as itself, not wrapped in stray quotes) **before** it's
-force-removed, so the response names exactly what a forced removal is about
-to discard. `worktreeRemoved` is `false` if there was no worktree left to
+`discardedPaths` lists every uncommitted/untracked non-ignored path found in
+the worktree (dequoted — see `server.dequote_git_path` — so a spaced Backlog.md
+filename shows up as itself, not wrapped in stray quotes). A request without
+`force: true` refuses these changes with HTTP 409 before removing the worktree
+or deleting the branch:
+
+```json
+{
+  "error": "worktree has uncommitted changes; pass force to discard them",
+  "discardedPaths": ["some/untracked-file.txt"]
+}
+```
+
+The caller can save the listed paths, then send a new request with
+`"force": true` to discard them. The 200 response reports the discarded paths
+after removal. `worktreeRemoved` is `false` if there was no worktree left to
 remove at all (only the branch still existed) — that's not an error, just
 nothing to do on that side.
 
@@ -2114,6 +2354,18 @@ session, a branch checked out outside Centrale (the external-checkout sentence
 above), or a branch that isn't fully merged. 500 for a `git status`,
 `git worktree remove`, or `git branch -d` failure. 502 if the project's
 `path` doesn't exist.
+
+**On a machine** (task-207; by the task's derived location, task-224, with
+409 for one in two places): the machine's session, checkouts and branch
+tip are read in one round trip; the branch is fetched into
+`refs/remotes/<machine>/task/<id>` and "fully merged" is decided on the hub
+against that fresh copy; the machine then removes the worktree and deletes
+the branch from its project repository only if the tip is still the one just
+verified (409 if it moved), and the hub drops its fetched ref. Leftover
+processes in the worktree refuse with 409 unless `force`, as above. A
+machine that cannot be reached gets the cleanup recorded as owed (202, as
+for End session) only when the hub's last fetched copy is already verified
+merged -- and only that tip is removed later; otherwise 503.
 
 ## `GET /api/discard-preview?project=<name>&task=<taskId>`
 
@@ -2183,6 +2435,17 @@ curl -s 'http://127.0.0.1:7420/api/discard-preview?project=my-app&task=TASK-9'
 **Errors:** 400 for a missing `project` or an invalid/missing `task`. 404 for
 an unknown project, or neither a worktree nor a branch for that project+task.
 502 if the project's `path` doesn't exist or `tmux` couldn't be asked.
+
+**A task on a machine** (task-208): the same fields, measured on the worker
+in one round trip after the branch is fetched into
+`refs/remotes/<machine>/task/<id>` (the commit count is taken on the hub
+against that fetched tip), plus `"machine"`; `worktreePath` is the path on
+the worker and an external checkout's path reads `<machine>:<path>`. The two
+POSTs below survey the same way under the lock; Discard's recovery tag is cut
+on the hub, and the branch on the worker is deleted only at the tagged tip.
+503 when the worker is unreachable, 504 when its answer never came back
+(nothing was removed, or the outcome there is unknown -- the body says
+which), 502 when the fetch fails.
 
 ## `POST /api/discard-attempt`
 
@@ -2436,7 +2699,11 @@ and `projects`, are not accepted back.
 | `refreshIntervalSeconds` | integer ≥ 5 | |
 | `checkCommands` | `{"<project>": "<command>" \| null, ...}` | `null` (or an empty/whitespace string) clears that project's check gate. Only named projects are touched. |
 | `maxAgents` | `{"<project>": positive integer \| null, ...}` | Sets a project's live-session cap. `null` clears it. Booleans, zero, negative, fractional and string values are invalid. Applies to the next spawn/resume; existing sessions remain. |
+| `workerCheck` | `{"<project>": {"command": "scripts/check.sh", "doc": "docs/setup.md"} \| null, ...}` | Sets the read-only worker readiness command and setup doc; both repo-relative, both required. `null` removes the entry. GET returns the same project map. Errors use `workerCheck.<project>`. |
 | `worktreeLinks` | `{"<project>": ["relative/path", ...] \| null, ...}` | Sets links for new worktrees; `null` or `[]` clears. Paths must be canonical, literal, repo-relative and non-overlapping; see [Configuration](configuration.md#setup--configuration). Existing worktrees stay unchanged. |
+| `projectMachines` | `{"<project>": ["<machine name>", ...] \| null, ...}` | The configured machines a project's tasks may run on besides this one; `null` or `[]` means the hub only. Removing a machine is refused (400, naming the tasks) while the project still has a task worktree or task branch there -- the hub's fetched copies included -- and when that machine cannot be asked; checked under the project's launch lock so no spawn lands there mid-save (task-224). Field errors are `"projectMachines.<project>"`. |
+| `machines` | complete list of machine objects | Writes top-level `projects.json` machines after `server.normalize_machines` validation. Removing a machine checks each project that listed it under the project launch lock; an allowed removal clears its placement and resets its default to the hub. Added and changed control connections start live; removed ones stop, and unchanged ones remain. A connection thread that cannot start adds a warning asking for a restart after the cause is fixed. Field errors are `"machines"`. |
+| `defaultMachine` | `{"<project>": "hub" \| "<machine name>", ...}` | Where a spawn naming no machine goes; must be one of the machines the same save leaves the project with. A save that would leave the current default out of `projectMachines` is refused unless it names a new one. Field errors are `"defaultMachine.<project>"`. |
 | `requireAgentAssignment` | boolean | Whether `POST /api/spawn` refuses (409) a task whose first assignee names no configured agent, rather than launching `defaultAgent` with a warning. Anything but a JSON boolean is a 400. |
 | `lockSpawnedTaskFiles` | boolean | Whether `POST /api/spawn` makes the main checkout's copy of the task file read-only after its claim commit (task-172). Takes effect on the next spawn; existing locks are kept. Anything but a JSON boolean is a 400. |
 | `defaultAgent` | string | Must name a key in the configured `agents` map — or, when `agents` is in the same request, in the map that request installs. |
@@ -2576,8 +2843,9 @@ tries.
 `(project, taskId)` — not by tmux session name**, so state and built-in kind
 survive a session being killed and re-spawned/resumed, but reset on every
 server restart. At startup a live session whose fleet-journal row shows a
-settled state of the same tmux session instance gets it back (task-201);
-every other task then reads `agentState: "unknown"` and
+settled state of the same tmux session instance gets it back (task-201),
+and a task on a worker gets the state its pane holds now, read from the
+worker before anything is announced (task-209); every other task then reads `agentState: "unknown"` and
 `agentKind: "unknown"` until an event arrives. A built-in session's next
 event restores both because its URL carries `agentKind`. This remains a live
 status hint, not Centrale-owned task data.
@@ -2637,8 +2905,13 @@ It is an allowlist over the `GET /api/fleet` snapshot, field by field:
 `agents`, `history` and `projects` carry only what is shown above, `needsYou`
 only a count, up to 20 items (oldest first) of kind, task, agent and time, and
 `unavailable`, the number of Needs-you checks that could not run (never their
-text). Never pane lines, messages, owner-question text, signals, session
-names, harvest results or error text. The snapshot is taken without arming
+text). With workers configured, each agent also has `machine` (the worker name,
+or `null` for this machine), and `machines` contains only `name`, `reach`,
+`agentCount` and `maxAgents` for each worker. The phone groups cards by those
+names and marks unreachable workers; with no workers configured, both additions
+are absent. Never SSH targets, hostnames, worktree paths, pane lines, messages,
+owner-question text, signals, session names, harvest results or error text.
+The snapshot is taken without arming
 `POST /api/session-input` the way the dashboard's own read of a permission
 dialog does. A snapshot that cannot be built is 503 `{"error": "fleet status
 unavailable right now"}`, with no detail.
@@ -2666,3 +2939,27 @@ from `static/` rather than returning JSON:
 
 Any path matching none of these three nor one of the `/api/*` routes above
 responds 404 `{"error": "not found"}`.
+
+## GET /api/system
+
+Read-only machine resource observations (task-242). Response: `{"machines": [...]}`,
+with the hub first and then every configured machine, in configuration order.
+Each row has `name`, `reachable`, `ramTotal`, `ramAvailable`, `swapUsed`, `swapTotal`,
+`diskTotal`, `diskFree`, `load1` (one-minute load), and `cores`. Memory and disk
+values are bytes; unavailable figures are `null`. For example:
+
+```json
+{"machines":[{"name":"hub","reachable":true,"ramTotal":16000000000,"ramAvailable":4100000000,"swapUsed":0,"swapTotal":2000000000,"diskTotal":500000000000,"diskFree":120000000000,"load1":3.2,"cores":8},{"name":"box-b","reachable":false,"ramTotal":null,"ramAvailable":null,"swapUsed":null,"diskTotal":null,"diskFree":null,"load1":null,"cores":null}]}
+```
+
+The hub is read in-process, using the filesystem of the first configured
+project (the current directory when no projects are configured). Workers use
+one Python reader command over the existing SSH path, with a five-second
+budget, measuring their `worktreeRoot`. Missing readers or platform facilities
+produce null figures. Worker probes run in parallel off the HTTP request path;
+the first response reports workers as `reachable: null` until their probes finish.
+The dashboard renders this not-yet-read state as `checking…` in grey; only a
+completed failed probe reports `reachable: false` and renders `unreachable`.
+Observations are cached for 30 seconds across dashboard clients; configuration
+changes invalidate the cache. This cache contains no task or lifecycle state.
+No new files, sockets, ports, or persistent resources are introduced.

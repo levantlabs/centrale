@@ -41,6 +41,50 @@ import server  # noqa: E402
 import settings  # noqa: E402
 
 
+CLEANUP_CONFIRM_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "board.js", "spawn.js", "harvest.js"]);
+var sent = [];
+var refreshes = 0;
+C.doRefresh = function () { refreshes++; };
+C.showToast = function () {};
+C.refreshHarvestButtons = function () {};
+C.findTask = function () { return { worktreeDirty: false }; };
+global.fetch = function (url, opts) {
+  sent.push(JSON.parse(opts.body));
+  if (sent.length === 1) return Promise.resolve({ ok: false, status: 409,
+    json: function () { return Promise.resolve({ error: "worktree has uncommitted changes",
+      discardedPaths: ["notes with spaces.txt", "logs/run.txt"] }); } });
+  return Promise.resolve({ ok: true, status: 200,
+    json: function () { return Promise.resolve({ branch: "task/task-1",
+      discardedPaths: ["notes with spaces.txt", "logs/run.txt"] }); } });
+};
+C.handleCleanupClick("app", "TASK-1");
+settle().then(function () {
+  var key = C.spawnKey("app", "TASK-1");
+  var before = { requests: sent.slice(), display: C.cleanupButtonDisplay("app", "TASK-1", C.cleanupStates[key]),
+    line: C.renderCleanupStatusLine(C.cleanupStates[key]).textContent };
+  C.handleCleanupClick("app", "TASK-1");
+  return settle().then(function () {
+    process.stdout.write(JSON.stringify({ before: before, requests: sent,
+      final: C.cleanupStates[key], refreshes: refreshes }));
+  });
+});
+"""
+
+
+@js_harness.requires_node
+class CleanupConfirmBehaviourTests(unittest.TestCase):
+    def test_dirty_409_names_paths_then_sends_force_only_on_confirmation(self):
+        out = js_harness.run_driver(self, CLEANUP_CONFIRM_DRIVER_JS)
+        self.assertEqual(out["before"]["requests"], [{"project": "app", "taskId": "TASK-1"}])
+        self.assertIn("notes with spaces.txt", out["before"]["line"])
+        self.assertIn("logs/run.txt", out["before"]["line"])
+        self.assertTrue(out["before"]["display"]["confirming"])
+        self.assertEqual(out["requests"][1], {"project": "app", "taskId": "TASK-1", "force": True})
+        self.assertEqual(out["final"]["status"], "success")
+        self.assertEqual(out["refreshes"], 1)
+
+
 # ---------------------------------------------------------------------
 # The driver
 # ---------------------------------------------------------------------
@@ -8358,6 +8402,9 @@ function click(el, target) { el.listeners.click.forEach(function (fn) { fn(makeE
     });
     out.titles = find(host, "fleet-agent-title").map(text);
     out.quiet = find(host, "fleet-quiet").map(text);
+    out.machineGroups = find(host, "fleet-machine").map(function (g) {
+      return { machine: g.attrs["data-machine"], head: text(find(g, "fleet-machine-head")[0]), cards: find(g, "fleet-card").length };
+    });
     out.tlAvailable = C.views.isAvailable("timeline");
     var first = find(host, "fleet-agent")[0];
     var second = find(host, "fleet-agent")[1];
@@ -8456,6 +8503,32 @@ class FleetAndTimelineViewTests(unittest.TestCase):
     @property
     def timeline_only(self):
         return self._run("view-timeline.js")
+
+    def test_fleet_without_machines_has_no_machine_grouping(self):
+        self.assertEqual(self.fleet_only["machineGroups"], [])
+
+    def test_fleet_groups_capacity_by_machine_and_marks_unreachable(self):
+        # task-210: atlas runs on box-b (which does not answer), orbit on the hub.
+        driver = FLEET_VIEWS_DRIVER_JS.replace(
+            "function find(node, cls, out) {",
+            """SNAP.projects = [{ name: "atlas", maxAgents: 3, agentCount: 2, machines: ["box-b"] },
+  { name: "orbit", maxAgents: null, agentCount: 1 }];
+SNAP.agents[0].state = "unreachable"; SNAP.agents[0].machine = "box-b";
+SNAP.agents[1].machine = "box-b";  // task-224: a card sits with where its agents run
+SNAP.agents.push({ project: "orbit", taskId: "TASK-5", agent: "claude", state: "working", stateSince: NOW - 5 });
+SNAP.machines = [{ name: "box-b", reach: "unreachable", error: null, agentCount: 2, maxAgents: 8 },
+  { name: "box-c", reach: "reachable", error: null, agentCount: 0, maxAgents: 4 }];
+SNAP.hub = { agentCount: 1 };
+function find(node, cls, out) {""", 1)
+        out = js_harness.cached_driver(self, driver, "view-fleet.js")
+        self.assertEqual([(g["machine"], g["cards"]) for g in out["machineGroups"]],
+                         [("hub", 1), ("box-b", 1), ("box-c", 0)])
+        self.assertEqual(out["machineGroups"][0]["head"], "This machine1 agents")
+        self.assertEqual(out["machineGroups"][1]["head"], "box-b2/8 agentsbox-b unreachable")
+        self.assertEqual(out["machineGroups"][2]["head"], "box-c0/4 agents")
+        unreachable = [r for r in out["rows"] if r["task"] == "TASK-1"][0]
+        self.assertIn("unreachable", unreachable["text"])
+        self.assertNotIn("unknown", unreachable["text"])
 
     def test_fleet_has_a_card_per_project_with_capacity(self):
         self.assertEqual(self.both["cards"], ["atlas"])
@@ -8798,6 +8871,7 @@ var C = loadFrontend(["dom.js", "fleet.js", "phone.js"]);
     needsKinds: find(doc("phone-needs"), "phone-needs-kind").map(function (n) { return n.textContent; }),
     needsNote: find(doc("phone-needs"), "phone-warn").map(function (n) { return n.textContent; }),
     cards: find(doc("phone-cards"), "fleet-card").map(function (c) { return c.getAttribute("data-project"); }),
+    machineGroups: find(doc("phone-cards"), "fleet-machine").length,
     ring: find(doc("phone-cards"), "fleet-ring-count")[0].textContent,
     rows: find(doc("phone-cards"), "fleet-agent").map(function (r) {
       return [r.getAttribute("data-task"), find(r, "fleet-agent-state")[0].textContent,
@@ -8834,6 +8908,7 @@ class PhoneStatusPageTests(unittest.TestCase):
         out = self.result()
         self.assertEqual((out["live"], out["merges"]), ("2", "1"))
         self.assertEqual(out["cards"], ["atlas"])
+        self.assertEqual(out["machineGroups"], 0)
         self.assertEqual(out["ring"], "2/3")
         self.assertEqual(out["rows"], [["TASK-1", "waiting", "10m", "codex"],
                                        ["TASK-2", "working · parked", "1m", "sonnet"]])
@@ -8854,6 +8929,34 @@ class PhoneStatusPageTests(unittest.TestCase):
         self.assertIn("the link's key was not accepted", out["failedError"])
         self.assertIn("Showing what was true at", out["failedError"])
         self.assertEqual(out["failedStillShows"], 1)
+
+    def test_machine_groups_place_worker_agents_and_show_unreachable_without_error_text(self):
+        driver = PHONE_DRIVER_JS.split("(async function () {")[0] + r"""
+SNAP.machines = [{ name: "box-b", reach: "reachable", agentCount: 1, maxAgents: 4 },
+                 { name: "box-c", reach: "unreachable", agentCount: 1, maxAgents: 2,
+                   error: "ssh error secret" }];
+SNAP.agents[0].machine = null;
+SNAP.agents[1].machine = "box-b";
+SNAP.agents.push({ project: "atlas", taskId: "TASK-3", agent: "codex",
+                   state: "unreachable", stateSince: null, machine: "box-c" });
+(async function () {
+  await settle();
+  var groups = find(document.getElementById("phone-cards"), "fleet-machine");
+  console.log(JSON.stringify(groups.map(function (g) {
+    return { machine: g.getAttribute("data-machine"),
+      title: find(g, "fleet-machine-name")[0].textContent,
+      capacity: find(g, "fleet-machine-cap")[0].textContent,
+      reach: find(g, "fleet-machine-reach")[0].textContent,
+      tasks: find(g, "fleet-agent").map(function (r) { return r.getAttribute("data-task"); }) };
+  })));
+})();
+"""
+        groups = js_harness.run_driver(self, driver)
+        self.assertEqual(groups, [
+            {"machine": "hub", "title": "This machine", "capacity": "1 agents", "reach": "", "tasks": ["TASK-1"]},
+            {"machine": "box-b", "title": "box-b", "capacity": "1/4 agents", "reach": "", "tasks": ["TASK-2"]},
+            {"machine": "box-c", "title": "box-c", "capacity": "1/2 agents", "reach": "box-c unreachable", "tasks": ["TASK-3"]},
+        ])
 
 
 SETTINGS_STATUS_PAGE_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
@@ -8903,6 +9006,85 @@ settle().then(function () {
 """
 
 
+MACHINE_SETTINGS_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+global.setTimeout = function () { return 0; };
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "settings.js"]);
+wireSettingsShell();
+C.showToast = function () {};
+C.doRefresh = function () {};
+var entries = [];
+var writes = [];
+var checks = 0;
+function payload() { return { harvestMode: "click", sessionPreviewMode: "interact", refreshIntervalSeconds: 10,
+  checkCommands: {}, maxAgents: {}, worktreeLinks: {}, defaultAgent: "claude", agentEntries: [], projects: [],
+  machineEntries: entries }; }
+global.fetch = function (url, opts) {
+  var body = opts && opts.body ? JSON.parse(opts.body) : null;
+  var response = payload();
+  if (url.indexOf("/api/machine-check?") === 0) {
+    checks++;
+    response = { name: "box-d", counts: {PASS: 1, WARN: 0, FAIL: 1}, lines: ["[PASS] machine box-d: reachable", "[FAIL] machine box-d: backlog missing"] };
+  } else if (body && body.machines) {
+    writes.push(body);
+    entries = body.machines;
+    response = payload();
+  }
+  return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(response); } });
+};
+function byId(id) { return document.getElementById(id); }
+function buttons() { return byId("settings-machines-list").querySelectorAll("button"); }
+var out = {};
+byId("settings-open").click();
+settle().then(function () {
+  out.empty = byId("settings-machines-list").textContent;
+  byId("settings-add-machine-btn").click();
+  byId("settings-machine-name").value = "box-d";
+  byId("settings-machine-ssh").value = "user@box-d";
+  byId("settings-machine-repo-root").value = "~/repos";
+  byId("settings-machine-worktree-root").value = "~/worktrees";
+  byId("settings-machine-max-agents").value = "2";
+  byId("settings-machine-save").click();
+  return settle();
+}).then(function () {
+  out.added = writes[0].machines[0];
+  buttons()[0].click();
+  byId("settings-machine-ssh").value = "other@box-d";
+  byId("settings-machine-save").click();
+  return settle();
+}).then(function () {
+  out.edited = writes[1].machines[0].ssh;
+  buttons()[1].click();
+  return settle();
+}).then(function () {
+  out.check = byId("settings-machine-check-results").textContent;
+  buttons()[2].click();
+  out.armed = buttons()[2].textContent;
+  buttons()[2].click();
+  return settle();
+}).then(function () {
+  out.removed = writes[2].machines;
+  out.checks = checks;
+  process.stdout.write(JSON.stringify(out));
+});
+"""
+
+
+@js_harness.requires_node
+class MachineSettingsBehaviourTests(unittest.TestCase):
+    def test_add_check_and_confirmed_removal_use_the_live_settings_sources(self):
+        out = js_harness.run_driver(self, MACHINE_SETTINGS_DRIVER_JS)
+        self.assertEqual(out["empty"], "")
+        self.assertEqual(out["added"], {"name": "box-d", "ssh": "user@box-d",
+                                        "repoRoot": "~/repos", "worktreeRoot": "~/worktrees",
+                                        "maxAgents": 2})
+        self.assertTrue(out["check"].startswith("Summary box-d: 1 PASS, 0 WARN, 1 FAIL\n"))
+        self.assertIn("[FAIL] machine box-d: backlog missing", out["check"])
+        self.assertEqual(out["edited"], "other@box-d")
+        self.assertEqual(out["checks"], 1)
+        self.assertIn("Confirm remove", out["armed"])
+        self.assertEqual(out["removed"], [])
+
+
 @js_harness.requires_node
 class SettingsStatusPageTests(unittest.TestCase):
     """task-212: the read-only status page's Settings section."""
@@ -8922,3 +9104,270 @@ class SettingsStatusPageTests(unittest.TestCase):
         self.assertEqual(self.out["items"], [
             "http://192.0.2.10:7500/?key=k",
             "http://workstation.local:7500/?key=k (home Wi-Fi only; works on Apple devices; not over a VPN)"])
+
+
+# ---------------------------------------------------------------------
+# Remote machines (task-207): the fetch age on a remote project's chip,
+# and an owed End session or cleanup is never shown as done.
+# ---------------------------------------------------------------------
+REMOTE_TASK_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "board.js",
+                      "spawn.js", "harvest.js", "sessions.js", "drawer.js"]);
+C.syncDrawerPanePolling = function () {};
+C.doRefresh = function () { refreshes++; };
+C.fetchSessions = function () {};
+C.showToast = function () {};
+C.openDrawer = function () {};
+var refreshes = 0;
+
+global.fetch = function (url) {
+  var owed = { ok: false, owed: true, machine: "box-b",
+               message: "machine box-b did not answer (timed out); recorded as owed" };
+  return Promise.resolve({ ok: true, status: 202,
+    json: function () { return Promise.resolve(owed); } });
+};
+
+function project(name, fetch) {
+  var p = { name: name, path: "/r/" + name, statuses: ["To Do", "In Progress", "Done"],
+            tasks: [{ id: "TASK-1", title: "t", status: "Done", alreadyMerged: true,
+                      hasSpawnBranch: true, worktreeDirty: false }] };
+  if (fetch) p.fetches = [fetch];
+  return p;
+}
+C.knownProjects.length = 0;
+["local", "fresh", "never", "failing"].forEach(function (n) { C.knownProjects.push(n); });
+C.activeProjects = new Set(C.knownProjects);
+C.boardData = { capabilities: { tmux: true }, projects: [
+  project("local"),
+  project("fresh", { machine: "box-b", fetchedAt: "x", fetchAgeSeconds: 7, error: null }),
+  project("never", { machine: "box-b", fetchedAt: null, fetchAgeSeconds: null, error: null }),
+  project("failing", { machine: "box-b", fetchedAt: "x", fetchAgeSeconds: 7260,
+                       error: "fatal: Could not read from remote repository." })
+]};
+C.firstLoadDone = true;
+C.renderProjectChips();
+
+var out = { chips: {} };
+C.byId("project-chips").querySelectorAll(".proj-fetch").forEach(function (el) {
+  var chip = el.parentNode;
+  var name = chip.querySelectorAll(".proj-name")[0].textContent;
+  out.chips[name] = { text: el.textContent, title: el.title, className: el.className };
+});
+
+C.handleEndSessionClick("fresh", "TASK-1");
+C.handleCleanupClick("fresh", "TASK-1");
+settle().then(function () {
+  out.end = C.endSessionStates[C.spawnKey("fresh", "TASK-1")];
+  out.cleanup = C.cleanupStates[C.spawnKey("fresh", "TASK-1")];
+  out.refreshes = refreshes;
+  process.stdout.write(JSON.stringify(out));
+}).catch(function (err) {
+  process.stderr.write((err && err.stack) || String(err));
+  process.exit(1);
+});
+"""
+
+
+@js_harness.requires_node
+class RemoteTaskBehaviourTests(unittest.TestCase):
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, REMOTE_TASK_DRIVER_JS)
+
+    def test_only_remote_projects_show_their_fetch_age(self):
+        self.assertEqual(sorted(self.out["chips"]), ["failing", "fresh", "never"])
+        self.assertEqual(self.out["chips"]["fresh"]["text"], "↓7s")
+        self.assertIn("machine box-b: fetched 7s ago", self.out["chips"]["fresh"]["title"])
+
+    def test_no_fetch_since_start_is_shown_as_unknown_not_as_fresh(self):
+        self.assertEqual(self.out["chips"]["never"]["text"], "↓?")
+        self.assertIn("not fetched since the server started", self.out["chips"]["never"]["title"])
+
+    def test_a_failed_fetch_keeps_its_age_and_says_why(self):
+        chip = self.out["chips"]["failing"]
+        self.assertEqual(chip["text"], "↓2h")
+        self.assertIn("stale", chip["className"])
+        self.assertIn("last fetch failed: fatal: Could not read", chip["title"])
+
+    def test_owed_end_session_and_cleanup_are_not_reported_as_done(self):
+        for state in (self.out["end"], self.out["cleanup"]):
+            self.assertEqual(state["status"], "error")
+            self.assertIn("recorded as owed", state["error"])
+        self.assertEqual(self.out["refreshes"], 0)
+
+
+# ---------------------------------------------------------------------
+# Remote machines in the cards and the session list (task-210)
+# ---------------------------------------------------------------------
+
+REMOTE_MACHINE_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
+var C = loadFrontend(["state.js", "dom.js", "tasks.js", "board.js",
+                      "spawn.js", "harvest.js", "sessions.js", "drawer.js"]);
+C.syncDrawerPanePolling = function () {};
+C.renderProjectChips = function () {};
+C.renderErrorBanners = function () {};
+C.doRefresh = function () {};
+C.fetchSessions = function () {};
+C.showToast = function () {};
+C.copyText = function () {};
+loadFrontend(["main.js"]);
+global.fetch = function () { return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } }); };
+
+function task(id, extra) {
+  return Object.assign({ id: id, title: "T " + id, status: "In Progress", labels: [], ready: true,
+    hasSpawnBranch: true, agentState: "unknown", agentKind: "unknown" }, extra || {});
+}
+var PROJECT = { name: "atlas", statuses: ["To Do", "In Progress", "Done"],
+  tasks: [task("TASK-7", { machine: "box-b", worktree: "~/w/atlas-task-7" }), task("TASK-8")] };
+C.knownProjects.length = 0; C.knownProjects.push("atlas");
+C.activeProjects = new Set(["atlas"]);
+C.boardData = { projects: [PROJECT], capabilities: { tmux: true } };
+C.firstLoadDone = true;
+C.sessionsData = [
+  { name: "centrale-atlas-task-7", project: "atlas", agentState: "unreachable", machine: "box-b", reach: "unreachable",
+    worktree: "~/w/atlas-task-7", attach: "ssh -t u@box-b tmux attach -t centrale-atlas-task-7", created: null },
+  { name: "centrale-atlas-task-8", project: "atlas", agentState: "working", created: "100" }
+];
+function all(node, cls, out) {
+  out = out || [];
+  if (String(node.className || "").split(/\s+/).indexOf(cls) !== -1) out.push(node);
+  node.childNodes.forEach(function (c) { all(c, cls, out); });
+  return out;
+}
+C.renderBoard();
+C.renderSessionsPanel();
+var cards = all(C.byId("board"), "card");
+var rows = all(C.byId("sessions-list"), "session-row");
+function cardChips(card) { return all(card, "machine-chip").map(function (n) { return n.textContent; }); }
+console.log(JSON.stringify({
+  cardChips: cards.map(function (c) { return [all(c, "card-id")[0].textContent, cardChips(c)]; }),
+  rowMachine: rows.map(function (r) { return all(r, "session-machine").map(function (n) { return n.textContent; }); }),
+  rowCode: rows.map(function (r) { return all(r, "code").concat(r.querySelectorAll("code")).map(function (n) { return n.textContent; })[0]; }),
+  rowBadge: rows.map(function (r) { return all(r, "agent-badge").map(function (n) { return n.textContent; }); }),
+  rowEnd: rows.map(function (r) { return r.querySelectorAll("button").map(function (b) { return b.textContent; }); })
+}));
+"""
+
+
+@js_harness.requires_node
+class RemoteMachineBehaviourTests(unittest.TestCase):
+    @property
+    def out(self):
+        return js_harness.cached_driver(self, REMOTE_MACHINE_DRIVER_JS)
+
+    def test_only_a_remote_task_names_its_machine_on_the_card(self):
+        self.assertEqual(self.out["cardChips"], [["TASK-7", ["box-b"]], ["TASK-8", []]])
+
+    def test_session_list_shows_machine_ssh_attach_and_unreachable_for_remote_rows(self):
+        out = self.out
+        self.assertEqual(out["rowMachine"], [["on box-b · ~/w/atlas-task-7"], []])
+        self.assertEqual(out["rowCode"][0], "ssh -t u@box-b tmux attach -t centrale-atlas-task-7")
+        self.assertEqual(out["rowCode"][1], "tmux attach -t centrale-atlas-task-8")
+        self.assertEqual(out["rowBadge"][0], ["machine unreachable"])
+        self.assertEqual(out["rowBadge"][1], ["working"])
+
+    def test_remote_rows_get_end_session(self):
+        for buttons in self.out["rowEnd"]:
+            self.assertIn("End session", buttons)
+
+# task-208: a machine that is not answering disables the actions that
+# need it, with the reason in the open
+# ---------------------------------------------------------------------
+
+MACHINE_UNREACHABLE_DRIVER_JS = r"""
+var fs = require("fs");
+var path = require("path");
+var vm = require("vm");
+
+var STATIC = process.argv[1];
+["state.js", "dom.js", "tasks.js", "board.js", "spawn.js", "harvest.js", "drawer.js"].forEach(function (name) {
+  vm.runInThisContext(fs.readFileSync(path.join(STATIC, name), "utf8"), { filename: name });
+});
+var C = window.Centrale;
+C.renderBoard = function () {};
+C.renderSessionsPanel = function () {};
+C.doRefresh = function () {};
+C.fetchSessions = function () {};
+C.showToast = function () {};
+C.syncDrawerPanePolling = function () {};
+
+var requests = [];
+global.fetch = function (url, opts) {
+  requests.push(url + " " + ((opts && opts.method) || "GET"));
+  return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve({}); } });
+};
+
+function setup(reach, machine) {
+  var task = {
+    id: "TASK-7", title: "A task", status: "In Progress", ready: true,
+    hasSpawnBranch: true, alreadyMerged: false, worktreeDirty: true,
+    branchCheckout: { kind: "centrale", path: "/srv/work/app-task-7", machine: "box-b" }
+  };
+  var project = { name: "app", tasks: [task], statuses: ["To Do", "In Progress", "Done"] };
+  // task-224: the machine is the task's own derived location.
+  if (machine) { task.machine = machine; task.worktree = "~/w/app-task-7"; }
+  C.knownProjects.length = 0;
+  C.knownProjects.push("app");
+  C.boardData = { projects: [project], capabilities: { tmux: true },
+                  machines: [{ name: "box-b", reach: reach, error: reach === "reachable" ? null : "ssh: connect timed out" }] };
+  C.sessionsData = [];
+  C.currentDrawer = { project: "app", id: "TASK-7", summary: task, branchTask: { id: "TASK-7", status: "In Progress" } };
+  requests.length = 0;
+  return task;
+}
+
+function harvestArea() {
+  var nodes = [];
+  (function walk(n) {
+    (n.childNodes || []).forEach(function (c) {
+      if (c.tagName === "button" || (c.className || "").indexOf("spawn-status-line") >= 0) nodes.push(c);
+      else walk(c);
+    });
+  })(document.getElementById("drawer-harvest-area"));
+  return nodes.map(function (n) {
+    return { tag: n.tagName, text: n.textContent, disabled: !!n.disabled, title: n.title || "" };
+  });
+}
+
+var out = {};
+var task = setup("unreachable", "box-b");
+C.renderDrawerHarvestArea();
+out.unreachable = harvestArea();
+out.card = C.harvestButtonDisplay(null, task, "app");
+var end = C.renderEndSessionButton("app", "TASK-7", "btn", false, null);
+end.click();
+out.end = { disabled: !!end.disabled, title: end.title, requests: requests.slice() };
+
+task = setup("reachable", "box-b");
+C.renderDrawerHarvestArea();
+out.reachable = harvestArea();
+out.reachableCard = C.harvestButtonDisplay(null, task, "app");
+
+task = setup("unreachable", null);   // a hub project is never blocked by a machine
+out.hubCard = C.harvestButtonDisplay(null, task, "app");
+fs.writeSync(1, JSON.stringify(out));
+process.exit(0);
+"""
+
+
+class MachineUnreachableBehaviourTests(unittest.TestCase):
+    @js_harness.requires_node
+    def test_an_unreachable_machine_disables_merge_discard_end_session_and_resume(self):
+        out = js_harness.run_driver(self, MACHINE_UNREACHABLE_DRIVER_JS)
+        buttons = [n for n in out["unreachable"] if n["tag"] == "button"]
+        self.assertEqual([b["text"] for b in buttons],
+                         ["Merge", "Abandon worktree, keep branch", "Discard attempt"])
+        self.assertTrue(all(b["disabled"] for b in buttons))
+        reason = buttons[0]["title"]
+        self.assertTrue(reason.startswith("Machine box-b is unreachable (ssh: connect timed out)."), reason)
+        self.assertIn("End session and Resume need it", reason)
+        self.assertEqual([n["text"] for n in out["unreachable"] if n["tag"] != "button"], [reason])
+        self.assertEqual((out["card"]["disabled"], out["card"]["external"], out["card"]["title"]),
+                         (True, True, reason))
+        self.assertEqual((out["end"]["disabled"], out["end"]["title"], out["end"]["requests"]),
+                         (True, reason, []))
+        # Answering again gives everything back, Resume included.
+        texts = [n["text"] for n in out["reachable"] if n["tag"] == "button"]
+        self.assertIn("Resume agent", texts)
+        self.assertFalse(out["reachableCard"]["disabled"])
+        self.assertFalse(out["hubCard"]["disabled"])

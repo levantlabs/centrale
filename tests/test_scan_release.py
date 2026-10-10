@@ -414,6 +414,58 @@ class LinkedWorktreeConfigTests(unittest.TestCase):
 
 
 class DerivedIdentityTests(unittest.TestCase):
+    def test_public_repository_url_exempts_only_its_own_account_hit(self):
+        account = "levant" + "labs"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "-C", tmp, "init", "-q"], check=True)
+            (root / "README.md").write_text(
+                f"git clone https://github.com/{account}/centrale.git\n"
+                f"<a href='https://github.com/{account}/centrale'>Centrale</a>\n"
+                f"https://github.com/{account}/centrale/tree/{account}/docs\n"
+                f"git@github.com:{account}/centrale.git\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(scan_release, "getpass") as getpass_:
+                getpass_.getuser.return_value = account
+                with mock.patch.dict(os.environ, {"USER": account}), \
+                     mock.patch.object(scan_release.Path, "home",
+                                       return_value=Path("/home") / account), \
+                     mock.patch.object(scan_release, "git_config", return_value=None):
+                    rules, _used, _skipped = scan_release.derived_identity_rules(root)
+            self.assertEqual(scan_release.scan(root, rules, ["README.md"]), [])
+
+    def test_public_repository_url_does_not_exempt_other_occurrences(self):
+        account = "levant" + "labs"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "-C", tmp, "init", "-q"], check=True)
+            (root / "README.md").write_text(
+                f"https://github.com/{account}/centrale and {account}\n"
+                f"https://github.com/{account}/other\n"
+                f"https://github.com/{account}/centrale-fork\n"
+                f"/home/{account}/work\n"
+                f"https://evil.example/github.com/{account}/centrale\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(scan_release, "getpass") as getpass_:
+                getpass_.getuser.return_value = account
+                with mock.patch.dict(os.environ, {"USER": account}), \
+                     mock.patch.object(scan_release.Path, "home",
+                                       return_value=Path("/home") / account), \
+                     mock.patch.object(scan_release, "git_config", return_value=None):
+                    rules, _used, _skipped = scan_release.derived_identity_rules(root)
+            findings = scan_release.scan(root, rules, ["README.md"])
+            self.assertEqual([(f.lineno, f.matched) for f in findings],
+                             [(1, account), (2, account), (3, account),
+                              (4, account), (5, account)])
+            git_name_rule = rules[0]._replace(name="git-name")
+            self.assertEqual(
+                [(f.lineno, f.matched) for f in
+                 scan_release.scan(root, [git_name_rule], ["README.md"])][:2],
+                [(1, account), (1, account)],
+            )
+
     def test_a_generic_login_name_never_becomes_a_rule(self):
         # "user" appears in ordinary prose in every repo; turning it into
         # a rule would make the scan useless rather than strict.

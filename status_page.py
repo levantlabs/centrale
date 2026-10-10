@@ -341,7 +341,7 @@ def strip_snapshot(snapshot, config):
                for r in snapshot.get("history") or []]
     needs = sorted(snapshot.get("needsYou") or [],
                    key=lambda i: i.get("since") if isinstance(i.get("since"), (int, float)) else 0)
-    return {
+    data = {
         "kind": SNAPSHOT_KIND,
         "timestamp": snapshot.get("timestamp"),
         "window": snapshot.get("window"),
@@ -360,6 +360,15 @@ def strip_snapshot(snapshot, config):
         },
         "historyUnavailable": bool(snapshot.get("historyError")),
     }
+    if snapshot.get("machines"):
+        # task-236: machine names and reach are enough to place agents on
+        # the phone. Connection details stay behind this network allowlist.
+        data["machines"] = [{"name": m.get("name"), "reach": m.get("reach"),
+                             "agentCount": m.get("agentCount", 0), "maxAgents": m.get("maxAgents")}
+                            for m in snapshot["machines"]]
+        for clean, agent in zip(agents, snapshot.get("agents") or []):
+            clean["machine"] = agent.get("machine")
+    return data
 
 
 def status_snapshot(config):

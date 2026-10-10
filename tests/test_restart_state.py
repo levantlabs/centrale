@@ -7,6 +7,7 @@ Hermetic: an isolated journal file per test, no tmux, no subprocesses.
 import http.client
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import threading
@@ -157,6 +158,31 @@ class RestartStateTests(unittest.TestCase):
             self.assertEqual(caught.exception.status, 409)
             self.assertEqual(self.lines(),
                              ["TASK-2 waiting for input (state before the server restart)"])
+
+    def test_local_pane_note_wins_over_journal_before_first_announcement(self):
+        self.append("finished", CREATED + 30, agentKind="claude")
+        sessions = [self.session()]
+        self.journal(fleet.Journal(self.path))
+        server._reset_agent_events()
+        note = subprocess.CompletedProcess([], 0, f"working {CREATED + 45}.25\n", "")
+        with mock.patch.object(server, "run_tmux", return_value=note):
+            server.restore_local_pane_states(self.config, sessions)
+        self.assertEqual(server.restore_agent_states(self.config, sessions), [])
+        server.announce_restart_states(self.config, sessions)
+        self.assertEqual(server.get_fleet_lifecycle(self.project, "task-2")["stateSince"],
+                         CREATED + 45.25)
+        self.assertEqual(self.lines(),
+                         ["TASK-2 working after the server restart"])
+
+    def test_session_without_note_uses_decision_five(self):
+        self.append("waiting", CREATED + 30, agentKind="claude")
+        sessions = [self.session()]
+        self.journal(fleet.Journal(self.path))
+        server._reset_agent_events()
+        with mock.patch.object(server, "run_tmux", return_value=subprocess.CompletedProcess([], 0, "\n", "")):
+            self.assertEqual(server.restore_local_pane_states(self.config, sessions), [])
+        self.assertEqual(server.restore_agent_states(self.config, sessions),
+                         [(self.project, "TASK-2")])
 
 
 class FiredAtOrderingTests(unittest.TestCase):

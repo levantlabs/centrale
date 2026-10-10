@@ -280,6 +280,7 @@
                                 // share this one entry per task, and the drawer can now show two of
                                 // them at once, so arming one must not arm the other (spawn.armedFor).
   var SPAWN_CONFIRM_WINDOW_MS = 5000;
+  var spawnMachineChoices = {}; // key "project::taskId" -> machine picked in the spawn control (task-225)
   var spawnAgentChoices = {};   // key "project::taskId" -> agent name picked in the spawn control
                                 // (task-171: only offered when the task's assignee names no agent)
 
@@ -301,13 +302,10 @@
 
   // task-43: cleanup of a branch already fully merged (Centrale's own
   // harvest, or entirely out-of-band -- see server.py's alreadyMerged).
-  // cleanupConfirmPending shares the informed-confirm shape task-40
-  // introduced for spawnConfirmPending, but its own map: a dirty
-  // worktree's cleanup requires one arm-then-confirm click, a clean
-  // one is a single click, and this must never interact with a
-  // concurrent spawn/respawn/resume confirm on the same task.
-  var cleanupStates = {};         // key "project::taskId" -> {status: 'loading'|'success'|'error', discardedPaths, branch, error}
-  var cleanupConfirmPending = {}; // key "project::taskId" -> {expires: epochMs}
+  // task-220: only the server's fresh 409 path list arms cleanup
+  // confirmation; a clean worktree is a single click.
+  var cleanupStates = {};         // key "project::taskId" -> {status: 'loading'|'confirm'|'success'|'error', discardedPaths, branch, error}
+  var cleanupConfirmPending = {}; // key "project::taskId" -> {expires: epochMs, paths}
 
   // task-119: throwing a bad attempt away. Two actions that differ ONLY
   // in whether the branch survives -- discard removes the worktree and
@@ -367,6 +365,7 @@
   C.readStoredSidebarCollapsed = readStoredSidebarCollapsed;
   C.reconcileConfirmPending = reconcileConfirmPending;
   C.spawnAgentChoices = spawnAgentChoices;
+  C.spawnMachineChoices = spawnMachineChoices;
   C.spawnConfirmPending = spawnConfirmPending;
   C.spawnStates = spawnStates;
 })(window.Centrale = window.Centrale || {});

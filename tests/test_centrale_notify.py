@@ -37,7 +37,24 @@ class MainArgvHandlingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://127.0.0.1:9/x"}):
             with mock.patch.object(centrale_notify, "_post_event") as post_event:
                 centrale_notify.main(["centrale_notify.py", "working"])
-        post_event.assert_called_once_with("http://127.0.0.1:9/x", "working", mock.ANY)
+        post_event.assert_called_once_with("http://127.0.0.1:9/x", "working", mock.ANY, hook=None)
+
+    def test_local_hook_writes_own_pane_with_same_fired_at_as_http(self):
+        with mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://127.0.0.1:9/x",
+                                          "TMUX_PANE": "%17"}), \
+             mock.patch.object(centrale_notify, "run_tmux_note") as pane, \
+             mock.patch.object(centrale_notify, "_post_event") as post:
+            centrale_notify.main(["notify", "working"])
+        fired_at = post.call_args.args[2]
+        pane.assert_called_once_with("%17", "working", fired_at)
+
+    def test_pane_note_failure_does_not_stop_http(self):
+        with mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://127.0.0.1:9/x",
+                                          "TMUX_PANE": "%17"}), \
+             mock.patch.object(centrale_notify, "run_tmux_note", side_effect=OSError("tmux down")), \
+             mock.patch.object(centrale_notify, "_post_event") as post:
+            centrale_notify.main(["notify", "waiting"])
+        post.assert_called_once()
 
     def test_extra_argv_is_ignored(self):
         # codex always appends one extra JSON-payload argument describing
@@ -46,7 +63,7 @@ class MainArgvHandlingTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://127.0.0.1:9/x"}):
             with mock.patch.object(centrale_notify, "_post_event") as post_event:
                 centrale_notify.main(["centrale_notify.py", "finished", '{"turn": "payload"}'])
-        post_event.assert_called_once_with("http://127.0.0.1:9/x", "finished", mock.ANY)
+        post_event.assert_called_once_with("http://127.0.0.1:9/x", "finished", mock.ANY, hook=None)
 
     def test_notification_payload_distinguishes_real_prompts_from_reminders(self):
         for notification_type in ("permission_prompt", "elicitation_dialog",
@@ -58,7 +75,7 @@ class MainArgvHandlingTests(unittest.TestCase):
                  mock.patch.object(centrale_notify, "_post_event") as post:
                 centrale_notify.main(["notify", "notification"])
                 if notification_type in {"permission_prompt", "elicitation_dialog", "elicitation_url_dialog", "agent_needs_input"}:
-                    post.assert_called_once_with("http://127.0.0.1:9/x", "waiting", mock.ANY)
+                    post.assert_called_once_with("http://127.0.0.1:9/x", "waiting", mock.ANY, hook=None)
                 else:
                     post.assert_not_called()
 
@@ -88,7 +105,74 @@ class MainArgvHandlingTests(unittest.TestCase):
              mock.patch.object(centrale_notify, "_retry_in_background") as retry:
             centrale_notify.main(["centrale_notify.py", "finished"])
         fired_at = post.call_args.args[2]
-        retry.assert_called_once_with("http://127.0.0.1:9/x", "finished", fired_at)
+        retry.assert_called_once_with("http://127.0.0.1:9/x", "finished", fired_at, None)
+
+    def test_hook_event_name_from_stdin_wins_and_the_registered_event_is_the_fallback(self):
+        # task-226: which hook point fired, so a stray "working" can be named.
+        url = {"CENTRALE_EVENT_URL": "http://127.0.0.1:9/x"}
+        cases = [
+            (json.dumps({"hook_event_name": "PreToolUse"}), ["n", "working", "UserPromptSubmit"], "PreToolUse"),
+            ("", ["n", "working", "UserPromptSubmit"], "UserPromptSubmit"),
+            ("broken", ["n", "finished", "Stop"], "Stop"),
+            ("", ["n", "working"], None),
+            ("", ["n", "finished", '{"turn": 1}'], None),  # codex's JSON argument is not an event
+        ]
+        for stdin, argv, expected in cases:
+            with self.subTest(stdin=stdin, argv=argv), mock.patch.dict(os.environ, url), \
+                 mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                 mock.patch.object(centrale_notify, "_post_event") as post:
+                centrale_notify.main(argv)
+            self.assertEqual(post.call_args.kwargs, {"hook": expected})
+
+    def test_unreachable_server_retries_with_the_hook_name(self):
+        with mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://127.0.0.1:9/x"}), \
+             mock.patch.object(sys, "stdin", io.StringIO("")), \
+             mock.patch.object(centrale_notify, "_post_event", side_effect=OSError("refused")) as post, \
+             mock.patch.object(centrale_notify, "_retry_in_background") as retry:
+            centrale_notify.main(["n", "working", "PreToolUse"])
+        retry.assert_called_once_with("http://127.0.0.1:9/x", "working", post.call_args.args[2], "PreToolUse")
+
+    def test_post_body_carries_hook_only_when_known(self):
+        with mock.patch.object(centrale_notify.urllib.request, "urlopen") as urlopen:
+            centrale_notify._post_event("http://u", "working", 1.5, hook="Stop")
+            centrale_notify._post_event("http://u", "working", 1.5)
+        bodies = [json.loads(c.args[0].data) for c in urlopen.call_args_list]
+        self.assertEqual(bodies, [{"state": "working", "firedAt": 1.5, "hook": "Stop"},
+                                  {"state": "working", "firedAt": 1.5}])
+
+    def test_claude_working_post_allowlists_provenance(self):
+        payload = {"hook_event_name": "PreToolUse", "tool_name": "Read",
+                   "agent_id": "fork-1", "prompt_id": "prompt-1", "session_id": "abc",
+                   "tool_input": {"file_path": "secret"}, "prompt": "secret prompt",
+                   "transcript_path": "/private/transcript.jsonl"}
+        with mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://u/?agentKind=claude"}), \
+             mock.patch.object(sys, "stdin", io.StringIO(json.dumps(payload))), \
+             mock.patch.object(centrale_notify.time, "time", return_value=123.5), \
+             mock.patch.object(centrale_notify.urllib.request, "urlopen") as post:
+            centrale_notify.main(["n", "working", "PreToolUse"])
+        self.assertEqual(json.loads(post.call_args.args[0].data), {
+            "state": "working", "firedAt": 123.5, "hook": "PreToolUse",
+            "tool_name": "Read", "agent_id": "fork-1", "prompt_id": "prompt-1",
+            "session_id": "abc"})
+
+    def test_provenance_fallback_does_not_lose_events_or_forward_other_payloads(self):
+        cases = [
+            ("claude", "working", ""), ("claude", "working", "broken"),
+            ("claude", "working", "[]"),
+            ("claude", "working", json.dumps({"tool_name": [], "agent_id": 7,
+                "prompt_id": "x" * 201, "session_id": "bad\nidentity"})),
+            ("codex", "working", json.dumps({"session_id": "abc", "tool_name": "Read"})),
+            ("claude", "finished", json.dumps({"session_id": "abc", "tool_name": "Read"})),
+        ]
+        for kind, state, stdin in cases:
+            with self.subTest(kind=kind, state=state, stdin=stdin), \
+                 mock.patch.dict(os.environ, {"CENTRALE_EVENT_URL": "http://u/?agentKind=" + kind}), \
+                 mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+                 mock.patch.object(centrale_notify.urllib.request, "urlopen") as post:
+                centrale_notify.main(["n", state, "PreToolUse"])
+            body = json.loads(post.call_args.args[0].data)
+            self.assertEqual(set(body), {"state", "firedAt", "hook"})
+            self.assertEqual(body["state"], state)
 
     def test_an_answered_error_is_not_retried(self):
         error = urllib.error.HTTPError("http://127.0.0.1:9/x", 400, "bad", {}, None)
@@ -209,11 +293,14 @@ class DownServerRetryTests(unittest.TestCase):
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
         probe.close()
-        url = f"http://127.0.0.1:{port}/api/agent-event?project=p&task=TASK-1"
+        url = f"http://127.0.0.1:{port}/api/agent-event?project=p&task=TASK-1&agentKind=claude"
         script = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                               "centrale_notify.py")
         started = time.monotonic()
-        proc = subprocess.run([sys.executable, script, "finished"], timeout=10,
+        proc = subprocess.run([sys.executable, script, "working", "PreToolUse"], timeout=10,
+                              input=json.dumps({"tool_name": "Read", "agent_id": "fork-1",
+                                                "prompt_id": "prompt-1", "session_id": "abc",
+                                                "tool_input": {"tool_input_note": "dropped"}}).encode(),
                               env={**os.environ, "CENTRALE_EVENT_URL": url},
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         # The hook (whose stdout pipe the runner waits on) returns at once.
@@ -235,7 +322,10 @@ class DownServerRetryTests(unittest.TestCase):
             httpd.server_close()
             thread.join(timeout=5)
         self.assertEqual(len(RecordingHandler.received), 1)
-        self.assertEqual(RecordingHandler.received[0]["body"]["state"], "finished")
+        body = RecordingHandler.received[0]["body"]
+        self.assertEqual(body, {"state": "working", "firedAt": body["firedAt"],
+                                "hook": "PreToolUse", "tool_name": "Read",
+                                "agent_id": "fork-1", "prompt_id": "prompt-1", "session_id": "abc"})
 
 
 if __name__ == "__main__":

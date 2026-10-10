@@ -111,6 +111,50 @@
     return select;
   }
 
+  // task-225 (doc-3 revision 5): where a fresh spawn may go. Only a project
+  // that lists machines has a choice, and only a task with no location yet
+  // -- one whose worktree or branch is already somewhere is spawned there
+  // by the server, which refuses any other machine. The hub is always the
+  // first option; the project's defaultMachine is preselected until a pick.
+  function spawnMachinePlan(task, projectName, taskId) {
+    var project = C.findProject(projectName);
+    var names = project && project.machines;
+    if (!names || !names.length) return null;
+    var location = task && task.location;
+    if (location && (location.conflict || location.machine)) return null;
+    var options = ["hub"].concat(names);
+    var choice = C.spawnMachineChoices[spawnKey(projectName, taskId)];
+    var selected = options.indexOf(choice) !== -1 ? choice
+      : (options.indexOf(project.defaultMachine) !== -1 ? project.defaultMachine : "hub");
+    return { options: options, selected: selected };
+  }
+
+  // The picker beside the spawn button: the hub plus the project's
+  // machines. Its value lives in C.spawnMachineChoices, like the agent's.
+  function renderSpawnMachinePicker(plan, projectName, taskId) {
+    var key = spawnKey(projectName, taskId);
+    var select = C.h("select", {
+      className: "spawn-machine-picker",
+      title: "Where this task's agent will run. The hub is this machine.",
+      attrs: { "aria-label": "Machine to spawn on" }
+    });
+    plan.options.forEach(function (name) {
+      var opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name === "hub" ? "hub (this machine)" : name;
+      select.appendChild(opt);
+    });
+    select.value = plan.selected;
+    select.addEventListener("click", function (e) { e.stopPropagation(); });
+    select.addEventListener("change", function (e) {
+      if (e && e.stopPropagation) e.stopPropagation();
+      C.spawnMachineChoices[key] = select.value;
+      delete C.spawnConfirmPending[key];
+      refreshSpawnButtons(projectName, taskId);
+    });
+    return select;
+  }
+
   // The three confirm-armed actions -- Spawn, Re-spawn and Resume --
   // share one pending entry per task (spawnConfirmPending), so the entry
   // has to say WHICH of them is armed. Before task-116 that was implicit:
@@ -137,6 +181,9 @@
       return { text: C.spawnButtonLabel(plan), disabled: true, confirming: false, noTmux: true, plan: plan };
     }
     if (live) return { text: "Session live", disabled: true, confirming: false };
+    // task-225: a task found in two places cannot be spawned until one is cleaned up.
+    var conflict = C.locationConflictReason(task);
+    if (conflict) return { text: "Location conflict", disabled: true, confirming: false, agentTitle: conflict };
     if (state && state.status === "loading") return { text: "Spawning…", disabled: true, confirming: false };
 
     var key = spawnKey(projectName, taskId);
@@ -321,6 +368,9 @@
     // the server resolves the assignee itself (and refuses to guess).
     var payload = { project: projectName, taskId: taskId };
     if (C.spawnAgentChoices[key]) payload.agent = C.spawnAgentChoices[key];
+    // task-225: the machine picked (or preselected) for a task with no location yet.
+    var machinePlan = spawnMachinePlan(C.findTask(projectName, taskId), projectName, taskId);
+    if (machinePlan) payload.machine = machinePlan.selected;
     fetch("/api/spawn", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -337,6 +387,7 @@
       // task-171: the claim recorded the pick as the assignee, so the
       // next board read resolves it without one.
       delete C.spawnAgentChoices[key];
+      delete C.spawnMachineChoices[key];
       // task-94: an agent is about to work on this branch, so a
       // remembered blocked/error merge verdict for it is already stale
       // -- drop it (a successful merge/cleanup verdict is kept; see
@@ -419,6 +470,8 @@
   C.handleSpawnClick = handleSpawnClick;
   C.resumeTask = resumeTask;
   C.renderSpawnAgentPicker = renderSpawnAgentPicker;
+  C.renderSpawnMachinePicker = renderSpawnMachinePicker;
+  C.spawnMachinePlan = spawnMachinePlan;
   C.spawnAgentPlan = spawnAgentPlan;
   C.spawnButtonDisplay = spawnButtonDisplay;
   C.spawnKey = spawnKey;

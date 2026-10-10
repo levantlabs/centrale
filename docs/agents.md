@@ -422,9 +422,10 @@ one informed click:
   task's description, plan, and implementation notes with `backlog task
   view`, and review the branch's own log and diff against `<base>`), then
   merge `<base>` into this branch (never rebase), resolve every conflict
-  textual *and* semantic, run the project's `checkCommand` (spelled out in
-  the prompt) until it passes, commit the result on the branch, and do
-  **not** merge into `<base>`. When a conversation is being continued the
+  textual *and* semantic, follow the project's `reconcileCheck` instruction
+  when present, else run its `checkCommand` (spelled out in the prompt),
+  else run focused tests covering the changes. Then commit the result on
+  the branch and do **not** merge into `<base>`. When a conversation is being continued the
   prompt adds one sentence of framing — you built this branch, so you
   already know what it intends; `<base>` has moved on since and what you
   remember of it is stale, so read the repository, not your memory of it.
@@ -654,6 +655,10 @@ updates the raw lifecycle event.
 
 Centrale exposes the resulting `"agentState"` and `"agentKind"` on the
 matching task in `GET /api/board` and row in `GET /api/sessions`.
+For a task that runs on another machine those carry `machine` and
+`worktree` too (the path on that machine, not on yours), and an agent on a
+machine that cannot be reached reads `agentState: "unreachable"` -- not
+`unknown`; wait or check the machine instead of ending the session.
 `agentState` is `"unknown"` until an event arrives. Claude events retain
 their `working`/`waiting`/`finished` meanings; a codex `finished` event
 is exposed as `"idle"`, because codex uses the same turn-end signal when it
@@ -711,13 +716,17 @@ with no config required:
   so a Centrale run from a task worktree repointed every running agent's
   hooks at that worktree, and once it was deleted every tool call on the
   machine was blocked (a missing hook script exits 2, which blocks the
-  tool call) — task-173. They also set two
+  tool call) — task-173. They also set three
   spawn-only settings: `skillOverrides: {"auto-mode-setup": "off"}`, so
   a spawned agent never stops on the "Teach auto mode about your
   environment?" offer, and `crossSessionInbound: "accept"`, so messages
   from your other sessions on this machine (an orchestrator's
   `SendMessage` ruling, say) are delivered rather than held for an
-  approval nobody is watching for. Because `--settings` takes
+  approval nobody is watching for, and `promptSuggestionEnabled: false`,
+  so an idle spawned pane shows no greyed-out guess at your next prompt
+  (in orchestrated projects those guesses read like real rulings).
+  `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=true` in a spawned agent's environment
+  would override that one. Because `--settings` takes
   precedence, these override your user settings for spawned agents
   only; your own sessions are unaffected.
 - **codex**: on a codex with the hooks engine (>= 0.150.0), spawn/resume

@@ -674,9 +674,10 @@ def probe_spawn_cmd(sleep_seconds=300, marker="itest-probe"):
 # deployed snapshot -- it stops it dead with ModuleNotFoundError before
 # any test can reach it, which is what happened to the whole real-server
 # half of this tier between task-107 landing and task-119 finding it.
-APP_MODULES = ("server.py", "spawn.py", "browser.py", "harvest.py", "settings.py",
+APP_MODULES = ("system_status.py", "server.py", "spawn.py", "browser.py", "harvest.py", "settings.py",
                "centrale_notify.py", "version.py", "orchestrator.py", "fleet.py",
-               "status_page.py")
+               "status_page.py", "machines.py", "remote_status.py", "remote.py",
+               "codex_sessions.py", "remote_harvest.py")
 
 
 def deploy_app(dest_dir):

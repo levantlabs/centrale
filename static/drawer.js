@@ -793,7 +793,7 @@
     area.appendChild(C.renderAgentBadge(displayState));
 
     if ((displayState === "waiting" || displayState === "idle") && live) {
-      var attachCmd = "tmux attach -t " + live.name;
+      var attachCmd = live.attach || ("tmux attach -t " + live.name);
       var waitingRow = C.h("div", { className: "drawer-waiting-attach" });
       waitingRow.appendChild(C.h("code", { text: attachCmd }));
       var waitingCopyBtn = C.h("button", { className: "btn btn-sm", text: "Copy" });
@@ -817,7 +817,10 @@
                                             false, armReason);
       endBtn.style.width = "100%";
       area.appendChild(endBtn);
-      if (armReason && C.endSessionIsArmed(projectName, taskId)) {
+      var endMachineReason = C.machineBlockReason(projectName, taskId);
+      if (endMachineReason) {
+        area.appendChild(C.h("div", { className: "spawn-status-line", text: endMachineReason }));
+      } else if (armReason && C.endSessionIsArmed(projectName, taskId)) {
         area.appendChild(C.h("div", { className: "spawn-status-line", text: armReason }));
       }
       var endLine = C.renderEndSessionStatusLine(C.endSessionStates[C.spawnKey(projectName, taskId)]);
@@ -939,13 +942,28 @@
       area.appendChild(pickRow);
       area.appendChild(C.h("div", { className: "spawn-status-line spawn-agent-reason", text: display.agentTitle }));
     }
+    // task-225: where a fresh spawn runs, for a project with machines; for a
+    // task found in two places, the reason the whole area is disabled.
+    var machinePlan = !live && !display.noTmux ? C.spawnMachinePlan(task, projectName, taskId) : null;
+    if (machinePlan) {
+      var machineRow = C.h("div", { className: "spawn-agent-pick-row" });
+      machineRow.appendChild(C.h("span", { className: "spawn-machine-label", text: "Run on" }));
+      machineRow.appendChild(C.renderSpawnMachinePicker(machinePlan, projectName, taskId));
+      area.appendChild(machineRow);
+    }
+    if (display.agentTitle && C.locationConflictReason(task)) {
+      area.appendChild(C.h("div", { className: "spawn-status-line spawn-location-conflict", text: display.agentTitle }));
+    }
     area.appendChild(btn);
 
     if (live && (!state || state.status !== "success")) {
       var liveInfo = C.h("div", { className: "spawn-status-line success" });
       liveInfo.appendChild(document.createTextNode("Live session: " + live.name));
+      if (live.machine) {
+        liveInfo.appendChild(C.h("div", { className: "session-machine", text: "On " + live.machine + (live.reach === "unreachable" ? " (unreachable)" : "") + " · " + live.worktree }));
+      }
       var row = C.h("div", { className: "attach-row" });
-      var cmd = "tmux attach -t " + live.name;
+      var cmd = live.attach || ("tmux attach -t " + live.name);
       row.appendChild(C.h("code", { text: cmd }));
       var cbtn = C.h("button", { className: "btn btn-sm", text: "Copy" });
       cbtn.addEventListener("click", function () { C.copyText(cmd, cbtn); });
@@ -1236,7 +1254,14 @@
   // (cleanup is the right action there), and no "Abandon worktree" when
   // there is no Centrale worktree to abandon.
   function renderDrawerLiveSessionActions(area, task, live) {
-    var reason = C.liveSessionBlockReason(live);
+    renderDrawerBlockedActions(area, task, C.liveSessionBlockReason(live));
+  }
+
+  // task-208: the same disabled set, carrying whatever reason blocks it
+  // -- a live session, or the machine the task runs on not answering
+  // (C.machineBlockReason), where the Resume and Re-spawn row is withheld
+  // too since both need that machine.
+  function renderDrawerBlockedActions(area, task, reason) {
     function blocked(text, className) {
       var btn = C.h("button", { className: className, text: text });
       btn.disabled = true;
@@ -1323,6 +1348,11 @@
       renderDrawerLiveSessionActions(area, task, liveSession);
       return;
     }
+    var machineReason = C.machineBlockReason(projectName, task.id);
+    if (machineReason && !settled) {
+      renderDrawerBlockedActions(area, task, machineReason);
+      return;
+    }
 
     if (!branchGone) {
       // task-43: a fully-merged branch means Merge would only ever
@@ -1398,7 +1428,7 @@
         // Centrale -- it sits right above the disabled "Worked
         // externally" spawn action and says the same thing. No click
         // handler in that case (see harvestButtonDisplay).
-        var display = C.harvestButtonDisplay(state, task);
+        var display = C.harvestButtonDisplay(state, task, projectName);
         var btn = C.h("button", { className: "btn btn-primary", text: display.text });
         btn.style.width = "100%";
         btn.disabled = display.disabled;
@@ -1414,7 +1444,7 @@
       area.appendChild(C.renderHarvestStatusLine(state));
     }
 
-    if (cState && (cState.status === "error" || cState.status === "success")) {
+    if (cState && (cState.status === "error" || cState.status === "success" || cState.status === "confirm")) {
       area.appendChild(C.renderCleanupStatusLine(cState));
     }
 

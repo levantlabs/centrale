@@ -131,10 +131,42 @@
     if (!projects.length) return [C.h("div", { className: "fleet-empty", text: "No projects configured" })];
     var nodes = [];
     var idle = [];
+    var machines = snap.machines || [];
     projects.forEach(function (p) {
-      var live = model.agents.filter(function (a) { return a.project === p.name && a.live; });
-      if (live.length) nodes.push(card(p, live)); else idle.push(p.name);
+      if (!model.agents.some(function (a) { return a.project === p.name && a.live; })) idle.push(p.name);
     });
+    if (!machines.length) {
+      projects.forEach(function (p) {
+        var live = model.agents.filter(function (a) { return a.project === p.name && a.live; });
+        if (live.length) nodes.push(card(p, live));
+      });
+    } else {
+      // task-236: the phone uses Fleet's machine groups and the same
+      // project card in each place where its agents actually run.
+      var hubCount = model.agents.filter(function (a) { return a.live && !a.live.machine; }).length;
+      var specs = [{ name: "", label: "This machine", agentCount: hubCount, hub: true }].concat(
+        machines.map(function (m) { return { name: m.name, label: m.name, agentCount: m.agentCount || 0,
+          maxAgents: m.maxAgents, reach: m.reach }; }));
+      specs.forEach(function (spec) {
+        var grid = C.h("div", { className: "fleet-grid" });
+        projects.forEach(function (p) {
+          var live = model.agents.filter(function (a) { return a.project === p.name && a.live &&
+            (a.live.machine || "") === spec.name; });
+          if (live.length) grid.appendChild(card(p, live));
+        });
+        if (spec.hub && !grid.childNodes.length) return;
+        var down = !spec.hub && spec.reach !== "reachable";
+        var full = typeof spec.maxAgents === "number" && spec.agentCount >= spec.maxAgents;
+        var head = C.h("div", { className: "fleet-machine-head", children: [
+          C.h("span", { className: "fleet-machine-name", text: spec.label }),
+          C.h("span", { className: "fleet-machine-cap" + (full ? " full" : ""),
+            text: spec.agentCount + (typeof spec.maxAgents === "number" ? "/" + spec.maxAgents : "") + " agents" }),
+          C.h("span", { className: "fleet-machine-reach" + (down ? " down" : ""),
+            text: down ? spec.label + " " + (spec.reach === "unknown" ? "not answering" : "unreachable") : "" })] });
+        nodes.push(C.h("section", { className: "fleet-machine", attrs: { "data-machine": spec.name || "hub" },
+          children: [head].concat(grid.childNodes.length ? [grid] : []) }));
+      });
+    }
     if (idle.length) nodes.push(C.h("div", { className: "fleet-quiet", text: "No agents: " + idle.join(", ") }));
     return nodes;
   }

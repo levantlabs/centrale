@@ -78,7 +78,12 @@ class Journal:
             if row["state"] == "session ended":
                 self.sessions.pop(key, None)
             elif row["state"] not in {"merged", "merge blocked"}:
-                self.sessions[key] = {"created": None, "observedAt": 0.0}
+                # The hub's tmux survey must not retire a worker session
+                # after reload. A state row inherits its spawn's machine.
+                machine = (row.get("machine") if row["state"] == "spawn" else
+                           row.get("machine") or (self.sessions.get(key) or {}).get("machine"))
+                self.sessions[key] = {"created": None, "observedAt": 0.0,
+                                      **({"machine": machine} if machine else {})}
         if self.skipped:
             # Remove an incomplete final line before the next append, so
             # one crashed write cannot swallow the next valid observation.

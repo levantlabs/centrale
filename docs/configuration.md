@@ -286,6 +286,81 @@ Fields:
   does to the default. It applies to a spawn and to the fresh-start
   fallback of a resume; the "Resume to reconcile" prompt ([docs/agents.md](agents.md#resume-to-reconcile-a-branch-that-fell-behind-main)) is separate and
   not affected.
+- `machines` (optional) — other Linux machines a project's tasks may run
+  on, reached over ssh from this machine (the hub). Omitted, `null` or `[]`
+  means none: everything runs here exactly as before, and Centrale never
+  starts an `ssh` process. Each entry:
+  ```json
+  {"name": "box-b", "ssh": "user@box-b", "repoRoot": "~/centrale-repos",
+   "worktreeRoot": "~/centrale-work", "maxAgents": 8}
+  ```
+  `name` labels the machine (letters, numbers, `-`, `_`, `.`); `ssh` is any
+  target `ssh` accepts, and the user there may differ from yours.
+  `repoRoot` holds one ordinary, detached project repository per project
+  that lists the machine (`<repoRoot>/<project>`). It also holds the
+  sources a project's `worktreeLinks` point at; its detached HEAD lets
+  the hub push `main` without Git refusing a push to a checked-out branch.
+  `worktreeRoot` is where task worktrees go. Both are paths on that
+  machine and are never `~`-expanded here: the machine's own shell expands
+  a leading `~/`. `maxAgents` caps live sessions on that machine, as the
+  per-project cap does (`null` means no cap). An optional `tmuxSocket`
+  names the tmux server Centrale uses there (`tmux -L <name>`); omitted,
+  it is that user's default server. A malformed entry is rejected
+  at startup.
+
+  Add or edit these entries in Settings → Machines. The machine's
+  `maxAgents` counts live agents from every project on that machine; a
+  project's `maxAgents` counts its live agents across the hub and every
+  worker. A spawn must fit both limits. For example, with my-app capped
+  at 2 and both my-app agents on box-d, further my-app spawns are
+  refused anywhere. If box-d is also capped at 2, further spawns of
+  any project on box-d are refused until a session ends.
+
+  Centrale reaches a machine with `BatchMode=yes`, `ConnectTimeout=5`,
+  `ServerAliveInterval=5`, `ServerAliveCountMax=1` and a kept-open
+  connection (`ControlMaster=auto`, `ControlPersist=60`), written to a
+  generated ssh config that includes your `~/.ssh/config` first, so any
+  value you set there wins. The generated config and the control sockets
+  live in `$XDG_RUNTIME_DIR/centrale-ssh` (else
+  `<tmp>/centrale-ssh-<uid>`); set `CENTRALE_SSH_DIR` to move them. The
+  directory must stay short -- ssh refuses socket paths over about 108
+  bytes -- so a longer one is refused with a message. `python3 server.py
+  --check` checks each machine (see [docs/operations.md](operations.md)).
+
+  While the server runs it keeps one more ssh process per machine open:
+  a tmux control-mode client (`tmux -C`) attached to a session named
+  `centrale_control` on that machine's tmux server, which Centrale creates
+  if it is missing and leaves running. Each task's window is linked into
+  that session so its agent's status can be read (task-209); nothing on the
+  machine listens on a port, and agents there never call this server.
+
+  A task placed on a machine runs its agent there (task-207, task-224): its
+  claim is committed here, the base branch pushed to the parked repository,
+  and its worktree cut there; each board refresh fetches every machine's
+  `task/*` branches, for each project that lists it, back into
+  `refs/remotes/<machine>/task/*`. Which machine a task is on is never
+  stored: see [Where a task is](#where-a-task-is) under `projects`. An End session or
+  cleanup the machine does not answer is recorded as owed and retried
+  when it answers again, in `$XDG_STATE_HOME/centrale/owed-teardowns.json`
+  (else `~/.local/state/centrale/owed-teardowns.json`); set
+  `CENTRALE_OWED_TEARDOWNS` to move it. The file exists only while
+  something is owed, and never without machines.
+
+  The UI names a machine only for tasks that run on one, offers the choice
+  of machine at spawn for a project that lists some, and edits each
+  project's `machines` and `defaultMachine` in Settings: see [Setting up a
+  worker](operations.md#setting-up-a-worker). The integration tests'
+  real-ssh variants run only when `CENTRALE_TEST_SSH_TARGET` names an ssh
+  target (see `tests_integration/README.md`).
+
+  Merging, Discard and Abandon for such a task read the machine itself
+  (task-208): its tmux for a live session, its worktree for uncommitted
+  changes, its project repository for a checkout elsewhere. The trial merge
+  and `checkCommand` run there, in a throwaway worktree under that
+  machine's `$TMPDIR` (else `/tmp`), at the base commit the hub just
+  pushed; the merge itself happens here. While a machine does not answer,
+  these actions, End session and Resume are disabled with that reason.
+  See [Tasks on another machine](merging.md#tasks-on-another-machine).
 - `projects` — a list of entries, one per repo to aggregate:
   - `name` — the label used everywhere in the UI and API (project chips,
     worktree/branch/session names). Entries missing a `name` are skipped.
@@ -298,6 +373,37 @@ Fields:
     five safety gates (see "Merging finished branches" in [docs/merging.md](merging.md#merging-finished-branches)). A project
     without one skips that gate — it passes vacuously,
     the same way a task with no dependencies is trivially unblocked.
+  - `workerCheck` (optional) — `{ "command": "scripts/worker/check.sh --check", "doc": "docs/WORKER-SETUP.md" }`.
+    Both fields must be nonempty strings: the command's executable and the
+    doc are repo-relative, without parent traversal or absolute paths.
+    Arguments are allowed, shell operators are rejected. The executable
+    must be runnable directly (including a shebang for scripts).
+    A fresh read-only check runs before each non-hub spawn in a detached
+    scratch worktree at the pushed base with `worktreeLinks` applied.
+    The check has 10 seconds plus a 2-second kill grace; failure, timeout
+    or a missing command refuses the spawn before its claim. Output is
+    limited to 2000 characters and the reply names the setup doc.
+    No entry means no check; the hub and Resume are never checked.
+    Settings edits both fields; clearing both removes the entry.
+    `--check` and Settings **Check this machine** use the worker's existing
+    base-branch ref (the hub checkout's current branch, e.g. `master`) without pushing. No ref is WARN: "not pushed yet; checked at
+    the next spawn". A worker base behind or different from the hub base is identified in the line.
+    See [Project worker readiness](operations.md#project-worker-readiness).
+  - `reconcileCheck` (optional) — a prompt instruction for the agent when
+    **Resume to reconcile** merges the base branch into a task branch. Set
+    this separately from `checkCommand` when the project's full suite
+    should run only in its own gate. For example:
+
+    ```json
+    {"name": "my-app", "path": "~/code/my-app", "reconcileCheck": "Run only focused tests named in the task brief; the project gate runs full suites."}
+    ```
+
+    The instruction is sent to the agent, not executed by Centrale. It
+    takes precedence over `checkCommand` in the reconcile prompt, but
+    does not change merge gate 5. With neither field set, the prompt asks
+    for focused tests covering the changes and conflict resolution.
+    Omitted, blank, or non-string values fall back to `checkCommand` when
+    configured, or to focused tests otherwise.
   - `maxAgents` (optional) — a positive integer limiting this project's live
     Centrale tmux sessions. Omitted or `null` means no cap. Each spawn,
     re-spawn and resume counts tmux sessions again before claiming or
@@ -337,6 +443,50 @@ Fields:
     ```json
     {"name": "my-app", "path": "~/code/my-app", "maxAgents": 4, "worktreeLinks": [".venv"]}
     ```
+  - `machines` (optional) — the configured `machines` entries (by `name`)
+    this project's tasks may run on, besides this machine (the hub), which
+    is always allowed. Omitted, `null` or `[]` means the hub only, exactly
+    as before; a name that is not configured, or one listed twice, is
+    rejected at startup. The project must be set up on each machine it
+    lists (parked repository, `worktreeLinks` sources, its tools), which
+    `--check` verifies per project and machine. The project's `path` stays a
+    checkout on the hub, which keeps `main` and does every merge.
+  - `defaultMachine` (optional) — where a spawn that names no machine goes:
+    `"hub"` (the same as omitting it) or one of the project's own
+    `machines`; anything else is rejected at startup. Each spawn may name a
+    machine instead (`POST /api/spawn`'s `machine`, see
+    [docs/api.md](api.md)).
+
+    ```json
+    {"name": "my-app", "path": "~/code/my-app", "machines": ["box-b"], "defaultMachine": "box-b"}
+    ```
+
+    A machine leaves a project's `machines` -- or the top-level
+    `machines` -- only while that project has no task worktree and no task
+    branch there: the Settings API refuses the change otherwise (and when
+    that machine cannot be asked), and a `projects.json` edited by hand
+    into that state is refused at startup and by `--check`, naming the
+    tasks to merge, discard or abandon first. The hub's fetched copies
+    (`refs/remotes/<machine>/task/*`) count as such tasks; a remote of the
+    same name in the hub's repository (`origin`) is yours and never does.
+    Revision 4's single per-project `machine` key, never released, is
+    rejected with a message naming these two.
+
+    <a id="where-a-task-is"></a>**Where a task is.** A task's location is
+    derived on every read, never stored (doc-3 revision 5): it is where
+    its `task/<id>` worktree is checked out -- the hub's `git worktree
+    list`, or a listed machine's project-repository worktree list -- and,
+    with no worktree anywhere, where its branch is: a local `task/<id>`
+    means the hub, a branch only in a machine's project repository (seen
+    through the hub's fetched `refs/remotes/<machine>/task/<id>`) means
+    that machine. A task found in two places is a conflict: it is reported
+    with both, and every action that needs a location (End session,
+    Resume, Merge, Discard, Abandon, clean-up) is refused with that reason
+    -- Centrale never guesses. A machine that does not answer is
+    represented by its fetched refs, so its tasks still show as on it,
+    unreachable. A spawn of a task that already has a location goes there,
+    and one that names a different machine is refused, naming where the
+    task is.
   - `checkTimeoutSeconds` (optional) — how long `checkCommand` is allowed to
     run before it's killed and treated as a failed gate 5 ("checkCommand
     timed out after Xs", not a hung request). Defaults to `600` (10 minutes
@@ -408,6 +558,8 @@ subset of `projects.json`:
    line, with an empty field meaning no links. Changes apply to future
    launches and merge attempts. Links are added only when a new worktree
    is created.
+   The project's max-agent limit counts its live agents on all machines,
+   including the hub; each machine's limit counts all projects on it.
 3. **Board auto-refresh interval** — `refreshIntervalSeconds`, a whole
    number of seconds, minimum 5. Purely client-side; changing it doesn't
    affect a countdown already in progress, only the one after it.
@@ -497,6 +649,23 @@ one-field `POST /api/settings` immediately, rather than waiting for the
 main Save button, and both refetch the board on success so the change is
 visible right away.
 
+**Machines** lists the worker definitions in `projects.json`. With none
+configured, it shows only **Add a machine**. Add or Edit takes a name,
+SSH target, repository root, worktree root, optional max-agent limit and
+optional tmux socket name. **Save machine** writes the full list through
+the same validation as startup, taking effect immediately: Centrale starts
+a control connection for a new worker, reconnects one whose definition
+changed, and stops one removed from the list. Existing unchanged workers
+keep their connections. If a new connection cannot start, Save warns that
+a restart is needed after fixing the cause. **Remove**
+requires a second click and is refused if any project still has a task
+worktree or branch there, or if the worker cannot answer that question.
+An allowed removal also removes that worker from each project's machine
+list and resets a default pointing there to the hub. **Check this machine**
+shows that worker's own `--check` lines, including reachability, tools,
+login, clock, and listed projects' repository and link checks. It does not
+change configuration.
+
 - **Remove** only deletes that project's entry from `projects.json` — it
   never touches the repo itself (no directory deletion, no branch/worktree
   cleanup). Removing the last remaining project is allowed: a board with
@@ -548,7 +717,8 @@ The pointer uses the configured Centrale port; re-run setup after changing it.
   "agents": ["<name>", ...], "requireAgentAssignment": bool, "lockSpawnedTaskFiles": bool, "agentEntries": [{"name", "cmd": [argv],
   "cmdText", "promptSuffix": str | null, "builtin": bool, "onPath": bool},
   ...], "projects": [{"name", "path"}, ...], "statusPage": {"enabled",
-  "port", "bind", "running", "error", "links", "labelledLinks"}}` — the
+  "port", "bind", "running", "error", "links", "labelledLinks"},
+  "machineEntries": [{"name", "ssh", "repoRoot", "worktreeRoot", "maxAgents", "tmuxSocket"?}]}` — the
   current value of every whitelisted setting, plus `agents` (every
   configured agent name, sorted), `agentEntries` (the full map in
   `projects.json` order, for the Agents editor: `cmdText` is the
@@ -590,6 +760,13 @@ The pointer uses the configured Centrale port; re-run setup after changing it.
   - `addProject` (`{"name", "path", "initBacklog": bool}`) — see "Add a
     project" above; `initBacklog` defaults to `false` if omitted and must be
     a boolean. The existing API key now opts into both Backlog and Centrale setup.
+  - `machines` (a complete list of worker objects) — validated by
+    `server.normalize_machines`; removing one checks each affected
+    project's remaining work under its launch lock.
+
+`GET /api/machine-check?name=<machine>` returns `{"name", "lines": [...]}`
+for a configured machine. The lines are formatted by the same worker
+checker used by `python3 server.py --check`; an unknown name returns 404.
 
   Any of these ten top-level fields may be omitted, leaving that setting
   untouched. Responds with the same shape, updated, on success (200). A

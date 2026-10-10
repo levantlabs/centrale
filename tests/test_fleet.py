@@ -671,3 +671,124 @@ class OwnerQuestionReuseTests(unittest.TestCase):
             server._owner_cache["thread"].join(10)
             self.assertEqual(server._owner_questions_cached(self.config, {}),
                              ([], ["owner questions unavailable: boom"]))
+
+
+class HookNameTests(unittest.TestCase):
+    """task-226: the hook point that reported a state is kept on the event
+    and journalled, and /api/sessions rows carry stateSince."""
+
+    def setUp(self):
+        import fleet
+        self.journal = fleet.Journal(None)
+        for patch in (mock.patch.object(server, 'fleet_history', self.journal),
+                      mock.patch.object(server.orchestrator, 'publish')):
+            patch.start()
+            self.addCleanup(patch.stop)
+        server._reset_agent_events()
+        self.addCleanup(server._reset_agent_events)
+
+    def states(self):
+        return [(r['state'], r.get('hook')) for r in self.journal.rows]
+
+    def test_journal_rows_name_the_hook_that_changed_the_state(self):
+        server.record_agent_event('app', 'TASK-1', 'working', agent_kind='claude', hook='UserPromptSubmit')
+        server.record_agent_event('app', 'TASK-1', 'working', agent_kind='claude', hook='PreToolUse')
+        server.record_agent_event('app', 'TASK-1', 'finished', agent_kind='claude', hook='Stop')
+        server.record_agent_event('app', 'TASK-1', 'working', agent_kind='claude', hook='PreToolUse')
+        self.assertEqual(self.states(), [('working', 'UserPromptSubmit'), ('finished', 'Stop'),
+                                         ('working', 'PreToolUse')])
+        self.assertEqual(server._agent_events[('app', 'TASK-1')]['hook'], 'PreToolUse')
+
+    def test_unknown_or_malformed_hook_is_ignored_not_rejected(self):
+        for hook in (None, 7, '', 'x' * 41, 'Pre Tool', {'a': 1}):
+            with self.subTest(hook=hook):
+                server._reset_agent_events()
+                self.journal.rows.clear()
+                server.record_agent_event('app', 'TASK-1', 'working', agent_kind='claude', hook=hook)
+                self.assertEqual(self.states(), [('working', None)])
+
+    def test_http_event_body_hook_reaches_the_journal(self):
+        config = {'projects': [{'name': 'app'}]}
+        httpd = server.CentraleHTTPServer(('127.0.0.1', 0), server.Handler, config)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(httpd.server_close)
+        self.addCleanup(httpd.shutdown)
+        conn = http.client.HTTPConnection(*httpd.server_address, timeout=5)
+        self.addCleanup(conn.close)
+        conn.request('POST', '/api/agent-event?project=app&task=TASK-1&agentKind=claude',
+                     json.dumps({'state': 'finished', 'hook': 'Stop'}),
+                     {'Content-Type': 'application/json'})
+        self.assertEqual(conn.getresponse().status, 200)
+        self.assertEqual(self.states(), [('finished', 'Stop')])
+
+    def test_http_working_provenance_is_allowlisted_and_session_is_only_hashed_on_disk(self):
+        # A dropped HTTP field, raw session persistence, or a sticky finished
+        # state breaks this recorded working -> Stop -> PreToolUse sequence.
+        with tempfile.TemporaryDirectory() as directory:
+            self.journal.path = Path(directory) / "fleet.jsonl"
+            config = {"projects": [{"name": "app"}]}
+            httpd = server.CentraleHTTPServer(("127.0.0.1", 0), server.Handler, config)
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            self.addCleanup(thread.join, 5)
+            self.addCleanup(httpd.server_close)
+            self.addCleanup(httpd.shutdown)
+            conn = http.client.HTTPConnection(*httpd.server_address, timeout=5)
+            self.addCleanup(conn.close)
+
+            def post(state, hook, details, kind="claude"):
+                conn.request("POST", "/api/agent-event?project=app&task=TASK-1&agentKind=" + kind,
+                             json.dumps({"state": state, "hook": hook, **details}),
+                             {"Content-Type": "application/json"})
+                response = conn.getresponse()
+                response.read()
+                self.assertEqual(response.status, 200)
+
+            parent = {"prompt_id": "turn-1", "session_id": "abc"}
+            post("working", "UserPromptSubmit", parent)
+            post("working", "PreToolUse", {**parent, "tool_name": "Read"})
+            post("finished", "Stop", parent)
+            post("working", "PreToolUse", {
+                "tool_name": "Read", "agent_id": "fork-1", "prompt_id": "turn-1",
+                "session_id": "def", "tool_input": {"private": "secret"},
+                "prompt": "private prompt", "transcript_path": "/private/transcript",
+                "session_id_hash": "client-must-not-choose-this"})
+            self.assertEqual(server.get_agent_state("app", "TASK-1"), "working")
+            rows = [json.loads(line) for line in self.journal.path.read_text().splitlines()]
+            self.assertEqual(len(rows), 3)  # ordinary working duplicates stay deduplicated
+            self.assertEqual(rows[0].get("session_id_hash"), "ba7816bf8f01")
+            self.assertEqual(rows[0].get("prompt_id"), "turn-1")
+            self.assertNotIn("tool_name", rows[0])
+            self.assertFalse({"session_id_hash", "prompt_id"} & rows[1].keys())
+            self.assertEqual({k: rows[2].get(k) for k in
+                              ("tool_name", "agent_id", "prompt_id", "session_id_hash")},
+                             {"tool_name": "Read", "agent_id": "fork-1",
+                              "prompt_id": "turn-1", "session_id_hash": "cb8379ac2098"})
+            for row in rows:
+                self.assertFalse({"session_id", "tool_input", "prompt", "transcript_path"} & row.keys())
+
+            # Optional provenance must never reject an otherwise valid event.
+            for kind, details in [("claude", {}), ("claude", {
+                "tool_name": {}, "agent_id": 1, "prompt_id": "x" * 201,
+                "session_id": "bad\nidentity"}), ("codex", parent)]:
+                server._reset_agent_events()
+                post("working", "PreToolUse", details, kind)
+                self.assertEqual(server.get_agent_state("app", "TASK-1"), "working")
+                row = self.journal.rows[-1]
+                self.assertFalse({"tool_name", "agent_id", "prompt_id", "session_id",
+                                  "session_id_hash"} & row.keys())
+
+    def test_sessions_rows_carry_state_since(self):
+        config = {'projects': [{'name': 'app', 'path': '/repo'}], 'worktreeRoot': '/nowhere'}
+        sessions = [{'name': 'centrale-app-task-1', 'created': '100'},
+                    {'name': 'centrale-app-task-2', 'created': '100'}]
+        with mock.patch.object(server.time, 'time', return_value=5000.0):
+            server.record_agent_event('app', 'TASK-1', 'working', agent_kind='claude')
+        with mock.patch.object(server, 'parked_status', return_value=None), \
+             mock.patch.object(server, 'read_delivery_log', return_value=([], 0)):
+            server.enrich_sessions_with_files(sessions, config)
+        self.assertEqual(sessions[0]['stateSince'], 5000.0)
+        self.assertEqual(sessions[0]['agentState'], 'working')
+        self.assertIsNone(sessions[1]['stateSince'])

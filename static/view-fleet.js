@@ -176,7 +176,10 @@
     return card;
   }
 
-  function paintCard(card, project, model, animate) {
+  // task-225: `place` ("" for the hub, else a machine name), when given,
+  // keeps only the agents running there -- a project whose agents run in
+  // several places has one card in each group. Without it, every agent.
+  function paintCard(card, project, model, animate, place) {
     var cap = capacity(project);
     card.cap.className = "fleet-capacity" + (cap.full ? " full" : "");
     card.cap.textContent = cap.text;
@@ -185,7 +188,8 @@
     card.ring.setAttribute("aria-label", cap.pct === null ? project.agentCount + " agents, no limit set" : project.agentCount + " of " + project.maxAgents + " agent slots used");
     if (cap.pct !== null) setVar(card.ring, "--ring", cap.pct + "%");
     card.count.textContent = cap.pct === null ? String(project.agentCount) : project.agentCount + "/" + project.maxAgents;
-    var live = model.agents.filter(function (a) { return a.project === project.name && a.live; });
+    var live = model.agents.filter(function (a) { return a.project === project.name && a.live &&
+      (place === undefined || (a.live.machine || "") === place); });
     var nodes = [card.head];
     var seen = {};
     live.forEach(function (a) {
@@ -225,23 +229,63 @@
       C.syncChildren(root, top);
       return;
     }
+    var machines = snapshot.machines || [];
     // A project with nothing running gets a mention, not a card.
     function running(p) { return model.agents.some(function (a) { return a.project === p.name && a.live; }); }
     var busy = projects.filter(running);
     var idle = projects.filter(function (p) { return !running(p); });
-    var grid = root.grid || (root.grid = C.h("div", { className: "fleet-grid" }));
     var mainNodes = [];
-    var nodes = [];
     var seen = {};
-    busy.forEach(function (p) {
-      if (!cards[p.name]) cards[p.name] = makeCard(p);
-      paintCard(cards[p.name], p, model, primed);
-      seen[p.name] = true;
-      nodes.push(cards[p.name].el);
-    });
+    function cardNodes(list, place) {
+      return list.map(function (p) {
+        var key = place === undefined ? p.name : p.name + "@" + place;
+        if (!cards[key]) cards[key] = makeCard(p);
+        paintCard(cards[key], p, model, primed, place);
+        seen[key] = true;
+        return cards[key].el;
+      });
+    }
+    if (!machines.length) {
+      // No machines configured: exactly the single grid of project cards.
+      var grid = root.grid || (root.grid = C.h("div", { className: "fleet-grid" }));
+      C.syncChildren(grid, cardNodes(busy));
+      if (busy.length) mainNodes.push(grid);
+    } else {
+      // task-210: capacity grouped by machine, the hub's own projects first.
+      var groups = root.groups || (root.groups = {});
+      var specs = [{ key: "", label: "This machine", count: (snapshot.hub || {}).agentCount || 0, hub: true }].concat(
+        machines.map(function (m) { return { key: m.name, label: m.name, count: m.agentCount || 0, max: m.maxAgents, reach: m.reach }; }));
+      // task-224/task-225: a project's card sits in each group where one of
+      // its live agents runs, listing only the agents there, so a project
+      // spread over several places has a card per place and each group's
+      // count stays exact.
+      var runsAt = function (p, place) {
+        return model.agents.some(function (a) { return a.project === p.name && a.live && (a.live.machine || "") === place; });
+      };
+      specs.forEach(function (spec) {
+        var mine = busy.filter(function (p) { return runsAt(p, spec.key); });
+        if (spec.hub && !mine.length) return;
+        var group = groups[spec.key] || (groups[spec.key] = {
+          el: C.h("section", { className: "fleet-machine", attrs: { "data-machine": spec.key || "hub" } }),
+          title: C.h("span", { className: "fleet-machine-name" }),
+          cap: C.h("span", { className: "fleet-machine-cap" }),
+          reach: C.h("span", { className: "fleet-machine-reach" }),
+          grid: C.h("div", { className: "fleet-grid" })
+        });
+        group.title.textContent = spec.label;
+        var full = typeof spec.max === "number" && spec.count >= spec.max;
+        group.cap.textContent = spec.count + (typeof spec.max === "number" ? "/" + spec.max : "") + " agents";
+        group.cap.className = "fleet-machine-cap" + (full ? " full" : "");
+        var down = !spec.hub && spec.reach !== "reachable";
+        group.reach.textContent = down ? spec.label + " " + (spec.reach === "unknown" ? "not answering" : "unreachable") : "";
+        group.reach.className = "fleet-machine-reach" + (down ? " down" : "");
+        C.syncChildren(group.grid, cardNodes(mine, spec.key));
+        C.syncChildren(group.el, [C.h("div", { className: "fleet-machine-head", children: [group.title, group.cap, group.reach].concat(C.machineMetrics ? [C.machineMetrics((C.systemData || []).find(function (m) { return m.name === (spec.key || "hub"); }))] : []) })]
+          .concat(mine.length ? [group.grid] : []));
+        mainNodes.push(group.el);
+      });
+    }
     Object.keys(cards).forEach(function (k) { if (!seen[k]) delete cards[k]; });
-    C.syncChildren(grid, nodes);
-    if (busy.length) mainNodes.push(grid);
     if (idle.length) {
       if (!quiet) quiet = C.h("div", { className: "fleet-quiet", attrs: { "data-idle-projects": "1" } });
       quiet.textContent = "No agents: " + idle.map(function (p) { return p.name; }).join(", ");

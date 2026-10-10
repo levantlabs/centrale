@@ -243,7 +243,7 @@
   // next refetch once the foreign worktree is gone; no client state.
   // Callers must not attach the harvest click handler when `external`
   // is set, so the disabled button can never POST /api/harvest.
-  function harvestButtonDisplay(state, task) {
+  function harvestButtonDisplay(state, task, projectName) {
     if (state && state.status === "loading") {
       // task-96: the gate the server says it is on, or -- with nothing
       // published (yet, or at all) -- exactly today's plain "Merging…".
@@ -254,6 +254,9 @@
     }
     var ext = C.externalCheckout(task);
     if (ext) return { text: "Merge", disabled: true, title: C.externalMergeReason(ext), external: true };
+    // task-208: `external` is the callers' "no click handler" flag.
+    var machineReason = projectName ? C.machineBlockReason(projectName, task.id) : null;
+    if (machineReason) return { text: "Merge", disabled: true, title: machineReason, external: true };
     return { text: "Merge", disabled: false, title: MERGE_TOOLTIP, external: false };
   }
 
@@ -540,7 +543,7 @@
   // footer and drawer render externalWorkButton instead, mirroring the
   // server's own 409 for that state.
 
-  function cleanupBranch(projectName, taskId) {
+  function cleanupBranch(projectName, taskId, force) {
     var key = C.spawnKey(projectName, taskId); // same "project::taskId" scheme
     C.cleanupStates[key] = { status: "loading" };
     refreshHarvestButtons(projectName, taskId);
@@ -548,10 +551,21 @@
     fetch("/api/cleanup-branch", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project: projectName, taskId: taskId })
+      body: JSON.stringify(force
+        ? { project: projectName, taskId: taskId, force: true }
+        : { project: projectName, taskId: taskId })
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
-        if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+        if (!res.ok) {
+          var err = new Error((data && data.error) || ("HTTP " + res.status));
+          if (res.status === 409 && Array.isArray(data.discardedPaths)) {
+            err.discardedPaths = data.discardedPaths;
+          }
+          throw err;
+        }
+        // task-207: 202 owed -- the machine did not answer, nothing was
+        // cleaned up yet; say so rather than report a success.
+        if (data && data.owed) throw new Error(data.message || "recorded as owed");
         return data;
       });
     }).then(function (data) {
@@ -565,46 +579,42 @@
       );
       C.doRefresh(true); // the branch/worktree are gone and the board changed
     }).catch(function (err) {
-      C.cleanupStates[key] = { status: "error", error: err.message || String(err) };
+      if (err.discardedPaths && err.discardedPaths.length) {
+        C.cleanupConfirmPending[key] = {
+          expires: Date.now() + C.SPAWN_CONFIRM_WINDOW_MS,
+          paths: err.discardedPaths
+        };
+        C.cleanupStates[key] = { status: "confirm", discardedPaths: err.discardedPaths };
+        setTimeout(function () {
+          var current = C.cleanupConfirmPending[key];
+          if (current && current.expires <= Date.now()) {
+            delete C.cleanupConfirmPending[key];
+            if (C.cleanupStates[key] && C.cleanupStates[key].status === "confirm") {
+              delete C.cleanupStates[key];
+            }
+            refreshHarvestButtons(projectName, taskId);
+          }
+        }, C.SPAWN_CONFIRM_WINDOW_MS + 100);
+      } else {
+        C.cleanupStates[key] = { status: "error", error: err.message || String(err) };
+      }
     }).then(function () {
       refreshHarvestButtons(projectName, taskId);
     });
   }
 
-  // First click on a dirty worktree arms an informed confirm (the exact
-  // file list is server-side only -- worktreeDirty is just a yes/no --
-  // so, per task-43's design, the armed message stays count-free rather
-  // than naming files the client doesn't have); a second click inside
-  // the window proceeds. A clean worktree skips arming and cleans up on
-  // the first click. Uses its own cleanupConfirmPending map, never
-  // spawnConfirmPending -- Spawn/Respawn/Resume and this are mutually
-  // exclusive states for a given task, but sharing one map would still
-  // be a confusing false coupling between unrelated actions.
+  // task-220: the server's fresh dirty-path refusal arms confirmation.
+  // A stale clean board flag can never turn a cleanup into silent loss.
   function handleCleanupClick(projectName, taskId) {
     var key = C.spawnKey(projectName, taskId);
-    var task = C.findTask(projectName, taskId);
-
-    if (!task || !task.worktreeDirty) {
-      cleanupBranch(projectName, taskId);
-      return;
-    }
-
     var pending = C.cleanupConfirmPending[key];
     if (pending && pending.expires > Date.now()) {
       delete C.cleanupConfirmPending[key];
-      cleanupBranch(projectName, taskId);
+      cleanupBranch(projectName, taskId, true);
       return;
     }
-
-    C.cleanupConfirmPending[key] = { expires: Date.now() + C.SPAWN_CONFIRM_WINDOW_MS };
-    refreshHarvestButtons(projectName, taskId);
-    setTimeout(function () {
-      var current = C.cleanupConfirmPending[key];
-      if (current && current.expires <= Date.now()) {
-        delete C.cleanupConfirmPending[key];
-        refreshHarvestButtons(projectName, taskId);
-      }
-    }, C.SPAWN_CONFIRM_WINDOW_MS + 100);
+    delete C.cleanupConfirmPending[key];
+    cleanupBranch(projectName, taskId, false);
   }
 
   function cleanupButtonDisplay(projectName, taskId, state) {
@@ -613,7 +623,7 @@
     if (pending && pending.expires > Date.now()) {
       return {
         text: "Confirm cleanup?",
-        confirmTitle: "Uncommitted changes in the worktree will be discarded — clean up anyway?",
+        confirmTitle: "Discard these uncommitted paths: " + pending.paths.join(", "),
         disabled: false,
         confirming: true
       };
@@ -622,6 +632,13 @@
   }
 
   function renderCleanupStatusLine(state) {
+    if (state.status === "confirm") {
+      var paths = state.discardedPaths || [];
+      var prompt = C.h("div", { className: "spawn-status-line error",
+        text: "Uncommitted changes: " + paths.join(", ") + ". Confirm cleanup to discard them." });
+      prompt.addEventListener("click", function (e) { e.stopPropagation(); });
+      return prompt;
+    }
     if (state.status === "error") {
       var errLine = C.h("div", { className: "spawn-status-line error", text: "Failed to clean up: " + state.error });
       errLine.addEventListener("click", function (e) { e.stopPropagation(); });
@@ -1018,6 +1035,9 @@
     }).then(function (res) {
       return res.json().catch(function () { return {}; }).then(function (data) {
         if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+        // task-207: 202 owed -- the machine did not answer and the session
+        // may still be running; the debt is retried, but nothing ended yet.
+        if (data && data.owed) throw new Error(data.message || "recorded as owed");
         return data;
       });
     }).then(function () {
@@ -1113,17 +1133,26 @@
 
   // The one disabled rendering left is the in-flight "Ending…": the
   // button is never withheld for an agent state (task-132), so it
-  // always carries its handler and always reaches handleEndSessionClick.
+  // always carries its handler and always reaches handleEndSessionClick
+  // -- except while its machine is not answering (task-208), when it is
+  // disabled with that reason and carries no handler at all.
   function renderEndSessionButton(projectName, taskId, className, openDrawerOnSuccess, armReason) {
     var key = C.spawnKey(projectName, taskId);
     var display = endSessionButtonDisplay(C.endSessionStates[key], armReason,
                                           endSessionIsArmed(projectName, taskId));
+    var machineReason = C.machineBlockReason(projectName, taskId);
     var btn = C.h("button", {
       className: className + (display.confirming ? " confirming" : ""),
       text: display.text
     });
     btn.disabled = display.disabled;
     btn.title = display.title;
+    if (machineReason) {
+      // task-208: the machine the session runs on is not answering.
+      btn.disabled = true;
+      btn.title = machineReason;
+      return btn;
+    }
     btn.addEventListener("click", function (e) {
       e.stopPropagation();
       handleEndSessionClick(projectName, taskId, openDrawerOnSuccess, armReason);

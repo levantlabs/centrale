@@ -43,6 +43,21 @@ curl --fail-with-body --silent --show-error "$CENTRALE_URL/api/spawn" \
   -d '{"project":"my-app","taskId":"TASK-2","agent":"codex"}'
 ```
 
+If the worker needs your first brief before taking any action, include
+`"firstMessage"` in that same request. Centrale puts it in the worker's
+initial prompt on the hub or a configured machine, after the normal workflow
+prompt and agent suffix. For example, add this field to the JSON body:
+
+```json
+"firstMessage": "Plan and wait for my ruling before editing."
+```
+
+The value must be a non-blank
+string of at most 8,000 characters; invalid values return 400 before a task
+is claimed or an agent starts. Omit it to use the unchanged spawn prompt.
+The brief is per spawn and is not saved on the task. Put durable requirements
+in the task before spawning; use a ruling for later messages.
+
 Explicit `agent` wins; otherwise the task's first assignee must name a
 configured agent. Names match case-insensitively, with an optional `@`.
 With default `requireAgentAssignment: true`, an unassigned task or human
@@ -54,6 +69,28 @@ claims and commits the task, creates/reuses `task/<task-id>` in a managed
 worktree, and launches the worker there. Inspect warnings: a failed claim
 does not prevent launch. After a lost response, reconcile through
 `GET /api/sessions` and `GET /api/board` before retrying.
+
+### Choose a machine
+
+When the project lists other `machines` (`GET /api/settings`'
+`projectMachines`), add `"machine"` to send the task to one of them, or
+`"hub"` to keep it on Centrale's own machine:
+
+```sh
+curl --fail-with-body --silent --show-error "$CENTRALE_URL/api/spawn" \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"my-app","taskId":"TASK-2","agent":"codex","machine":"box-b"}'
+```
+
+Without it the task goes to the project's `defaultMachine`, else the hub.
+A name the project does not list is 400 with the allowed list. A task that
+already has a worktree or branch somewhere stays there: naming another
+machine is 409 naming where it is, and a task found in two places is 409
+naming both -- report that to the owner rather than removing either copy.
+Success then adds `machine` and `worktree` (the path on that machine); the
+board and `GET /api/task` report each task's `location`. Work on a worker is
+reached through Centrale only: its session, rulings and merge all go
+through the same API calls as on the hub.
 
 409 also means an existing live session, a Done task, or a branch checked out
 outside Centrale. Read the reason; do not create a competing worker. For
@@ -76,7 +113,8 @@ keyed by project name; `POST /api/settings` accepts partial maps:
 ```
 
 `maxAgents` must be a positive integer; omitted or `null` means no cap.
-Spawn and resume count live tmux sessions on each request. At the cap,
+Spawn and resume count live tmux sessions on each request, on every machine
+the project runs on. At the cap,
 409 names the sessions: wait for work to finish, review and end an eligible
 session, then retry. A finished/idle badge alone does not free a slot.
 
@@ -223,3 +261,35 @@ review) (state before the server restart)` or `TASK-3 state unknown after the
 server restart (...)`: handle each (inspect unknown ones), reconcile actions you
 had in flight, then continue with cursors as usual.
 Waiting consumes no events and blocks no other API requests.
+
+
+## Preparing a worker for your project
+
+Your project owns worker setup, including its script, setup doc and list
+of secrets/files that must stay absent. Centrale installs nothing. Write
+any sudo steps as exact commands for the owner; do not run them yourself.
+Keep a read-only readiness check in your repo, then declare in projects.json
+(or both Worker check fields in Settings), after the script lands on main:
+
+```json
+"workerCheck": {"command": "scripts/worker/check.sh --check", "doc": "docs/WORKER-SETUP.md"}
+```
+
+The command must be directly executable and repo-relative (arguments are
+allowed). It runs from a detached scratch worktree root at the pushed base
+on the chosen non-hub worker, with worktreeLinks from the parked copy.
+It must only read, finish within 10 seconds, and report forbidden files by
+name without their contents. Transient memory and gate locks belong to
+your orchestrator's routing, not this static readiness check.
+
+Failure, timeout or a missing command refuses Spawn before claim/commit or
+a task branch/worktree. The reply includes bounded output and:
+"read docs/WORKER-SETUP.md in app and set up box-b, or spawn on the hub".
+A missing or non-executable check file is "setup not finished"; a present
+check exiting 126/127 reports an ordinary failure. Prepare the worker using your
+project's document, or choose the hub. No workerCheck means no check; the
+hub and Resume never run it. Scratch worktrees are removed after every
+outcome. --check and Settings Check this machine read the existing worker
+base ref without pushing, using the hub checkout's current branch name
+(e.g. master); a missing base is WARN until the next spawn and a worker
+base behind the hub is named. Spawn uses a fresh pushed base.

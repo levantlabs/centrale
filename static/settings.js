@@ -16,6 +16,9 @@
   var lastSettingsData = null;
   var settingsRemovePending = {}; // project name -> {expires: epochMs}
   var settingsProjectActionInFlight = false; // guards add/remove while a request is in flight
+  var settingsMachineActionInFlight = false;
+  var settingsMachineEditing = null;
+  var settingsMachineRemovePending = null;
   // task-78: the Agents editor's rows -- [{name, cmd (shell-quoted text),
   // promptSuffix, builtin, onPath}], the working copy the inputs write
   // into so a re-render never loses typing. `settingsAgentsDirty` gates
@@ -40,6 +43,8 @@
     // collapsed too; dropping the old cards means populate's
     // keep-what-was-open-across-a-save rule has nothing to carry over.
     C.byId("settings-projects-section").open = false;
+    C.byId("settings-machine-editor").hidden = true;
+    C.byId("settings-machine-check-results").hidden = true;
     C.clearChildren(C.byId("settings-check-commands"));
 
     fetch("/api/settings").then(function (res) {
@@ -152,8 +157,12 @@
     });
     C.clearChildren(container);
     var checkCommands = data.checkCommands || {};
+    var workerChecks = data.workerCheck || {};
     var maxAgents = data.maxAgents || {};
     var worktreeLinks = data.worktreeLinks || {};
+    var machineNames = data.machines || [];
+    var projectMachines = data.projectMachines || {};
+    var defaultMachines = data.defaultMachine || {};
     // task-158: the names come from THIS payload, never from the board's
     // C.knownProjects. That list is "every project name ever seen" and
     // is only ever pushed to, so a removed project stayed in it and its
@@ -201,6 +210,17 @@
       input.value = checkCommands[name] || "";
       addField("Test command", "Runs on the merged result before a merge. Blank = no test gate.", input, "checkCommand");
 
+      // task-240: the project owns the read-only check and its setup doc.
+      var workerCheck = workerChecks[name] || {};
+      ["command", "doc"].forEach(function (key) {
+        var fieldInput = document.createElement("input");
+        fieldInput.type = "text";
+        fieldInput.value = workerCheck[key] || "";
+        addField(key === "command" ? "Worker check command" : "Worker setup doc",
+          key === "command" ? "Repo-relative read-only command, run before a worker spawn. Blank pair = no check." : "Repo-relative setup document named when the check fails.",
+          fieldInput, key === "command" ? "workerCheckCommand" : "workerCheckDoc");
+      });
+
       // task-177: these are project config beside checkCommand. The
       // textarea holds literal repo-relative paths, one per line.
       var capInput = document.createElement("input");
@@ -217,6 +237,46 @@
       linksInput.value = (worktreeLinks[name] || []).join("\n");
       addField("Worktree links", "Linked from the main checkout into each new worktree. One repo-relative path per line.", linksInput, "worktreeLinks");
 
+      // task-225: with machines configured, which of them this project's
+      // tasks may run on and where a spawn naming none goes. Absent
+      // entirely without machines, so a single-machine form is unchanged.
+      var machineChecks = [];
+      var defaultSelect = null;
+      if (machineNames.length) {
+        var group = document.createElement("div");
+        machineChecks = machineNames.map(function (machine) {
+          var label = document.createElement("label");
+          var box = document.createElement("input");
+          box.type = "checkbox";
+          box.value = machine;
+          box.setAttribute("data-machine", machine);
+          box.checked = (projectMachines[name] || []).indexOf(machine) !== -1;
+          label.appendChild(box);
+          label.appendChild(document.createTextNode(machine));
+          group.appendChild(label);
+          return box;
+        });
+        addField("Machines", "Besides this machine, where this project's tasks may run. Removing one is refused while the project still has tasks there.", group, "projectMachines");
+        group.className = "settings-machine-checks";
+        defaultSelect = document.createElement("select");
+        addField("Default machine", "Where a spawn that names no machine goes.", defaultSelect, "defaultMachine");
+        var syncDefaultOptions = function (preferred) {
+          var allowed = ["hub"].concat(machineChecks.filter(function (b) { return b.checked; }).map(function (b) { return b.value; }));
+          C.clearChildren(defaultSelect);
+          allowed.forEach(function (machine) {
+            var opt = document.createElement("option");
+            opt.value = machine;
+            opt.textContent = machine === "hub" ? "hub (this machine)" : machine;
+            defaultSelect.appendChild(opt);
+          });
+          defaultSelect.value = allowed.indexOf(preferred) !== -1 ? preferred : "hub";
+        };
+        syncDefaultOptions(defaultMachines[name] || "hub");
+        machineChecks.forEach(function (box) {
+          box.addEventListener("change", function () { syncDefaultOptions(defaultSelect.value); });
+        });
+      }
+
       function updateCardSummary() {
         var parts = [];
         var cap = capInput.value.trim();
@@ -224,6 +284,8 @@
         var links = linksInput.value.split("\n").filter(function (l) { return l.trim(); }).length;
         if (links) parts.push(links + (links === 1 ? " link" : " links"));
         if (input.value.trim()) parts.push("test command set");
+        var onMachines = machineChecks.filter(function (b) { return b.checked; }).length;
+        if (onMachines) parts.push(onMachines + (onMachines === 1 ? " machine" : " machines"));
         C.clearChildren(cardSummary);
         cardSummary.appendChild(C.h("span", { className: "settings-project-card-name", text: name, title: name }));
         cardSummary.appendChild(C.h("span", {
@@ -232,6 +294,7 @@
         }));
       }
       [input, capInput, linksInput].forEach(function (el) { el.addEventListener("input", updateCardSummary); });
+      machineChecks.forEach(function (box) { box.addEventListener("change", updateCardSummary); });
       updateCardSummary();
 
       container.appendChild(card);
@@ -252,6 +315,138 @@
     syncSettingsAgentPicker(data.defaultAgent);
 
     renderProjectsList(data.projects || []);
+    renderMachinesList(data.machineEntries || []);
+  }
+
+  // task-228: machine definitions use the same POST /api/settings write
+  // path as other configuration. Each action posts the complete list;
+  // the server validates it with normalize_machines before touching disk.
+  function renderMachinesList(entries) {
+    var list = C.byId("settings-machines-list");
+    C.clearChildren(list);
+    entries.forEach(function (entry, index) {
+      var row = C.h("div", { className: "settings-machine-row" });
+      row.appendChild(C.h("strong", { text: entry.name }));
+      row.appendChild(C.h("span", { text: " " + entry.ssh + (entry.maxAgents == null ? "" : " · max " + entry.maxAgents + " agents") }));
+      function action(label, callback) {
+        var button = C.h("button", { className: "btn btn-sm", text: label });
+        button.type = "button";
+        button.disabled = settingsMachineActionInFlight;
+        button.addEventListener("click", callback);
+        row.appendChild(button);
+      }
+      action("Edit", function () { openMachineEditor(index); });
+      action("Check this machine", function () { checkMachine(entry.name); });
+      action(settingsMachineRemovePending === entry.name ? "Confirm remove " + entry.name : "Remove", function () {
+        if (settingsMachineRemovePending === entry.name) {
+          settingsMachineRemovePending = null;
+          saveMachines(entries.filter(function (_, at) { return at !== index; }), "Removed " + entry.name + ".");
+        } else {
+          settingsMachineRemovePending = entry.name;
+          renderMachinesList(entries);
+          setTimeout(function () {
+            if (settingsMachineRemovePending === entry.name) {
+              settingsMachineRemovePending = null;
+              renderMachinesList(entries);
+            }
+          }, C.SPAWN_CONFIRM_WINDOW_MS);
+        }
+      });
+      list.appendChild(row);
+    });
+  }
+
+  function openMachineEditor(index) {
+    var entries = (lastSettingsData && lastSettingsData.machineEntries) || [];
+    var entry = index == null ? {} : entries[index];
+    settingsMachineEditing = index;
+    C.byId("settings-machine-editor-title").textContent = index == null ? "Add a machine" : "Edit " + entry.name;
+    C.byId("settings-machine-name").value = entry.name || "";
+    C.byId("settings-machine-ssh").value = entry.ssh || "";
+    C.byId("settings-machine-repo-root").value = entry.repoRoot || "";
+    C.byId("settings-machine-worktree-root").value = entry.worktreeRoot || "";
+    C.byId("settings-machine-max-agents").value = entry.maxAgents == null ? "" : String(entry.maxAgents);
+    C.byId("settings-machine-tmux-socket").value = entry.tmuxSocket || "";
+    C.byId("settings-machine-editor").hidden = false;
+    C.byId("settings-error-machines").hidden = true;
+  }
+
+  function saveMachines(entries, success) {
+    if (settingsMachineActionInFlight) return;
+    var editorWasOpen = !C.byId("settings-machine-editor").hidden;
+    settingsMachineActionInFlight = true;
+    setSettingsStatus("Saving machines…", null);
+    fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ machines: entries }) }).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) {
+          var err = new Error((data && data.error) || ("HTTP " + res.status));
+          err.fields = data && data.fields;
+          throw err;
+        }
+        return data;
+      });
+    }).then(function (data) {
+      populateSettingsForm(data);
+      C.byId("settings-machine-editor").hidden = true;
+      var warnings = Array.isArray(data.warnings) ? data.warnings : [];
+      setSettingsStatus(warnings.length ? success + " Warning: " + warnings.join(" ") : success,
+        warnings.length ? "warning" : "success");
+      C.doRefresh(true);
+    }).catch(function (err) {
+      var reason = (err.fields && err.fields.machines) || err.message || String(err);
+      var field = C.byId("settings-error-machines");
+      field.textContent = reason;
+      field.hidden = false;
+      C.byId("settings-machine-editor").hidden = !editorWasOpen;
+      setSettingsStatus("Machine change refused: " + reason, "error");
+    }).then(function () {
+      settingsMachineActionInFlight = false;
+      renderMachinesList((lastSettingsData && lastSettingsData.machineEntries) || []);
+    });
+  }
+
+  function saveMachineEditor() {
+    if (settingsMachineActionInFlight) return;
+    var capInput = C.byId("settings-machine-max-agents");
+    if (capInput.validity && capInput.validity.badInput) {
+      var field = C.byId("settings-error-machines");
+      field.textContent = "Finish the max-agent number, or clear it for no limit.";
+      field.hidden = false;
+      return;
+    }
+    var cap = capInput.value.trim();
+    var entry = {
+      name: C.byId("settings-machine-name").value.trim(),
+      ssh: C.byId("settings-machine-ssh").value.trim(),
+      repoRoot: C.byId("settings-machine-repo-root").value,
+      worktreeRoot: C.byId("settings-machine-worktree-root").value,
+      maxAgents: cap === "" ? null : (/^[0-9]+$/.test(cap) && Number.isSafeInteger(Number(cap)) ? Number(cap) : cap)
+    };
+    var socket = C.byId("settings-machine-tmux-socket").value.trim();
+    if (socket) entry.tmuxSocket = socket;
+    var entries = ((lastSettingsData && lastSettingsData.machineEntries) || []).slice();
+    if (settingsMachineEditing == null) entries.push(entry);
+    else entries[settingsMachineEditing] = entry;
+    saveMachines(entries, "Saved machine " + entry.name + ".");
+  }
+
+  function checkMachine(name) {
+    var output = C.byId("settings-machine-check-results");
+    output.hidden = false;
+    output.textContent = "Checking " + name + "…";
+    fetch("/api/machine-check?name=" + encodeURIComponent(name)).then(function (res) {
+      return res.json().catch(function () { return {}; }).then(function (data) {
+        if (!res.ok) throw new Error((data && data.error) || ("HTTP " + res.status));
+        return data;
+      });
+    }).then(function (data) {
+      var counts = data.counts || {};
+      output.textContent = "Summary " + name + ": " + (counts.PASS || 0) + " PASS, " +
+        (counts.WARN || 0) + " WARN, " + (counts.FAIL || 0) + " FAIL\n" + (data.lines || []).join("\n");
+    }).catch(function (err) {
+      output.textContent = "Could not check " + name + ": " + (err.message || String(err));
+    });
   }
 
   // task-78: Agents editor ------------------------------------------
@@ -689,10 +884,11 @@
     // when there is one: the server validates against projects.json, so
     // it can name a project this form is not showing.
     var projectSetting = fieldName.split(".")[0];
-    if (["checkCommands", "maxAgents", "worktreeLinks"].indexOf(projectSetting) !== -1 &&
+    if (["checkCommands", "workerCheck", "maxAgents", "worktreeLinks", "projectMachines", "defaultMachine"].indexOf(projectSetting) !== -1 &&
         fieldName.indexOf(projectSetting + ".") === 0) {
       var project = fieldName.slice(projectSetting.length + 1);
-      var setting = projectSetting === "checkCommands" ? "checkCommand" : projectSetting;
+      var setting = projectSetting === "checkCommands" ? "checkCommand" :
+        (projectSetting === "workerCheck" ? "workerCheckCommand" : projectSetting);
       var rowErr = document.querySelector('#settings-check-commands [data-setting-error="' + setting + '"][data-project-error="' + project + '"]');
       if (rowErr) {
         rowErr.hidden = false;
@@ -772,7 +968,15 @@
       }).filter(function (line) { return line !== ""; });
     });
 
+    var workerChecks = {};
+    document.querySelectorAll('#settings-check-commands input[data-setting="workerCheckCommand"]').forEach(function (input) {
+      var name = input.getAttribute("data-project");
+      var doc = document.querySelector('#settings-check-commands input[data-project="' + name + '"][data-setting="workerCheckDoc"]');
+      var command = input.value.trim(), docPath = doc.value.trim();
+      workerChecks[name] = command || docPath ? { command: command, doc: docPath } : null;
+    });
     var body = {
+      workerCheck: workerChecks,
       harvestMode: C.byId("settings-harvest-mode-toggle").checked ? "auto" : "click",
       requireAgentAssignment: C.byId("settings-require-agent-toggle").checked,
       lockSpawnedTaskFiles: C.byId("settings-lock-task-files-toggle").checked,
@@ -783,6 +987,21 @@
       worktreeLinks: worktreeLinks,
       defaultAgent: C.byId("settings-default-agent").value
     };
+    // task-225: sent only when the form shows machines (the server answers
+    // them only then), for every project card on screen.
+    var machineGroups = document.querySelectorAll('#settings-check-commands [data-setting="projectMachines"]');
+    if (machineGroups.length) {
+      body.projectMachines = {};
+      body.defaultMachine = {};
+      machineGroups.forEach(function (group) {
+        body.projectMachines[group.getAttribute("data-project")] = Array.prototype.filter.call(
+          group.querySelectorAll("input"), function (box) { return box.checked; }
+        ).map(function (box) { return box.value; });
+      });
+      document.querySelectorAll('#settings-check-commands [data-setting="defaultMachine"]').forEach(function (select) {
+        body.defaultMachine[select.getAttribute("data-project")] = select.value;
+      });
+    }
     // task-78: only a touched Agents section rewrites the map -- an
     // untouched one leaves projects.json's "agents" key exactly as is
     // (present or absent).
@@ -845,6 +1064,9 @@
   C.byId("settings-save").addEventListener("click", saveSettings);
   C.byId("settings-add-project-btn").addEventListener("click", handleAddProjectClick);
   C.byId("settings-add-agent-btn").addEventListener("click", handleAddAgentClick);
+  C.byId("settings-add-machine-btn").addEventListener("click", function () { openMachineEditor(null); });
+  C.byId("settings-machine-save").addEventListener("click", saveMachineEditor);
+  C.byId("settings-machine-cancel").addEventListener("click", function () { C.byId("settings-machine-editor").hidden = true; });
   C.byId("settings-default-agent").addEventListener("change", updateSettingsAgentsSummary);
 
   // ------------------------------------------------------------------

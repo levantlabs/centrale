@@ -15,6 +15,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import server  # noqa: E402
 import settings  # noqa: E402
+import machines  # noqa: E402
+import remote_status  # noqa: E402
 
 
 def _git_result(returncode=0, stdout="true\n", stderr=""):
@@ -62,6 +64,68 @@ class CurrentSettingsTests(unittest.TestCase):
         self.assertEqual(result["checkCommands"], {"my-app": None})
         self.assertEqual(result["maxAgents"], {"my-app": None})
         self.assertEqual(result["worktreeLinks"], {"my-app": []})
+        self.assertEqual(result["machineEntries"], [])
+
+
+class MachineSettingsTests(unittest.TestCase):
+    def setUp(self):
+        self.config = make_config([{"name": "my-app", "path": "/repos/my-app", "machines": []}])
+        tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+        json.dump({"projects": [{"name": "my-app", "path": "/repos/my-app"}]}, tmp)
+        tmp.close()
+        self.path = tmp.name
+        self.addCleanup(lambda: os.path.exists(self.path) and os.unlink(self.path))
+        self.worker = {"name": "box-d", "ssh": "user@box-d", "repoRoot": "~/repos",
+                       "worktreeRoot": "~/worktrees", "maxAgents": 2}
+
+    def test_add_edit_remove_round_trip_with_loader_validation(self):
+        result = settings.apply_settings(self.config, {"machines": [self.worker]}, path=self.path)
+        self.assertEqual(result["machineEntries"], [self.worker])
+        self.assertEqual(server.load_config(path=self.path)["machines"], [self.worker])
+        edited = dict(self.worker, ssh="other@box-d", maxAgents=3)
+        settings.apply_settings(self.config, {"machines": [edited]}, path=self.path)
+        self.assertEqual(server.load_config(path=self.path)["machines"], [edited])
+        settings.apply_settings(self.config, {"machines": []}, path=self.path)
+        self.assertEqual(server.load_config(path=self.path)["machines"], [])
+
+    def test_add_machine_and_assign_project_in_one_atomic_save(self):
+        settings.apply_settings(self.config, {"machines": [self.worker],
+                                              "projectMachines": {"my-app": ["box-d"]},
+                                              "defaultMachine": {"my-app": "box-d"}}, path=self.path)
+        loaded = server.load_config(path=self.path)
+        self.assertEqual(loaded["projects"][0]["machines"], ["box-d"])
+        self.assertEqual(loaded["projects"][0]["defaultMachine"], "box-d")
+
+    def test_every_loader_rejection_is_a_settings_rejection_without_writes(self):
+        cases = [dict(self.worker, name="bad name"), dict(self.worker, ssh="-option"),
+                 dict(self.worker, repoRoot=""), dict(self.worker, worktreeRoot="bad\npath"),
+                 dict(self.worker, maxAgents=0), dict(self.worker, tmuxSocket="bad name")]
+        before = Path(self.path).read_text()
+        for entry in cases:
+            with self.subTest(entry=entry), self.assertRaises(settings.ValidationError) as error:
+                settings.apply_settings(self.config, {"machines": [entry]}, path=self.path)
+            self.assertIn("machines", error.exception.fields)
+            self.assertEqual(Path(self.path).read_text(), before)
+            self.assertNotIn("machines", self.config)
+
+    def test_removal_checks_each_project_then_clears_placement_and_default(self):
+        self.config["machines"] = [self.worker]
+        self.config["projects"][0].update(machines=["box-d"], defaultMachine="box-d")
+        Path(self.path).write_text(json.dumps({"machines": [self.worker], "projects": [
+            {"name": "my-app", "path": "/repos/my-app", "machines": ["box-d"],
+             "defaultMachine": "box-d"}]}))
+        with mock.patch.object(machines, "machines_removal_refusal", return_value="task/TASK-1 remains") as guard:
+            with self.assertRaises(settings.ValidationError) as error:
+                settings.apply_settings(self.config, {"machines": []}, path=self.path)
+        self.assertIn("task/TASK-1", error.exception.fields["machines"])
+        guard.assert_called_once()
+        self.assertEqual(server.load_config(path=self.path)["machines"], [self.worker])
+        with mock.patch.object(machines, "machines_removal_refusal", return_value=None):
+            settings.apply_settings(self.config, {"machines": []}, path=self.path)
+        loaded = server.load_config(path=self.path)
+        self.assertEqual(loaded["machines"], [])
+        self.assertEqual(loaded["projects"][0]["machines"], [])
+        self.assertIsNone(loaded["projects"][0]["defaultMachine"])
 
 
 class ApplySettingsValidationTests(unittest.TestCase):
@@ -1137,6 +1201,36 @@ class _SettingsHttpBase(unittest.TestCase):
 
 
 class SettingsHttpApiTests(_SettingsHttpBase):
+    def test_machine_save_reconciles_only_after_successful_write(self):
+        worker = {"name": "box-d", "ssh": "user@box-d", "repoRoot": "~/repos",
+                  "worktreeRoot": "~/worktrees", "maxAgents": None}
+        with mock.patch.object(remote_status, "reconcile") as reconcile:
+            status, _ = self._post("/api/settings", json.dumps({"machines": [dict(worker, ssh="-bad")]}).encode())
+            self.assertEqual(status, 400)
+            reconcile.assert_not_called()
+            status, _ = self._post("/api/settings", json.dumps({"machines": [worker]}).encode())
+            self.assertEqual(status, 200)
+            reconcile.assert_called_once_with(self.config)
+        self.addCleanup(self.config.pop, "machines")
+
+    def test_machine_check_returns_only_selected_machine_lines(self):
+        self.config["machines"] = [
+            {"name": "box-d", "ssh": "user@box-d", "repoRoot": "~/repos", "worktreeRoot": "~/worktrees", "maxAgents": None},
+            {"name": "box-e", "ssh": "user@box-e", "repoRoot": "~/repos", "worktreeRoot": "~/worktrees", "maxAgents": None},
+        ]
+        self.addCleanup(self.config.pop, "machines")
+        with mock.patch.object(machines, "_doctor_machine", return_value=[
+            ("PASS", "machine box-d: reachable"), ("FAIL", "machine box-d: backlog missing")
+        ]) as doctor:
+            status, body = self._get("/api/machine-check?name=box-d")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["lines"], ["[PASS] machine box-d: reachable", "[FAIL] machine box-d: backlog missing"])
+        self.assertEqual(body["counts"], {"PASS": 1, "WARN": 0, "FAIL": 1})
+        doctor.assert_called_once()
+        self.assertEqual(doctor.call_args.args[1]["name"], "box-d")
+        status, _ = self._get("/api/machine-check?name=missing")
+        self.assertEqual(status, 404)
+
     def test_agent_guide_uses_bound_port_and_survives_file_changes(self):
         with mock.patch("builtins.open", side_effect=AssertionError("guide should be loaded at boot")):
             with urllib.request.urlopen(self._url("/api/agent-guide")) as response:
@@ -1720,3 +1814,37 @@ class AgentsEditorHttpTests(_SettingsHttpBase):
         self.assertEqual(status, 400)
         self.assertEqual(body["fields"]["agents.2.name"], "name is required")
         self.assertEqual(body["fields"]["agents.2.cmd"], "command is required")
+
+class WorkerCheckSettingsTests(unittest.TestCase):
+    def test_validation(self):
+        value = {'command': 'scripts/check.sh --check', 'doc': 'docs/setup.md'}
+        self.assertEqual(server.normalize_project_worker_check(value), value)
+        self.assertIsNone(server.normalize_project_worker_check(None))
+        for bad in ['', [], {}, {'command': 'check.sh'}, {'command': '/tmp/check', 'doc': 'setup.md'},
+                    {'command': '../check', 'doc': 'setup.md'}, {'command': 'check', 'doc': '../setup.md'},
+                    {'command': 'check; install', 'doc': 'setup.md'}]:
+            with self.subTest(value=bad), self.assertRaises(server.ConfigError):
+                server.normalize_project_worker_check(bad)
+
+    def test_round_trip_and_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'projects.json'
+            path.write_text(json.dumps({'projects': [{'name': 'app', 'path': directory}]}))
+            config = server.load_config(path)
+            value = {'command': 'scripts/check.sh', 'doc': 'docs/setup.md'}
+            settings.apply_settings(config, {'workerCheck': {'app': value}}, path=path)
+            self.assertEqual(settings.current_settings(config)['workerCheck']['app'], value)
+            self.assertEqual(server.load_config(path)['projects'][0]['workerCheck'], value)
+            settings.apply_settings(config, {'workerCheck': {'app': None}}, path=path)
+            self.assertNotIn('workerCheck', json.loads(path.read_text())['projects'][0])
+            with self.assertRaises(settings.ValidationError):
+                settings.apply_settings(config, {'workerCheck': {'app': {'command': 'check'}}}, path=path)
+
+
+    def test_invalid_config_names_worker_field(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'projects.json'
+            path.write_text(json.dumps({'projects': [{'name': 'app', 'path': directory,
+                                                      'workerCheck': {'command': 'check.sh'}}]}))
+            with self.assertRaisesRegex(server.ConfigError, r'projects.app.workerCheck.*command and doc'):
+                server.load_config(path)

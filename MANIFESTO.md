@@ -60,7 +60,13 @@ session gets back its last *settled* state (finished, idle or waiting) from
 the fleet journal, which already records every change. It gets it back only
 when the row is not older than the tmux session's creation time and names
 the same session instance. A session that was working, or was recreated
-under the same name, still shows that Centrale does not know.
+under the same name, still shows that Centrale does not know. An agent's
+hook now also keeps its state in its own tmux pane (task-209/task-223,
+decision-8): a restart reads that note before announcing anything and takes
+it as it stands, working included -- it is the agent's present claim, not
+a memory. Local sessions started before pane notes were added still use the
+settled-state journal rule above. A worker machine that cannot be reached
+is announced as unreachable, never guessed.
 
 The third is the Needs-you check of each worker's task (task-215,
 decision-7). Backlog loads the whole board to show one task, so checking

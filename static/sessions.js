@@ -7,6 +7,64 @@
 (function (C) {
   "use strict";
 
+  // task-242: shared sidebar/Fleet figures; no task or lifecycle state.
+  C.systemData = [];
+  C.machineLevel = function (kind, value, total) {
+    if (value == null || total == null || total <= 0) return "";
+    var ratio = value / total;
+    if (kind === "load") return ratio > 1.5 ? "red" : ratio > 1 ? "amber" : "";
+    if (kind === "swap") return ratio > 0.8 ? "red" : ratio > 0.5 ? "amber" : "";
+    var red = kind === "ram" ? 0.10 : 0.05;
+    var amber = kind === "ram" ? 0.20 : 0.15;
+    return ratio < red ? "red" : ratio < amber ? "amber" : "";
+  };
+  C.machineMetrics = function (m) {
+    var row = C.h("span", {className: "machine-metrics"});
+    if (!m || !m.reachable) {
+      row.className += " unavailable";
+      row.textContent = !m || m.reachable == null ? "checking…" : "unreachable";
+      return row;
+    }
+    function bytes(value) { return value == null ? "n/a" : (value / 1000000000).toFixed(1) + " GB free"; }
+    [["ram", "RAM " + bytes(m.ramAvailable), m.ramAvailable, m.ramTotal],
+     ["swap", "swap " + (m.swapUsed == null ? "n/a" : (m.swapUsed / 1000000000).toFixed(1) + " GB used"), m.swapUsed, m.swapTotal],
+     ["disk", "disk " + bytes(m.diskFree), m.diskFree, m.diskTotal],
+     ["load", "load " + (m.load1 == null || m.cores == null ? "n/a" : m.load1.toFixed(1) + "/" + m.cores), m.load1, m.cores]].forEach(function (metric, i) {
+       if (i) row.appendChild(C.h("span", {text: " · "}));
+       row.appendChild(C.h("span", {className: C.machineLevel(metric[0], metric[2], metric[3]), text: metric[1]}));
+     });
+    return row;
+  };
+  C.renderMachines = function () {
+    var list = C.byId("machines-list");
+    if (list) {
+      C.clearChildren(list);
+      C.systemData.forEach(function (m) {
+        list.appendChild(C.h("div", {className: "machine-row", children: [C.h("strong", {text: m.name + " "}), C.machineMetrics(m)]}));
+      });
+    }
+    document.querySelectorAll(".fleet-machine-head").forEach(function (head) {
+      var name = head.getAttribute("data-machine") || head.parentNode.getAttribute("data-machine");
+      var old = head.querySelector(".machine-metrics");
+      if (old) head.removeChild(old);
+      head.appendChild(C.machineMetrics(C.systemData.find(function (m) {return m.name === name;})));
+    });
+  };
+  C.startSystemPolling = function () {
+    if (C.systemTimer) return;
+    var busy = false;
+    function refresh() {
+      if (busy) return;
+      busy = true;
+      fetch("/api/system").then(function (r) { if (!r.ok) throw new Error("system unavailable"); return r.json(); })
+        .then(function (data) { C.systemData = data.machines || []; })
+        .catch(function () { C.systemData = C.systemData.map(function (m) {return {name: m.name, reachable: false};}); })
+        .finally(function () {busy = false; C.renderMachines();});
+    }
+    C.systemTimer = setInterval(refresh, 30000);
+    refresh();
+  };
+
   // ------------------------------------------------------------------
   // Sessions panel
   // ------------------------------------------------------------------
@@ -80,6 +138,18 @@
         row.appendChild(C.h("div", { className: "created", text: descr }));
       }
 
+      if (s.machine) {
+        row.appendChild(C.h("div", { className: "created session-machine", text: "on " + s.machine + (s.worktree ? " · " + s.worktree : ""), title: s.worktree || "" }));
+      }
+
+      // task-225: a session whose task is found in two places says so.
+      var sessionTask = parsed ? C.findTask(parsed.project, parsed.taskId) : null;
+      var sessionConflict = C.locationConflictReason(sessionTask);
+      if (sessionConflict) {
+        row.appendChild(C.h("div", { className: "created session-machine location-conflict",
+          text: "task in two places: " + sessionTask.location.conflict.join(" + "), title: sessionConflict }));
+      }
+
       if (s.parked && s.parked.lastLine) {
         row.appendChild(C.h("div", { className: "created", text: "last line: " + s.parked.lastLine }));
       }
@@ -102,7 +172,8 @@
       }
 
       var attachRow = C.h("div", { className: "attach-row" });
-      var attachCmd = "tmux attach -t " + s.name;
+      // task-210: a remote session is attached over ssh (the server names it).
+      var attachCmd = s.attach || ("tmux attach -t " + s.name);
       attachRow.appendChild(C.h("code", { text: attachCmd }));
       var copyBtn = C.h("button", { className: "btn btn-sm", text: "Copy" });
       copyBtn.addEventListener("click", function (e) {

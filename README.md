@@ -137,6 +137,13 @@ Done task that left some unchecked. → [docs/board.md](docs/board.md#using-the-
 setup, firewall and add-to-home-screen steps (with a screenshot):
 [docs/operations.md](docs/operations.md#checking-status-from-a-phone).
 
+**Run agents on other machines.** Add a machine over ssh in Settings, let a
+project use it, and pick it when you spawn: the agent runs there while merges,
+the board and every status stay on this machine. The sidebar shows each
+machine's free RAM, swap, disk and load, and `python3 server.py --check`
+tells you what a machine is missing. Tested on Ubuntu workers so far. →
+[docs/operations.md](docs/operations.md#setting-up-a-worker)
+
 **Three views over your running agents.** Tabs above the board open **Needs
 you** (an inbox of what only a person can do: a permission dialog or menu
 you answer in place with arrows and Enter or a click, an agent that went idle

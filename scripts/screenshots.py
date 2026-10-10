@@ -698,6 +698,64 @@ def seed_fleet(server, fixture):
     server.fleet_history = journal
 
 
+class FakeControl:
+    """A worker's control connection as remote_status.session_rows reads it:
+    a reach and the task panes it holds. No ssh, no tmux."""
+
+    def __init__(self, reach, tasks=()):
+        self.reach, self._tasks = reach, list(tasks)
+
+    def tasks(self):
+        return self._tasks
+
+
+MACHINES_FIXTURE = [
+    {"name": "box-b", "ssh": "worker@box-b", "repoRoot": "~/centrale-repos",
+     "worktreeRoot": "~/centrale-work", "maxAgents": 4, "project": "my-lib",
+     "reach": "reachable"},
+    {"name": "box-c", "ssh": "worker@box-c", "repoRoot": "~/centrale-repos",
+     "worktreeRoot": "~/centrale-work", "maxAgents": 4, "project": "my-app",
+     "reach": "unreachable"},
+]
+
+
+def stand_up_machines(server, config, fixture, sandbox):
+    """Place the fixture's projects' tasks on two invented machines, one
+    answering and one not, for the shots marked "machines" (task-224: each
+    project lists its machine and defaults to it). Every
+    boundary that would start ssh is replaced here; `server.list_sessions`
+    stops reporting the moved projects' sessions (the hub's tmux no longer
+    holds them) and the same agents come back as the machines' own panes.
+    Returns the config for a second server. Applied after the plain shots,
+    since these are process-wide replacements."""
+    import machines
+    import remote_status
+
+    moved = {m["project"]: m for m in MACHINES_FIXTURE}
+    os.environ["CENTRALE_OWED_TEARDOWNS"] = os.path.join(sandbox, "owed.json")
+    report = [{"name": m["name"], "reach": m["reach"], "error": None, "results": []}
+              for m in MACHINES_FIXTURE]
+    live = [s for s in fixture["sessions"]]
+    for m in MACHINES_FIXTURE:
+        remote_status._connections[m["name"]] = FakeControl(
+            m["reach"],
+            [(s["project"], s["task"], s.get("agentKind")) for s in live
+             if s["project"] == m["project"]] if m["reach"] == "reachable" else [])
+    real_list = server.list_sessions
+    server.list_sessions = lambda strict=False: [
+        s for s in real_list(strict)
+        if not any(s["name"].startswith(f"centrale-{name}-") for name in moved)]
+    server._refresh_machines = lambda cfg: report
+    machines.refresh = lambda cfg, reads=None: report
+    return dict(
+        config,
+        machines=[{k: m[k] for k in ("name", "ssh", "repoRoot", "worktreeRoot", "maxAgents")}
+                  for m in MACHINES_FIXTURE],
+        projects=[dict(p, machines=[moved[p["name"]]["name"]], defaultMachine=moved[p["name"]]["name"])
+                  if p["name"] in moved else p
+                  for p in config["projects"]])
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="scripts/screenshots.py",
@@ -796,6 +854,7 @@ def main(argv=None):
     frozen_ms = int(fixture["clock"]["pageNowEpoch"]) * 1000
     executable = os.environ.get("CENTRALE_SCREENSHOT_CHROMIUM") or None
     written = []
+    machine_httpd = None
 
     try:
         with sync_playwright() as p:
@@ -816,15 +875,29 @@ def main(argv=None):
                     context.add_init_script(_init_script(theme, frozen_ms))
                     return context
 
+                machine_url = None
+                if any(s.get("machines") for s in shots):
+                    # After every plain shot (see stand_up_machines).
+                    shots = sorted(shots, key=lambda s: bool(s.get("machines")))
                 for shot in shots:
                     spec = dict(shot)
-                    spec["url"] = status_url if shot["kind"] == "phone" else url
+                    if shot.get("machines") and machine_url is None:
+                        machine_httpd = server.CentraleHTTPServer(
+                            ("127.0.0.1", 0), server.Handler,
+                            stand_up_machines(server, config, fixture, sandbox))
+                        threading.Thread(target=machine_httpd.serve_forever, daemon=True).start()
+                        machine_url = f"http://127.0.0.1:{machine_httpd.server_address[1]}/"
+                    spec["url"] = (machine_url if shot.get("machines") else
+                                   status_url if shot["kind"] == "phone" else url)
                     spec.setdefault("cardTitle", _card_title(fixture, shot))
                     written.append(shoot(context_factory, spec, args.out, expected_cards, Image))
                     print(f"wrote {_display_path(written[-1])}")
             finally:
                 browser.close()
     finally:
+        if machine_httpd is not None:
+            machine_httpd.shutdown()
+            machine_httpd.server_close()
         httpd.shutdown()
         httpd.server_close()
         status_httpd.shutdown()

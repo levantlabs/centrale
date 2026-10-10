@@ -172,10 +172,7 @@ class CleanupBranchIntegrationTests(base.IntegrationCase):
         self.assertEqual(body["discardedPaths"], [])
         self.assertFalse(self._branch_exists(branch))
 
-    def test_centrale_checkout_still_removes_the_worktree_and_deletes_the_branch(self):
-        # kind == "centrale": the out-of-band merge happened from Centrale's
-        # own worktree path -> today's full cleanup, with an untracked
-        # leftover reported in discardedPaths.
+    def _merged_centrale_checkout(self):
         task_id = base.create_task(self.repo_path, "Merged from the Centrale worktree", acceptance_criteria=["done"])
         # _merge_out_of_band creates its own task; build the path first so
         # the branch lands exactly where checkout_state calls "centrale".
@@ -189,6 +186,10 @@ class CleanupBranchIntegrationTests(base.IntegrationCase):
         self._git("add", "-A", cwd=centrale_wt)
         self._git("commit", "-q", "-m", f"{task_id}: done", cwd=centrale_wt)
         self._git("merge", "--no-ff", "-q", "-m", f"merge {branch}", branch)
+        return task_id, branch, centrale_wt
+
+    def test_centrale_checkout_refuses_untracked_then_force_discards_it(self):
+        task_id, branch, centrale_wt = self._merged_centrale_checkout()
         with open(os.path.join(centrale_wt, "scratch.txt"), "w", encoding="utf-8") as f:
             f.write("untracked leftover\n")
         self._start_server()
@@ -199,12 +200,53 @@ class CleanupBranchIntegrationTests(base.IntegrationCase):
 
         status, body = self._request("POST", "/api/cleanup-branch", {"project": self.PROJECT, "taskId": task_id})
 
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["discardedPaths"], ["scratch.txt"])
+        self.assertTrue(os.path.isfile(os.path.join(centrale_wt, "scratch.txt")))
+        self.assertTrue(self._branch_exists(branch))
+        self.assertIn(os.path.realpath(centrale_wt), self._worktree_paths())
+        status, body = self._request("POST", "/api/cleanup-branch", {
+            "project": self.PROJECT, "taskId": task_id, "force": True})
         self.assertEqual(status, 200, body)
         self.assertTrue(body["worktreeRemoved"])
         self.assertEqual(body["discardedPaths"], ["scratch.txt"])
         self.assertFalse(os.path.isdir(centrale_wt))
         self.assertFalse(self._branch_exists(branch))
         self.assertNotIn(os.path.realpath(centrale_wt), self._worktree_paths())
+
+    def test_tracked_edit_refuses_without_side_effects(self):
+        task_id, branch, centrale_wt = self._merged_centrale_checkout()
+        tracked = os.path.join(centrale_wt, "work.txt")
+        with open(tracked, "a", encoding="utf-8") as f:
+            f.write("unsaved edit\n")
+        self._start_server()
+        status, body = self._request("POST", "/api/cleanup-branch", {
+            "project": self.PROJECT, "taskId": task_id})
+        self.assertEqual(status, 409, body)
+        self.assertEqual(body["discardedPaths"], ["work.txt"])
+        with open(tracked, encoding="utf-8") as f:
+            self.assertIn("unsaved edit", f.read())
+        self.assertTrue(self._branch_exists(branch))
+        self.assertIn(os.path.realpath(centrale_wt), self._worktree_paths())
+        self.assertEqual(self._git("tag", "--list", "abandoned/*").stdout.strip(), "")
+
+    def test_ignored_files_and_node_modules_link_do_not_block_cleanup(self):
+        task_id, branch, centrale_wt = self._merged_centrale_checkout()
+        with open(os.path.join(centrale_wt, ".gitignore"), "w", encoding="utf-8") as f:
+            f.write("*.log\nnode_modules\n")
+        self._git("add", ".gitignore", cwd=centrale_wt)
+        self._git("commit", "-q", "-m", "ignore generated files", cwd=centrale_wt)
+        self._git("merge", "-q", "--no-ff", "-m", "merge ignore", branch)
+        with open(os.path.join(centrale_wt, "run.log"), "w", encoding="utf-8") as f:
+            f.write("generated\n")
+        os.symlink(self.tmp_dir, os.path.join(centrale_wt, "node_modules"))
+        self._start_server()
+        status, body = self._request("POST", "/api/cleanup-branch", {
+            "project": self.PROJECT, "taskId": task_id})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["discardedPaths"], [])
+        self.assertFalse(os.path.exists(centrale_wt))
+        self.assertFalse(self._branch_exists(branch))
 
 
 if __name__ == "__main__":

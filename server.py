@@ -11,6 +11,7 @@ import argparse
 import concurrent.futures
 import copy
 import datetime
+import hashlib
 import http.server
 import json
 import math
@@ -38,6 +39,7 @@ import uuid
 if __name__ == "__main__":
     sys.modules.setdefault("server", sys.modules[__name__])
 
+import centrale_notify
 import orchestrator
 import fleet
 import version  # the one place the version number is written down
@@ -121,6 +123,120 @@ def normalize_project_max_agents(raw, source="maxAgents"):
     if isinstance(raw, bool) or not isinstance(raw, int) or raw < 1:
         raise ConfigError(f"projects.json: {source} must be a positive whole number or null")
     return raw
+
+
+MACHINE_PATH_KEYS = ("repoRoot", "worktreeRoot")
+
+
+def normalize_machines(raw):
+    """The projects.json top-level 'machines' list (doc-3, task-206):
+    other Linux machines a project's agents may run on, reached over ssh.
+    Missing, null or [] means none -- one machine, exactly as before.
+
+    Each entry is {"name", "ssh", "repoRoot", "worktreeRoot", "maxAgents"},
+    plus an optional "tmuxSocket" (task-209).
+    `repoRoot` and `worktreeRoot` are paths ON THAT MACHINE and are kept
+    verbatim: the hub never `~`-expands them, because its home is not the
+    worker's (machines.shell_path lets the worker's shell do it). A
+    malformed entry raises ConfigError, the top-level keys' style, since
+    a half-understood machine is not something to run agents on."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError("projects.json: 'machines' must be an array of machine objects")
+    machines = []
+    for index, entry in enumerate(raw):
+        source = f"machines[{index}]"
+        if not isinstance(entry, dict):
+            raise ConfigError(f"projects.json: {source} must be an object")
+        name = entry.get("name")
+        if not isinstance(name, str) or not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$", name):
+            raise ConfigError(
+                f"projects.json: {source}.name must be letters, numbers, '-', '_' or '.', "
+                "starting with a letter or number"
+            )
+        source = f"machines.{name}"
+        if any(m["name"] == name for m in machines):
+            raise ConfigError(f"projects.json: machine name {name!r} is used twice")
+        target = entry.get("ssh")
+        # A leading '-' would be read by ssh as an option, not a target.
+        if (not isinstance(target, str) or not target.strip() or target != target.strip()
+                or target.startswith("-") or any(c.isspace() for c in target)):
+            raise ConfigError(f"projects.json: {source}.ssh must be an ssh target such as user@host")
+        normalized = {"name": name, "ssh": target}
+        for key in MACHINE_PATH_KEYS:
+            value = entry.get(key)
+            if not isinstance(value, str) or not value.strip() or "\n" in value or "\0" in value:
+                raise ConfigError(f"projects.json: {source}.{key} must be a path on that machine")
+            normalized[key] = value
+        normalized["maxAgents"] = normalize_project_max_agents(entry.get("maxAgents"), f"{source}.maxAgents")
+        # task-209: which tmux server on the worker (`tmux -L <name>`);
+        # omitted means that user's default server.
+        socket = entry.get("tmuxSocket")
+        if socket is not None:
+            if not isinstance(socket, str) or not re.match(r"^[A-Za-z0-9_.-]{1,64}$", socket):
+                raise ConfigError(f"projects.json: {source}.tmuxSocket must be a tmux -L socket name")
+            normalized["tmuxSocket"] = socket
+        machines.append(normalized)
+    return machines
+
+
+HUB = "hub"
+
+
+def normalize_project_machines(raw, machines, source="machines"):
+    """One project's optional 'machines' (doc-3 revision 5, task-224): the
+    configured machines its tasks may run on, besides the hub, which is
+    always allowed. Missing, null or [] means the hub only, exactly as
+    before. An unknown or repeated name raises ConfigError rather than
+    quietly dropping it, which would strand that machine's tasks."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ConfigError(f"projects.json: {source} must be an array of machine names")
+    known = {m["name"] for m in machines}
+    names = []
+    for value in raw:
+        if not isinstance(value, str) or value not in known:
+            raise ConfigError(f"projects.json: {source} must name configured machines, got {value!r}")
+        if value in names:
+            raise ConfigError(f"projects.json: {source} names {value!r} twice")
+        names.append(value)
+    return names
+
+
+def normalize_project_default_machine(raw, allowed, source="defaultMachine"):
+    """One project's optional 'defaultMachine': where a spawn that names
+    no machine goes. None (absent, null or "hub") is the hub; anything
+    else must be one of the project's own `machines`."""
+    if raw is None or raw == HUB:
+        return None
+    if not isinstance(raw, str) or raw not in allowed:
+        choices = ", ".join([HUB, *allowed])
+        raise ConfigError(f"projects.json: {source} must be one of {choices}, got {raw!r}")
+    return raw
+
+
+def normalize_project_worker_check(raw, source="workerCheck"):
+    """task-240: project-owned readiness logic; only its relative paths live here."""
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"command", "doc"}:
+        raise ConfigError(f"projects.json: {source} must contain command and doc")
+    for key in ("command", "doc"):
+        if not isinstance(raw[key], str) or not raw[key].strip():
+            raise ConfigError(f"projects.json: {source}.{key} must be a nonempty string")
+    command, doc = raw["command"].strip(), raw["doc"].strip()
+    try:
+        argv = shlex.split(command)
+    except ValueError as exc:
+        raise ConfigError(f"projects.json: {source}.command: {exc}") from exc
+    if not argv or any(c in command for c in "\n\r;|&<>`$"):
+        raise ConfigError(f"projects.json: {source}.command must be a repo-relative command with arguments")
+    for key, path in (("command", argv[0]), ("doc", doc)):
+        if path.startswith(("/", "~", "-")) or ".." in path.split("/") or path in (".", "./"):
+            raise ConfigError(f"projects.json: {source}.{key} must be repo-relative without parent traversal")
+    return {"command": command, "doc": doc}
 
 
 def normalize_project_worktree_links(raw, source="worktreeLinks"):
@@ -582,6 +698,8 @@ def load_config(path=None):
     import status_page  # local import: avoids a circular import at module load
     status_page_config = status_page.normalize_config(raw.get("statusPage"), port)
 
+    machines = normalize_machines(raw.get("machines"))
+
     projects = []
     for entry in raw.get("projects") or []:
         if not isinstance(entry, dict):
@@ -598,25 +716,41 @@ def load_config(path=None):
         check_command = entry.get("checkCommand")
         if not isinstance(check_command, str) or not check_command.strip():
             check_command = None
+        reconcile_check = entry.get("reconcileCheck")
+        if not isinstance(reconcile_check, str) or not reconcile_check.strip():
+            reconcile_check = None
         check_timeout_seconds = _normalize_check_timeout(entry.get("checkTimeoutSeconds"))
         project_worktree_root = _normalize_project_worktree_root(entry.get("worktreeRoot"))
         max_agents = normalize_project_max_agents(entry.get("maxAgents"), f"projects.{name}.maxAgents")
         worktree_links = normalize_project_worktree_links(entry.get("worktreeLinks"), f"projects.{name}.worktreeLinks")
+        if "machine" in entry:
+            # Revision 4's per-project key, never released (task-224).
+            raise ConfigError(f"projects.json: projects.{name}.machine is replaced by 'machines' (the machines its "
+                              "tasks may run on) and 'defaultMachine' -- see docs/configuration.md")
+        project_machines = normalize_project_machines(
+            entry.get("machines"), machines, f"projects.{name}.machines")
+        default_machine = normalize_project_default_machine(
+            entry.get("defaultMachine"), project_machines, f"projects.{name}.defaultMachine")
         projects.append({
             "name": name,
             "path": os.path.expanduser(proj_path or ""),
             "browserPort": browser_port,
             "checkCommand": check_command,
+            "workerCheck": normalize_project_worker_check(entry.get("workerCheck"), f"projects.{name}.workerCheck"),
+            "reconcileCheck": reconcile_check,
             "checkTimeoutSeconds": check_timeout_seconds,
             "worktreeRoot": project_worktree_root,
             "maxAgents": max_agents,
             "worktreeLinks": worktree_links,
+            "machines": project_machines,
+            "defaultMachine": default_machine,
         })
 
     return {
         "port": port,
         "worktreeRoot": worktree_root,
         "projects": projects,
+        "machines": machines,
         "agents": agents,
         "defaultAgent": default_agent,
         "requireAgentAssignment": require_agent_assignment,
@@ -657,12 +791,14 @@ def configure_subprocess_timeout(seconds):
     _subprocess_timeout_seconds = seconds
 
 
-def _run(cmd, cwd=None, timeout=15, input=None):
+def _run(cmd, cwd=None, timeout=15, input=None, env=None):
     """Run a command, never raising for a non-zero exit. Returns a
     subprocess.CompletedProcess, synthesizing one for a missing binary or a
     timeout so callers always get the same shape back. `input`, when not
     None, is fed to the child's stdin (text) -- how send_session_input
-    hands reply text to `tmux load-buffer -` (task-72)."""
+    hands reply text to `tmux load-buffer -` (task-72). `env`, when not
+    None, is ADDED to this process's environment for the child (task-207:
+    GIT_SSH_COMMAND for git's push and fetch to a machine)."""
     try:
         return subprocess.run(
             cmd,
@@ -671,6 +807,7 @@ def _run(cmd, cwd=None, timeout=15, input=None):
             text=True,
             timeout=timeout,
             input=input,
+            env={**os.environ, **env} if env is not None else None,
         )
     except FileNotFoundError as exc:
         return subprocess.CompletedProcess(cmd, 127, "", str(exc))
@@ -1299,6 +1436,26 @@ def kill_process(pid, sig=signal.SIGTERM):
 
 _DELETED_CWD_SUFFIX = " (deleted)"
 
+# task-222: Codex's per-user app-server daemon (and its pid-update-loop /
+# code-mode-host siblings) outlives the codex that started it and is shared
+# by every later codex, but keeps the cwd of whichever codex started it
+# first -- which can be a task worktree. Its binaries all live under
+# <CODEX_HOME>/packages/app-server-daemon/, so the sweep recognises it by
+# executable path (never by directory) and leaves it alone.
+_CODEX_DAEMON_EXE_MARKER = os.sep + os.path.join("packages", "app-server-daemon") + os.sep
+
+
+def _is_codex_shared_daemon(pid):
+    """True when /proc/<pid>/exe resolves under a Codex
+    packages/app-server-daemon/ directory. A removed-on-upgrade binary
+    reads back with a trailing " (deleted)", which still contains the
+    marker. False when the exe can't be read."""
+    try:
+        exe = os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return False
+    return _CODEX_DAEMON_EXE_MARKER in exe
+
 
 def _pids_with_cwd_under(directory):
     """Every live pid on this host whose /proc/<pid>/cwd names a path
@@ -1317,6 +1474,9 @@ def _pids_with_cwd_under(directory):
     empirically against a real removed directory) -- stripped before
     comparing, so a process orphaned by `git worktree remove` is still
     found even after the worktree directory is gone.
+
+    Codex's shared app-server daemon is skipped even when its cwd is
+    under `directory` (_is_codex_shared_daemon, task-222).
 
     Returns a sorted list of ints; empty (never raises) on a platform
     without /proc, the same degrade-gracefully contract
@@ -1341,7 +1501,8 @@ def _pids_with_cwd_under(directory):
             continue
         if cwd.endswith(_DELETED_CWD_SUFFIX):
             cwd = cwd[: -len(_DELETED_CWD_SUFFIX)]
-        if cwd == target or cwd.startswith(prefix):
+        if (cwd == target or cwd.startswith(prefix)) \
+                and not _is_codex_shared_daemon(entry):
             pids.append(int(entry))
     return sorted(pids)
 
@@ -1377,12 +1538,58 @@ def notify_script_path():
     return os.path.join(BASE_DIR, "centrale_notify.py")
 
 
-def _hooks_settings_hook(state):
-    command = shlex.join(["python3", notify_script_path(), state])
+# task-209: the two places a hook can report to (doc-3, "One hook snippet,
+# two sinks"). A local agent POSTs to this server, unchanged; an agent on a
+# worker cannot reach it (no reverse tunnel), so it writes its state into
+# its own tmux pane option, which remote_status reads over the worker's
+# control connection.
+PANE_STATE_OPTION = "@centrale_state"
+
+
+def tmux_sink_script():
+    """The POSIX sh body of a worker hook, run as `sh -c <this> centrale-hook
+    <state>`: allow-lists the state, keeps task-192's Notification filter
+    (stdin parsed by python3, else jq -- --check requires one of them), and
+    sets `<state> <firedAt>` on the hook's own pane ($TMUX_PANE). Anything
+    else -- an unknown state, no pane, tmux failing -- exits 0 silently: a
+    hook must never break the agent it is attached to."""
+    import centrale_notify  # the one INPUT_NOTIFICATIONS set, both sinks
+
+    wanted = "|".join(sorted(centrale_notify.INPUT_NOTIFICATIONS))
+    return (
+        's=$1; case $s in working|waiting|finished) ;; notification) p=$(cat); '
+        """t=$(printf %s "$p" | python3 -c 'import json,sys; """
+        """print(json.load(sys.stdin).get("notification_type") or "")' 2>/dev/null """
+        """|| printf %s "$p" | jq -r '.notification_type // ""' 2>/dev/null); """
+        f'case $t in {wanted}) s=waiting ;; *) exit 0 ;; esac ;; *) exit 0 ;; esac; '
+        '[ -n "$TMUX_PANE" ] || exit 0; '
+        f'tmux set-option -p -t "$TMUX_PANE" {PANE_STATE_OPTION} "$s $(date +%s.%N)" '
+        ">/dev/null 2>&1 </dev/null; exit 0"
+    )
+
+
+def hook_argv(state, sink="http"):
+    """The one generated hook command for `state`, as argv, per sink:
+    "http" (a local agent, unchanged) runs centrale_notify.py; "tmux" (an
+    agent on a worker) runs tmux_sink_script()."""
+    if sink == "tmux":
+        return ["sh", "-c", tmux_sink_script(), "centrale-hook", state]
+    if sink != "http":
+        raise ValueError(f"unknown hook sink: {sink!r}")
+    return ["python3", notify_script_path(), state]
+
+
+def _hooks_settings_hook(state, sink="http", event=None):
+    """`event` (claude only, http sink) is the hook point it is registered
+    for; centrale_notify records it as the event's "hook" (task-226)."""
+    argv = hook_argv(state, sink)
+    if event and sink == "http":
+        argv.append(event)
+    command = shlex.join(argv)
     return {"hooks": [{"type": "command", "command": command}]}
 
 
-def hooks_settings_payload():
+def hooks_settings_payload(sink="http"):
     """The Claude Code hooks settings JSON: UserPromptSubmit/PreToolUse
     -> working, input-request Notification -> waiting, Stop -> finished. Agent-generic
     and identical for every claude-family spawn -- identity travels via
@@ -1391,7 +1598,7 @@ def hooks_settings_payload():
     file is shared across every spawn/resume rather than written fresh
     per task.
 
-    Also carries two spawn-only settings (task-170.1), both scoped to
+    Also carries spawn-only settings (task-170.1, task-241), all scoped to
     this --settings layer so the user's own ~/.claude config is never
     touched:
     - skillOverrides auto-mode-setup "off": turns off /auto-mode-setup
@@ -1404,18 +1611,27 @@ def hooks_settings_payload():
       are delivered, not held for an approval nobody is watching for
       (task-355, task-252.1). The owner's ruling, with the alternatives
       and consequences, is recorded on task-170.1. An inbound message
-      still cannot approve a permission prompt or change config."""
+      still cannot approve a permission prompt or change config.
+    - promptSuggestionEnabled false (task-241): no greyed-out
+      next-prompt guess in a spawned pane. Nobody types there, and in
+      orchestrated projects the guesses read like real rulings. The
+      owner keeps suggestions in their own sessions, which this layer
+      never touches.
+
+    `sink` (task-209) picks where the hooks report: "http" (a local
+    agent, the default) or "tmux" (an agent on a worker); see hook_argv."""
     return {
         "hooks": {
-            "UserPromptSubmit": [_hooks_settings_hook("working")],
-            "PreToolUse": [_hooks_settings_hook("working")],
+            "UserPromptSubmit": [_hooks_settings_hook("working", sink, "UserPromptSubmit")],
+            "PreToolUse": [_hooks_settings_hook("working", sink, "PreToolUse")],
             # Idle reminders are notifications too, not requests for input
             # (task-192). Keep real permission/elicitation/menu signals.
-            "Notification": [_hooks_settings_hook("notification")],
-            "Stop": [_hooks_settings_hook("finished")],
+            "Notification": [_hooks_settings_hook("notification", sink, "Notification")],
+            "Stop": [_hooks_settings_hook("finished", sink, "Stop")],
         },
         "skillOverrides": {"auto-mode-setup": "off"},
         "crossSessionInbound": "accept",
+        "promptSuggestionEnabled": False,
     }
 
 
@@ -1432,7 +1648,7 @@ def hooks_settings_payload():
 # resolve wrong. PermissionRequest is codex's permission-review signal;
 # unlike Claude's Notification it also fires before automatic approval,
 # so its public waiting state needs confirmation below (task-176).
-def _codex_hooks_override(point, state):
+def _codex_hooks_override(point, state, sink="http"):
     """One -c override argv pair, e.g. ["-c",
     'hooks.UserPromptSubmit=[{hooks=[{type="command",command="python3
     <abs>/centrale_notify.py working"}]}]'] -- a TOML inline-array-of-
@@ -1445,12 +1661,12 @@ def _codex_hooks_override(point, state):
     valid subset of TOML's basic-string escaping, the same trick the
     notify override's own json.dumps(notify_argv) value already relies
     on for its array."""
-    command = _hooks_settings_hook(state)["hooks"][0]["command"]
+    command = _hooks_settings_hook(state, sink)["hooks"][0]["command"]
     quoted_command = json.dumps(command)
     return ["-c", f'hooks.{point}=[{{hooks=[{{type="command",command={quoted_command}}}]}}]']
 
 
-def codex_hooks_overrides():
+def codex_hooks_overrides(sink="http"):
     """The -c inline config overrides that give codex
     UserPromptSubmit/PreToolUse -> working, PermissionRequest -> waiting,
     Stop -> finished lifecycle fidelity (task-44), in place of a
@@ -1469,7 +1685,7 @@ def codex_hooks_overrides():
         ("PostToolUse", "working"),
         ("Stop", "finished"),
     ):
-        overrides += _codex_hooks_override(point, state)
+        overrides += _codex_hooks_override(point, state, sink)
     return overrides
 
 
@@ -1480,6 +1696,7 @@ def codex_hooks_overrides():
 # lookup from /api/board (task["id"], whatever case backlog stores it as)
 # and one from /api/sessions (parsed lowercase out of a tmux session
 # name -- see _parse_session_project_and_task) always agree.
+HOOK_NAME_RE = re.compile(r"[A-Za-z]{1,40}")
 _agent_events = {}
 _agent_events_lock = threading.RLock()
 # PermissionRequest precedes automatic review, not just human approval.
@@ -1495,6 +1712,99 @@ CODEX_STOP_SECONDS = 1.0
 _pending_codex_stops = {}
 
 
+# task-209: a task whose agent runs on a worker has no local tmux session
+# to capture; remote_status registers, per task, a capture over that
+# worker's control connection. Empty without machines, so the local path
+# below is the only one taken.
+remote_pane_capture = {}
+# Browser captures must identify the worker as well as the task: during
+# placement changes an old control connection can still hold that task's
+# pane, and it must never arm input to the new worker (task-230).
+remote_task_pane_capture = {}
+
+
+def capture_agent_pane(key, max_lines):
+    """capture_session_pane for the agent of task `key`, wherever it runs."""
+    capture = remote_pane_capture.get(key)
+    if capture is not None:
+        return capture(max_lines)
+    import spawn
+    return capture_session_pane(spawn.session_name(*key), max_lines)
+
+
+def capture_task_pane(config, project, task_id, max_lines, location=None):
+    """Read a task pane at its derived location (task-230)."""
+    import spawn
+
+    if location is None:
+        location = task_location(config, project, task_id)
+    if location is not None and location.conflict:
+        raise PaneCaptureError(location.conflict_reason(), status=409)
+    if location is not None and location.machine:
+        capture = remote_task_pane_capture.get(
+            (location.machine, project["name"], task_id.upper()))
+        if capture is None:
+            raise PaneCaptureError("worker pane capture is unavailable", status=503)
+        return capture(max_lines)
+    return capture_session_pane(spawn.session_name(project["name"], task_id), max_lines)
+
+
+def pane_capture_key(name, machine=None):
+    """The capture gate for a session on this particular worker or hub."""
+    return name if machine is None else (name, machine)
+
+
+def remote_session_rows(config):
+    """Live sessions on the configured machines (task-210), shaped like
+    list_sessions rows. Nothing -- and remote_status is not even imported --
+    without machines."""
+    if not config.get("machines"):
+        return []
+    import remote_status  # local import: avoids a circular import at module load
+
+    return remote_status.session_rows(config)
+
+
+def task_location(config, project, task_id, live=True):
+    """Where a task is (doc-3 revision 5, task-224): machines.locate for a
+    project with `machines`, read fresh -- over ssh with `live`, from the
+    hub's own refs without -- or None for a project with none, without
+    importing anything (the single-machine guarantee)."""
+    if not project.get("machines"):
+        return None
+    import machines  # local import: avoids a circular import at module load
+
+    return machines.locate(config, project, task_id, live=live)
+
+
+def location_fields(config, location):
+    """What a task response carries about where it is: "location" (only
+    for a project with machines), plus "machine" and "worktree" for a task
+    on a worker (machine_fields). {} without machines, so a
+    single-machine response is unchanged."""
+    if location is None:
+        return {}
+    out = {"location": location.as_json()}
+    if not location.conflict:
+        out.update(machine_fields(config, location.placed(), location.task_id))
+    return out
+
+
+def machine_fields(config, project, task_id):
+    """{"machine", "worktree"} for a task placed on a worker (`project` as
+    machines.placed gives it), naming where it lives; {} for the hub, so
+    a single-machine response is unchanged."""
+    name = project.get("machine")
+    if not name:
+        return {}
+    import machines  # local import: avoids a circular import at module load
+    import remote
+
+    machine = machines.machine_named(config, name)
+    return {"machine": name,
+            "worktree": str(remote.worktree_path(machine, project["name"], task_id))}
+
+
 def _cancel_codex_stop_locked(key):
     timer = _pending_codex_stops.pop(key, None)
     if timer is not None:
@@ -1506,12 +1816,11 @@ def _schedule_codex_stop_locked(key):
         with _agent_events_lock:
             if _pending_codex_stops.get(key) is not timer:
                 return
-        import spawn
         state, retry = "finished", False
         try:
             # Only the current screen, never scrollback containing an old
             # status line. A dialog is stronger evidence than a turn end.
-            lines = capture_session_pane(spawn.session_name(*key), 0)
+            lines = capture_agent_pane(key, 0)
             region = [line.strip() for line in lines if line.strip()][-DELIVERY_DIALOG_REGION_LINES:]
             if not region:
                 state, retry = "unknown", True
@@ -1549,13 +1858,17 @@ AGENT_STATE_MESSAGES = {
 }
 
 
-def _set_agent_event_locked(key, state, kind):
-    """Update badge and notification atomically; caller holds the badge lock."""
+def _set_agent_event_locked(key, state, kind, hook=None, provenance=None):
+    """Update badge and notification atomically; caller holds the badge lock.
+    `hook` (task-226) names the hook point that reported the state; it is
+    kept on the event and journalled with a state change."""
     previous = _agent_events.get(key) or {}
     _agent_events[key] = {
         "state": state, "agentKind": kind, "lastEventAt": time.time(),
         "agent": previous.get("agent") or kind or "unknown",
     }
+    if hook:
+        _agent_events[key]["hook"] = hook
     if previous.get("firedAt") is not None:
         _agent_events[key]["firedAt"] = previous["firedAt"]
     public_state = "idle" if kind == "codex" and state == "finished" else state
@@ -1568,9 +1881,22 @@ def _set_agent_event_locked(key, state, kind):
         # task-201: kind and session identity let a restarted server
         # restore this state only onto the same tmux session instance.
         details = {"agentKind": kind} if kind else {}
+        if hook:
+            details["hook"] = hook
+        # task-227: identify the next trailing Claude working hook without
+        # changing lifecycle decisions or retaining conversation content.
+        if kind == "claude" and state == "working":
+            source = centrale_notify.hook_provenance(provenance)
+            session_id = source.pop("session_id", None)
+            if session_id is not None:
+                source["session_id_hash"] = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:12]
+            details.update(source)
         created = (fleet_history.sessions.get(key) or {}).get("created")
         if created is not None:
             details["created"] = str(created)
+        machine = (fleet_history.sessions.get(key) or {}).get("machine")
+        if machine:
+            details["machine"] = machine
         fleet_history.append(*key, _agent_events[key]["agent"], public_state,
                              timestamp=_agent_events[key]["stateSince"], **details)
         message = AGENT_STATE_MESSAGES.get(public_state)
@@ -1594,10 +1920,9 @@ def _schedule_codex_wait_locked(key):
         # forever with older hooks. Age alone cannot establish human input.
         # Reuse the delivery path's dialog evidence, only after a wait hook
         # has persisted; never derive lifecycle from arbitrary pane activity.
-        import spawn
         state, retry = "working", True
         try:
-            lines = capture_session_pane(spawn.session_name(*key), DELIVERY_CAPTURE_LINES)
+            lines = capture_agent_pane(key, DELIVERY_CAPTURE_LINES)
             if detect_pane_dialog(lines) is not None:
                 state, retry = "waiting", False
         except PaneCaptureError as exc:
@@ -1619,7 +1944,7 @@ def _schedule_codex_wait_locked(key):
 
 
 def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None,
-                       fired_at=None):
+                       fired_at=None, clock_skew=0.0, hook=None, provenance=None):
     """Records an agent lifecycle event for (project, taskId). Raises
     ValueError for a state not in AGENT_STATES or a non-null agent kind
     not in AGENT_KINDS -- Handler._handle_agent_event turns that into a
@@ -1636,7 +1961,20 @@ def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None
     retried events can arrive in either order; one fired before the
     last applied event, or before a spawn/resume cleared the task, is
     stale and dropped. Callers that omit it keep arrival order.
+
+    ``clock_skew`` (task-209) is how far the clock that stamped
+    ``fired_at`` may be from this one: zero for a local hook (same
+    machine, same clock), the skew `--check` verifies for a worker's.
+    A stamp is accepted up to that far ahead, and an event is stale only
+    when it is older than the last one by more than that.
+
+    ``hook`` (task-226) is the hook point that fired, as the hook itself
+    reported it; anything but a short plain name is dropped. ``provenance``
+    (task-227) supplies optional Claude working-hook identifiers; only the
+    allowlist reaches the journal, with session_id replaced by a short hash.
     """
+    if not (isinstance(hook, str) and HOOK_NAME_RE.fullmatch(hook)):
+        hook = None
     if state not in AGENT_STATES:
         raise ValueError(f"invalid state: {state!r}")
     if agent_kind is not None and agent_kind not in AGENT_KINDS:
@@ -1645,10 +1983,11 @@ def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None
         key = _agent_event_key(project, task_id)
         previous = _agent_events.get(key) or {}
         if fired_at is not None:
-            # Same machine, same clock; clamp so a bogus future stamp
-            # cannot shadow every later event.
-            fired_at = min(fired_at, time.time())
-            if fired_at < (previous.get("firedAt") or 0):
+            # Clamp so a bogus future stamp cannot shadow every later
+            # event: to this clock for a local hook, within the checked
+            # skew for a worker's (task-209).
+            fired_at = min(fired_at, time.time() + clock_skew)
+            if fired_at + clock_skew < (previous.get("firedAt") or 0):
                 return
             previous["firedAt"] = fired_at
             _agent_events[key] = previous
@@ -1667,7 +2006,7 @@ def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None
                 # Preserve a corroborated idle/waiting state across duplicate
                 # Stop + notify signals; first candidates stay working.
                 if previous.get("state") not in ("finished", "waiting"):
-                    _set_agent_event_locked(key, "working", kind)
+                    _set_agent_event_locked(key, "working", kind, hook)
                 _schedule_codex_stop_locked(key)
             return
         _cancel_codex_stop_locked(key)
@@ -1678,11 +2017,11 @@ def record_agent_event(project, task_id, state, agent_kind=None, agent_name=None
                 # Duplicate hooks neither extend the deadline nor republish.
                 previous["lastEventAt"] = time.time()
                 return
-            _set_agent_event_locked(key, "working", kind)
+            _set_agent_event_locked(key, "working", kind, hook)
             _schedule_codex_wait_locked(key)
             return
         _cancel_codex_wait_locked(key)
-        _set_agent_event_locked(key, state, kind)
+        _set_agent_event_locked(key, state, kind, hook, provenance)
 
 
 def get_agent_lifecycle(project, task_id):
@@ -1985,7 +2324,7 @@ def _worktree_has_uncommitted_changes(config, project_name, task_id):
     return bool((proc.stdout or "").strip())
 
 
-def _branch_is_fully_merged(project_path, task_id):
+def _branch_is_fully_merged(project_path, task_id, ref=None):
     """True iff task_id's task/<id> branch tip is an ancestor of the
     project's current base branch (spawn.current_branch). Ancestry ALONE
     cannot tell "was merged" apart from "never produced anything" -- a
@@ -2004,13 +2343,14 @@ def _branch_is_fully_merged(project_path, task_id):
     (returncode 1 or anything else both read as False)."""
     import spawn  # local import: avoids a circular import at module load
 
-    branch = spawn.branch_name(task_id)
+    # task-208: `ref` is the fetched copy for a task on a machine.
+    branch = ref or spawn.branch_name(task_id)
     base_branch = spawn.current_branch(project_path)
     proc = run_git(["merge-base", "--is-ancestor", branch, base_branch], cwd=project_path)
     return proc.returncode == 0
 
 
-def _branch_already_merged(project_path, task_id, task_status):
+def _branch_already_merged(project_path, task_id, task_status, ref=None):
     """The real "already merged" decision (task-45): the branch tip must
     be an ancestor of the base branch AND the main-side task status must
     be Done. A genuine out-of-band merge (the TASK-1 incident in another
@@ -2037,7 +2377,7 @@ def _branch_already_merged(project_path, task_id, task_status):
     can never disagree about what "already merged" means."""
     if str(task_status or "").strip().lower() != "done":
         return False
-    return _branch_is_fully_merged(project_path, task_id)
+    return _branch_is_fully_merged(project_path, task_id, ref)
 
 
 def _read_main_task_status(repo_path, task_id):
@@ -2085,7 +2425,7 @@ def _task_view_or_none(cwd, task_id):
     return None
 
 
-def _branch_task_view(config, project, task_id, reuse=False):
+def _branch_task_view(config, project, task_id, reuse=False, location=None):
     """The task as its own `task/<id>` branch has it -- GET /api/task's
     "branchTask" -- read from wherever that branch actually lives
     (task-79), or None when there's nothing to read.
@@ -2114,8 +2454,19 @@ def _branch_task_view(config, project, task_id, reuse=False):
     worktree git still lists) reads as nothing, exactly as before.
 
     reuse=True (fleet_inbox only) skips the backlog run while the
-    source is unchanged; see _task_view_reuse below."""
+    source is unchanged; see _task_view_reuse below.
+
+    task-224: `location` (task_location) follows a task on a worker to
+    the hub's fetched copy of its branch, read through a detached
+    snapshot like a parked branch; a task in two places reads nothing."""
     import spawn  # local import: avoids a circular import at module load
+
+    if location is not None and location.conflict:
+        return None
+    if location is not None and location.machine:
+        ref = f"refs/remotes/{location.machine}/{spawn.branch_name(task_id)}"
+        with spawn.detached_snapshot(project["path"], ref) as (snapshot, error):
+            return None if error is not None else _task_view_or_none(snapshot, task_id)
 
     wt_dir = spawn.worktree_dir(config, project["name"], task_id)
     if os.path.isdir(wt_dir):
@@ -2285,6 +2636,38 @@ def recovery_tag_name(task_id, now=None):
     return f"abandoned/{task_id.lower()}-{stamp}"
 
 
+def stale_state_reason(survey, expected_tip, expected_paths):
+    """The 409 sentence when a discard/abandon survey no longer matches
+    the state its confirm described (task-121), or None. Shared by the
+    hub's routes and a task on a machine's (task-208).
+
+    Paths are compared order-insensitively: `git status --porcelain`
+    order is not part of what the user reviewed ("3 uncommitted
+    files" is), and a reordering that destroys nothing new should not
+    cost them a second confirm."""
+    branch = survey["branch"]
+    tip = survey["branchTip"]
+    if tip != expected_tip:
+        if expected_tip is None:
+            reason = f"{branch} exists now and did not when that preview was taken"
+        elif tip is None:
+            reason = f"{branch} is already gone -- it was at {expected_tip[:10]}"
+        else:
+            reason = (f"{branch} has moved: it is at {tip[:10]} now,"
+                      f" not {expected_tip[:10]}")
+        return (f"the repository changed after that preview -- {reason}. Nothing was"
+                " discarded; check again what would go.")
+
+    paths = survey["dirtyPaths"]
+    if paths is None or sorted(paths) != sorted(expected_paths):
+        now = "an unmeasurable number of" if paths is None else str(len(paths))
+        return ("the worktree changed after that preview -- it holds"
+                f" {now} uncommitted files now, not the"
+                f" {len(expected_paths)} the confirm named. Nothing was discarded; check"
+                " again what would go.")
+    return None
+
+
 def recovery_command(branch, sha):
     """The exact copy-pasteable line that puts a discarded branch back."""
     return f"git branch {branch} {sha}"
@@ -2343,9 +2726,14 @@ def latest_discard_times(repo_path):
     return newest
 
 
-def _load_project_board(config, project):
+def _load_project_board(config, project, machine_report=None):
     """Fetch and merge the task list for a single project. Never
-    raises: failures are captured as an "error" field on the result."""
+    raises: failures are captured as an "error" field on the result.
+
+    `machine_report` (task-224) is the refresh's machine round trip, a
+    future, for a project with `machines`: each task's location is
+    derived from it once it is in -- the backlog read above it runs
+    alongside."""
     import harvest  # local import: avoids a circular import at module load
     import spawn  # local import: avoids a circular import at module load
 
@@ -2372,14 +2760,25 @@ def _load_project_board(config, project):
 
     tasks = list_data.get("tasks") or []
 
+    # task-224: each task's location, from the hub's own refs and
+    # worktrees plus this refresh's one round trip per machine (waited
+    # for here, after the slow backlog read, so the fetch it ran is in).
+    placement = None
+    if project.get("machines") and machine_report is not None:
+        import remote_harvest  # local import: only for a project with machines
+
+        placement = remote_harvest.board_placement(config, project, machine_report.result())
+
     # One `git for-each-ref` call for the whole project (never one per
     # task) to flag which tasks have an unmerged task/<id> branch. main's
     # status/AC/notes for such a task can be stale (see harvest.py's gate
     # 2 and GET /api/task's "branchTask") -- the frontend uses this flag
     # to show the Merge button and an "unmerged branch" indicator without
     # waiting on main to agree the task is Done.
+    # task-208/task-224: for a project with machines, its task branches
+    # also include the hub's fetched copies (refs/remotes/<machine>/task/*).
     spawn_branch_ids = {
-        harvest.task_id_from_branch(b) for b in harvest.list_task_branches(path)
+        harvest.task_id_from_branch(b) for b in harvest.task_branches(config, project)
     }
     spawn_branch_ids.discard(None)
 
@@ -2414,7 +2813,9 @@ def _load_project_board(config, project):
         merged = dict(task)
         task_id = merged.get("id")
         merged["ready"] = merged["isReady"]
-        has_branch = task_id in spawn_branch_ids
+        location = placement.locate(task_id) if placement is not None else None
+        machine = location.machine if location is not None else None
+        has_branch = task_id in spawn_branch_ids or bool(location and location.found)
         merged["hasSpawnBranch"] = has_branch
         merged.update(get_agent_lifecycle(name, task_id))
         # Only checked for tasks that actually have a branch (one git
@@ -2423,13 +2824,22 @@ def _load_project_board(config, project):
         # agent's session died mid-work, leaving uncommitted changes
         # behind in its worktree. See GET /api/resume and the drawer's
         # "Resume agent" action.
-        merged["worktreeDirty"] = has_branch and _worktree_has_uncommitted_changes(config, name, task_id)
+        merged["worktreeDirty"] = (has_branch and machine is None
+                                   and _worktree_has_uncommitted_changes(config, name, task_id))
         # task-70: null for a task without a branch; otherwise where its
         # branch is checked out (see `checkouts` above). Only the external
         # kind costs an extra git call (the branch's last-commit age).
         merged["branchCheckout"] = (
             spawn.checkout_state(config, project, task_id, checkouts=checkouts) if has_branch else None
         )
+        if has_branch and machine:
+            # task-208: read from the worker's bare repository by this
+            # refresh's round trip; unknown whenever that machine did not
+            # answer -- never "none", which the board shows as parked.
+            merged["branchCheckout"] = placement.branch_checkout(task_id, machine)
+        elif has_branch and location is not None and location.conflict:
+            # task-224: in two places -- no single checkout to describe.
+            merged["branchCheckout"] = {"kind": "unknown", "path": None}
         # task-43/task-45: a branch fully merged into the base branch AND
         # whose main-side task is Done -- whether by Centrale's own
         # harvest or entirely out-of-band (the real TASK-1 incident in
@@ -2443,7 +2853,10 @@ def _load_project_board(config, project):
         # so this stays the same one-call-per-branch-bearing-task cost
         # discipline as worktreeDirty just above -- the git ancestry
         # call itself is skipped entirely unless status is Done.
-        merged["alreadyMerged"] = has_branch and _branch_already_merged(path, task_id, merged.get("status"))
+        merged["alreadyMerged"] = (has_branch and not (location is not None and location.conflict)
+                                   and _branch_already_merged(
+            path, task_id, merged.get("status"),
+            ref=f"refs/remotes/{machine}/{spawn.branch_name(task_id)}" if machine else None))
         # task-91: the id in "milestone" stays exactly as backlog gave it
         # -- it is what the frontend filters on, and it survives a
         # rename. "milestoneTitle" is display only, and is None whenever
@@ -2457,6 +2870,9 @@ def _load_project_board(config, project):
         # listing failed -- see latest_discard_times).
         merged["lastDiscardedAt"] = discard_times.get(task_id)
         merged["taskFileLocked"] = str(task_id or "").lower() in locked_files
+        # task-224: where the task is ("location"), and for a task on a
+        # worker its machine and worktree there; nothing without machines.
+        merged.update(location_fields(config, location))
         merged_tasks.append(merged)
         status = merged.get("status")
         if status and status not in observed_statuses:
@@ -2485,10 +2901,19 @@ def get_board(config, force=False):
     """
     projects = config.get("projects") or []
     results_by_name = {}
+    machine_report = None
+    if config.get("machines"):
+        # doc-3: one batched round trip per machine per refresh, alongside
+        # the project loads rather than after them. Never with no machines.
+        import machines  # local import: avoids a circular import at module load
+
+        machine_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        machine_report = machine_pool.submit(_refresh_machines, config)
+        machine_pool.shutdown(wait=False)
     if projects:
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(projects)) as pool:
             future_to_name = {
-                pool.submit(_load_project_board, config, project): project["name"]
+                pool.submit(_load_project_board, config, project, machine_report): project["name"]
                 for project in projects
             }
             for future in future_to_name:
@@ -2506,8 +2931,38 @@ def get_board(config, force=False):
 
     ordered = [results_by_name[p["name"]] for p in projects]
     board = {"projects": ordered}
+    if machine_report is not None:
+        import machines  # local import: avoids a circular import at module load
+
+        import remote  # local import: avoids a circular import at module load
+
+        board["machines"] = machines.reach_summary(machine_report.result())
+        # task-207/task-224: each project's machines, the task/* fetch from
+        # each with its age, and the teardowns still owed to a machine
+        # that did not answer.
+        for entry, project in zip(ordered, projects):
+            if project.get("machines"):
+                entry["machines"] = list(project["machines"])
+                entry["defaultMachine"] = project.get("defaultMachine") or HUB
+                entry["fetches"] = [remote.fetch_status(project, m) for m in project["machines"]]
+        board["owedTeardowns"] = remote.owed_teardowns()
 
     return board
+
+
+def _refresh_machines(config):
+    """A board refresh's machine work: the batched reachability round trip,
+    then (task-207) the task/* fetch from every machine that answered.
+    Only ever called with machines configured."""
+    import machines  # local import: avoids a circular import at module load
+    import remote  # local import: avoids a circular import at module load
+
+    import remote_harvest  # local import: avoids a circular import at module load
+
+    # task-208: the same round trip reads each project's checkouts there.
+    report = machines.refresh(config, remote_harvest.refresh_reads(config))
+    remote.after_refresh(config, report)
+    return report
 
 
 # ---------------------------------------------------------------------------
@@ -2552,12 +3007,16 @@ def list_sessions(strict=False):
     return sessions
 
 
-def record_session_started(project, task_id, agent, timestamp=None):
+def record_session_started(project, task_id, agent, timestamp=None, machine=None):
+    """`machine` names the worker a session started on (task-224), so the
+    hub's own tmux survey never reads its absence as an end."""
     key = _agent_event_key(project, task_id)
     with _agent_events_lock, fleet_history.lock:
         fleet_history.last_survey = time.monotonic()
-        fleet_history.sessions[key] = {"created": None, "observedAt": time.monotonic()}
-        fleet_history.append(*key, agent, "spawn", timestamp=timestamp)
+        fleet_history.sessions[key] = {"created": None, "observedAt": time.monotonic(),
+                                       **({"machine": machine} if machine else {})}
+        fleet_history.append(*key, agent, "spawn", timestamp=timestamp,
+                             **({"machine": machine} if machine else {}))
 
 
 def record_session_ended(project, task_id):
@@ -2582,6 +3041,9 @@ def observe_fleet_sessions(sessions, config, surveyed_at=None):
     the response and project counts always come from this fresh tmux survey.
     """
     surveyed_at = time.monotonic() if surveyed_at is None else surveyed_at
+    # task-209/task-224: this survey is of the hub's tmux only. A session
+    # started on another machine is not in it, and its absence here ends
+    # nothing; the journal entry that session's start wrote says so.
     live = {}
     for session in sessions:
         project, task_id = _parse_session_project_and_task(session.get("name", ""), config)
@@ -2592,6 +3054,8 @@ def observe_fleet_sessions(sessions, config, surveyed_at=None):
             return
         fleet_history.last_survey = surveyed_at
         for key, previous in list(fleet_history.sessions.items()):
+            if previous.get("machine") and key not in live:
+                continue
             if previous["observedAt"] > surveyed_at:
                 live.pop(key, None)
                 continue
@@ -2653,6 +3117,74 @@ def restore_agent_states(config, sessions):
             }
         restored.append(key)
     return restored
+
+
+def restore_local_pane_states(config, sessions):
+    """Read each live local session's pane note before journal restore.
+
+    A pane option lives with its agent, so its current hook claim can restore
+    working too. A missing or malformed note leaves decision-5's journal
+    fallback available for older sessions (task-223).
+    """
+    restored = []
+    for session in sessions:
+        project, task_id = _parse_session_project_and_task(session.get("name", ""), config)
+        if project is None:
+            continue
+        try:
+            proc = run_tmux(["list-panes", "-t", "=" + session["name"] + ":",
+                             "-F", "#{@centrale_state}"])
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if proc.returncode != 0:
+            continue
+        notes = []
+        for line in (proc.stdout or "").splitlines():
+            parts = line.split(" ")
+            if len(parts) != 2 or parts[0] not in AGENT_STATES:
+                continue
+            try:
+                fired_at = float(parts[1])
+            except ValueError:
+                continue
+            if math.isfinite(fired_at):
+                notes.append((fired_at, parts[0]))
+        if not notes:
+            continue
+        fired_at, state = max(notes)
+        key = _agent_event_key(project["name"], task_id)
+        row = fleet_history.last_agent_state(*key)
+        try:
+            created = float(session.get("created"))
+        except (TypeError, ValueError):
+            created = None
+        same_session = (created is not None and row.get("timestamp", 0) >= created
+                        and (row.get("created") is None
+                             or str(row["created"]) == str(session.get("created"))))
+        kind = row.get("agentKind") if same_session and row.get("agentKind") in AGENT_KINDS else None
+        if restore_remote_state(*key, state, kind, fired_at):
+            restored.append(key)
+    return restored
+
+
+def restore_remote_state(project, task_id, state, kind, fired_at):
+    """Boot-time restore of a worker pane's read-back state (task-209).
+
+    Unlike restore_agent_states' journal rows, this is not a memory: it
+    is the state the pane's own hook set and still holds, read from the
+    worker just now, so it is restored as it stands -- ``working``
+    included (decision-5, amended). Like that restore it writes no
+    journal row and publishes nothing; remote_status.announce does the
+    announcing. Returns False when a hook already reported this task."""
+    key = _agent_event_key(project, task_id)
+    with _agent_events_lock:
+        if _agent_events.get(key, {}).get("state"):
+            return False
+        _agent_events[key] = {
+            "state": state, "agentKind": kind, "agent": fleet_history.agent(*key),
+            "stateSince": fired_at, "lastEventAt": fired_at, "firedAt": fired_at,
+        }
+    return True
 
 
 def announce_restart_states(config, sessions):
@@ -2723,7 +3255,9 @@ def parked_status(config, session, state, since, deliveries, now=None):
     dialog, last_line = None, None
     if session_preview_mode(config) != "off":
         try:
-            lines = capture_session_pane(session["name"], MAX_SESSION_PANE_LINES)
+            remote_capture = remote_pane_capture.get(key)
+            lines = (remote_capture(MAX_SESSION_PANE_LINES) if remote_capture is not None
+                     else capture_session_pane(session["name"], MAX_SESSION_PANE_LINES))
             dialog = detect_pane_dialog(lines)
             shown = [line.strip() for line in lines if line.strip()]
             last_line = shown[-1] if shown else None
@@ -2747,7 +3281,11 @@ def get_fleet(config, window=fleet.DEFAULT_WINDOW, arm_input=True):
     surveyed_at = time.monotonic()
     sessions = list_sessions(strict=True)
     observe_fleet_sessions(sessions, config, surveyed_at)
-    projects = [{"name": p["name"], "maxAgents": p.get("maxAgents"), "agentCount": 0}
+    # task-210: workers' sessions join the list after the hub's tmux survey,
+    # which they are not part of (observe_fleet_sessions above).
+    sessions = sessions + remote_session_rows(config)
+    projects = [{"name": p["name"], "maxAgents": p.get("maxAgents"), "agentCount": 0,
+                 **({"machines": list(p["machines"])} if p.get("machines") else {})}
                 for p in config.get("projects", [])]
     by_name = {p["name"]: p for p in projects}
     agents = []
@@ -2756,10 +3294,17 @@ def get_fleet(config, window=fleet.DEFAULT_WINDOW, arm_input=True):
         if project is None:
             continue
         by_name[project["name"]]["agentCount"] += 1
-        agents.append({"project": project["name"], "taskId": task_id.upper(),
-                       "session": session["name"], "created": session.get("created"),
-                       "attached": session.get("attached", False),
-                       **get_fleet_lifecycle(project["name"], task_id)})
+        agent = {"project": project["name"], "taskId": task_id.upper(),
+                 "session": session["name"], "created": session.get("created"),
+                 "attached": session.get("attached", False),
+                 **get_fleet_lifecycle(project["name"], task_id)}
+        if session.get("machine"):
+            agent.update(machine=session["machine"], worktree=session["worktree"])
+            if session["reach"] != "reachable":
+                # task-210: no live read of this agent; "unknown" would
+                # claim we looked and could not tell.
+                agent["state"] = "unreachable"
+        agents.append(agent)
     snapshot = fleet_history.snapshot(window)
     snapshot["history"] = [r for r in snapshot["history"] if r["project"] in by_name]
     snapshot.update(projects=projects, agents=agents,
@@ -2781,6 +3326,23 @@ def get_fleet(config, window=fleet.DEFAULT_WINDOW, arm_input=True):
                                     a["stateSince"], entries)
     snapshot["sessionPreviewMode"] = session_preview_mode(config)
     snapshot["needsYou"], snapshot["needsYouErrors"] = fleet_inbox(config, snapshot, entries, arm_input)
+    if config.get("machines"):
+        import machines  # local import: avoids a circular import at module load
+
+        # doc-3: one batched round trip per machine per fleet refresh.
+        snapshot["machines"] = machines.reach_summary(machines.refresh(config))
+        # task-210: capacity per machine, the hub's own projects included.
+        by_machine = {m["name"]: m for m in snapshot["machines"]}
+        for entry in snapshot["machines"]:
+            entry["agentCount"] = 0
+            entry["maxAgents"] = next(m.get("maxAgents") for m in config["machines"]
+                                      if m["name"] == entry["name"])
+        hub = {"agentCount": 0}
+        # task-224: each agent counts where its session runs.
+        for a in agents:
+            machine = a.get("machine")
+            (by_machine[machine] if machine in by_machine else hub)["agentCount"] += 1
+        snapshot["hub"] = hub
     return snapshot
 
 
@@ -2817,10 +3379,10 @@ def fleet_inbox(config, snapshot, deliveries, arm_input=True):
         project, task_id = a["project"], a["taskId"]
         if a["state"] == "waiting" and session_preview_mode(config) != "off":
             try:
-                lines = capture_session_pane(a["session"], MAX_SESSION_PANE_LINES)
+                lines = capture_agent_pane((project, task_id), MAX_SESSION_PANE_LINES)
                 dialog = detect_pane_dialog(lines)
                 if dialog:
-                    if arm_input:
+                    if arm_input and not a.get("machine"):
                         record_pane_capture(a["session"])
                     add("permission", project, task_id, a["agent"], a["stateSince"],
                         "Waiting hook + pane dialog: " + dialog, lines=lines,
@@ -2831,7 +3393,7 @@ def fleet_inbox(config, snapshot, deliveries, arm_input=True):
             add("parked", project, task_id, a["agent"], a["parked"]["since"],
                 "Agent state " + a["state"] + " + " + a["parked"]["reason"],
                 text=a["parked"]["lastLine"] or "", lastLine=a["parked"]["lastLine"])
-        elif a["state"] == "idle":
+        elif a["state"] == "idle" and not a.get("machine"):
             # A live Centrale worker writes its report on its own worktree,
             # not main. Never restore a finished badge from durable history.
             cwd = spawn.worktree_dir(config, project, task_id)
@@ -3250,7 +3812,7 @@ def _is_session_gone(stderr_lowered):
     )
 
 
-def send_session_input(name, kind, value):
+def send_session_input(name, kind, value, runner=None):
     """Deliver a validated reply into the live tmux session `name`
     (task-61) through run_tmux. Exact-match target "=<name>:" for the
     same reason capture_session_pane uses it (a bare prefix could reach a
@@ -3296,6 +3858,7 @@ def send_session_input(name, kind, value):
     or no tmux server is running, SessionInputError(status=500) on any
     other tmux failure. Returns the list of argv lists that were run."""
     target = f"={name}:"
+    runner = run_tmux if runner is None else runner
 
     def fail(args, proc):
         stderr = (proc.stderr or proc.stdout or "").strip()
@@ -3307,7 +3870,7 @@ def send_session_input(name, kind, value):
 
     if kind == "key":
         args = ["send-keys", "-t", target, value]
-        proc = run_tmux(args)
+        proc = runner(args)
         if proc.returncode != 0:
             fail(args, proc)
         return [args]
@@ -3316,19 +3879,49 @@ def send_session_input(name, kind, value):
     load = ["load-buffer", "-b", buf, "-"]
     paste = ["paste-buffer", "-d", "-p", "-b", buf, "-t", target]
     enter = ["send-keys", "-t", target, "Enter"]
-    proc = run_tmux(load, input=value)
+    proc = runner(load, input=value)
     if proc.returncode != 0:
         fail(load, proc)
-    proc = run_tmux(paste)
+    proc = runner(paste)
     if proc.returncode != 0:
         # -d never ran, so the buffer is still there: drop it (best
         # effort -- the paste failure is the error worth reporting).
-        run_tmux(["delete-buffer", "-b", buf])
+        runner(["delete-buffer", "-b", buf])
         fail(paste, proc)
-    proc = run_tmux(enter)
+    proc = runner(enter)
     if proc.returncode != 0:
         fail(enter, proc)
     return [load, paste, enter]
+
+
+def send_task_input(config, project, task_id, name, kind, value,
+                    expected_machine=None, check_machine=False):
+    """Send an input to the task's current machine (task-230)."""
+    location = task_location(config, project, task_id)
+    if location is not None and location.conflict:
+        raise SessionInputError(location.conflict_reason(), status=409)
+    machine_name = location.machine if location is not None else None
+    if check_machine and machine_name != expected_machine:
+        raise SessionInputError(
+            f"task location changed before input: expected {expected_machine or 'hub'}, "
+            f"found {machine_name or 'hub'}", status=409)
+    if location is None or not location.machine:
+        return send_session_input(name, kind, value)
+
+    import machines
+
+    machine = machines.machine_named(config, location.machine)
+
+    def remote_tmux(args, input=None):
+        result = machines.run_on_machine(
+            config, location.machine, [*machines.tmux_argv(machine), *args], input=input)
+        if result.status != machines.ANSWERED:
+            raise SessionInputError(
+                f"worker {location.machine} did not confirm tmux {args[0]}: {result.stderr or result.status}",
+                status=503)
+        return result
+
+    return send_session_input(name, kind, value, runner=remote_tmux)
 
 
 # ---------------------------------------------------------------------------
@@ -3552,15 +4145,15 @@ def _delivery_lock_for(name):
         return _delivery_session_locks.setdefault(name, threading.Lock())
 
 
-def _delivery_pane_dialog(name, lines):
+def _delivery_pane_dialog(name, lines, capture=None):
     # Inline Codex may leave its loading marker in scrollback. Confirm
     # that marker on the current screen; keep scrollback for echo counts.
     if codex_resume_loading(lines):
-        lines = capture_session_pane(name, 0)
+        lines = (capture or capture_session_pane)(name, 0)
     return detect_pane_dialog(lines)
 
 
-def deliver_message(name, text):
+def deliver_message(name, text, capture=None, send=None):
     """Paste `text` into session `name` and confirm it arrived. Returns a
     dict with "outcome" -- "delivered", "no-session", "dialog", "no-echo"
     or "tmux-error" -- plus "echo"/"echoAt" when delivered, "dialog" (the
@@ -3581,10 +4174,12 @@ def deliver_message(name, text):
     cannot tell a submitted prompt from one still sitting in the composer
     (both render behind the same glyph), and it says nothing about whether
     the agent has acted on it yet."""
+    capture = capture_session_pane if capture is None else capture
+    send = send_session_input if send is None else send
     with _delivery_lock_for(name):
         try:
-            before = capture_session_pane(name, DELIVERY_CAPTURE_LINES)
-            dialog = _delivery_pane_dialog(name, before)
+            before = capture(name, DELIVERY_CAPTURE_LINES)
+            dialog = _delivery_pane_dialog(name, before, capture)
         except PaneCaptureError as exc:
             if exc.status == 404:
                 return {"outcome": "no-session", "reason": f"no live session {name}"}
@@ -3599,7 +4194,7 @@ def deliver_message(name, text):
 
         baseline = len(echo_lines(before, text))
         try:
-            send_session_input(name, "text", text)
+            send(name, "text", text)
         except SessionInputError as exc:
             if exc.status == 404:
                 return {"outcome": "no-session", "reason": f"no live session {name}"}
@@ -3610,7 +4205,7 @@ def deliver_message(name, text):
         while True:
             _delivery_sleep(DELIVERY_ECHO_POLL_SECONDS)
             try:
-                after = capture_session_pane(name, DELIVERY_CAPTURE_LINES)
+                after = capture(name, DELIVERY_CAPTURE_LINES)
             except PaneCaptureError as exc:
                 if exc.status == 404:
                     return {
@@ -3626,7 +4221,7 @@ def deliver_message(name, text):
                 break
 
         try:
-            dialog = _delivery_pane_dialog(name, last)
+            dialog = _delivery_pane_dialog(name, last, capture)
         except PaneCaptureError as exc:
             return {"outcome": "no-session" if exc.status == 404 else "tmux-error",
                     "reason": f"text was sent but the current pane check failed: {exc}"}
@@ -3804,7 +4399,15 @@ def enrich_sessions_with_files(sessions, config):
             continue
         session["project"] = project["name"]
         session.update(get_agent_lifecycle(project["name"], task_id_lower))
+        if session.get("machine"):
+            # task-210: its worktree is on the worker, so there is nothing to
+            # read here; an unreachable machine has no live state at all.
+            if session["reach"] != "reachable":
+                session["agentState"] = "unreachable"
         lifecycle = get_fleet_lifecycle(project["name"], task_id_lower)
+        session["stateSince"] = lifecycle["stateSince"]  # task-226
+        if session.get("machine") and session["reach"] != "reachable":
+            continue
         if lifecycle["state"] in ("finished", "idle", "unknown"):
             if deliveries is None:
                 try:
@@ -3813,6 +4416,8 @@ def enrich_sessions_with_files(sessions, config):
                     deliveries = []
             session["parked"] = parked_status(config, session, lifecycle["state"],
                                               lifecycle["stateSince"], deliveries)
+        if session.get("machine"):
+            continue
         wt_dir = spawn.worktree_dir(config, project["name"], task_id_lower)
         files, total = _collect_touched_files(wt_dir)
         if files is None:
@@ -4238,6 +4843,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         response = dict(data)
+        # task-210/task-224: where the task is, read from the hub's own
+        # refs and worktrees -- no ssh on a drawer open; the board's
+        # refresh asks the machines. Nothing added without machines.
+        location = task_location(self.config, project, task_id, live=False)
+        response.update(location_fields(self.config, location))
 
         # This task's Done status, checked ACs, and implementation notes
         # are committed only on task/<id> until that branch is merged --
@@ -4248,7 +4858,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # means no "branchTask" in the response, not a failed request
         # (the main-checkout view above is still a valid response on its
         # own).
-        branch_data = _branch_task_view(self.config, project, task_id)
+        branch_data = _branch_task_view(self.config, project, task_id, location=location)
         if branch_data is not None:
             response["branchTask"] = branch_data
 
@@ -4271,6 +4881,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send_error_json(502, str(exc))
             return
         observe_fleet_sessions(sessions, self.config, surveyed_at)
+        sessions = sessions + remote_session_rows(self.config)
         enrich_sessions_with_files(sessions, self.config)
         self._send_json(200, {"sessions": sessions})
 
@@ -4313,7 +4924,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # drawer's ~2s poll tick keeps costing exactly one tmux call.
         name = spawn.session_name(project_name, task_id)
         try:
-            lines = capture_session_pane(name, max_lines)
+            location = task_location(self.config, project, task_id)
+            lines = capture_task_pane(self.config, project, task_id, max_lines, location=location)
         except PaneCaptureError as exc:
             if exc.status == 404:
                 self._send_error_json(404, f"no live session for {project_name}/{task_id}")
@@ -4321,7 +4933,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._send_error_json(exc.status, str(exc))
             return
 
-        record_pane_capture(name)  # task-61: arms POST /api/session-input for this session
+        # task-230: a capture from one worker cannot arm input to another.
+        record_pane_capture(pane_capture_key(name, location.machine if location else None))
         captured_at = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
         self._send_json(200, {
             "session": name,
@@ -4364,6 +4977,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_board(query)
             elif path == "/api/task":
                 self._handle_task(query)
+            elif path == "/api/system":
+                import system_status
+                self._send_json(200, system_status.cache.get(self.config))
             elif path == "/api/fleet":
                 self._handle_fleet(urllib.parse.parse_qs(parsed.query, keep_blank_values=True))
             elif path == "/api/sessions":
@@ -4382,6 +4998,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self._handle_discard_preview(query)
             elif path == "/api/settings":
                 self._handle_settings_get()
+            elif path == "/api/machine-check":
+                self._handle_machine_check(query)
             elif path == "/api/agent-guide":
                 self._handle_agent_guide()
             else:
@@ -4458,6 +5076,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         self._send_json(200, settings.current_settings(self.config))
 
+    def _handle_machine_check(self, query):
+        import machines
+
+        name = (query.get("name") or [None])[0]
+        machine = next((m for m in self.config.get("machines") or [] if m["name"] == name), None)
+        if machine is None:
+            self._send_error_json(404, f"unknown machine: {name}")
+            return
+        lines = machines._doctor_machine(self.config, machine, machines.agent_executables(self.config), {})
+        self._send_json(200, {"name": name, "counts": doctor_counts(lines),
+                              "lines": [f"[{level}] {message}" for level, message in lines]})
+
     def _handle_agent_guide(self):
         origin = f"http://127.0.0.1:{self.server.server_address[1]}".encode()
         data = AGENT_GUIDE.replace(b"{{CENTRALE_URL}}", origin)
@@ -4506,6 +5136,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         except settings.SettingsError as exc:
             self._send_error_json(exc.status, str(exc))
             return
+        if "machines" in body:
+            import remote_status  # local import: machine saves update live control connections
+
+            result["warnings"].extend(remote_status.reconcile(self.config) or [])
         if "statusPage" in body:
             import status_page  # local import: avoids a circular import at module load
 
@@ -4549,6 +5183,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # task-171: an explicit agent choice, validated by spawn.spawn
         # (unknown -> 400); absent means "the task's assignee".
         agent = body.get("agent")
+        # task-224: an optional placement -- "hub" or one of the project's
+        # machines; absent means its defaultMachine, else the hub
+        # (spawn.placement, which refuses anything else). Passed only when
+        # given, so a request without it calls spawn exactly as before.
+        placement = {"machine": body["machine"]} if "machine" in body else {}
+        first_message = {}
+        if "firstMessage" in body:
+            try:
+                first_message["first_message"] = spawn.validate_first_message(body["firstMessage"])
+            except spawn.SpawnError as exc:
+                self._send_error_json(exc.status, str(exc))
+                return
 
         # task-121: creating this task's worktree is a lifecycle
         # operation like any other, so it waits for one already running
@@ -4557,7 +5203,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # unaffected.
         try:
             with task_lifecycle_lock(project, task_id):
-                result = spawn.spawn(self.config, project, task_id, agent=agent)
+                result = spawn.spawn(self.config, project, task_id, agent=agent,
+                                     **placement, **first_message)
         except spawn.SpawnError as exc:
             self._send_error_json(exc.status, str(exc))
             return
@@ -4580,10 +5227,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # reconcile variant IS a resume (same validation/409/worktree
         # path, see spawn.resume), differing only in the prompt it runs.
         reconcile = body.get("reconcile") is True
+        # task-224: a resume goes where the task is; "machine" only places
+        # a task that has no location yet, exactly as for a spawn.
+        placement = {"machine": body["machine"]} if "machine" in body else {}
 
         try:
             with task_lifecycle_lock(project, task_id):  # task-121, as for spawn above
-                result = spawn.resume(self.config, project, task_id, reconcile=reconcile)
+                result = spawn.resume(self.config, project, task_id, reconcile=reconcile, **placement)
         except spawn.SpawnError as exc:
             self._send_error_json(exc.status, str(exc))
             return
@@ -4673,7 +5323,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         try:
             record_agent_event(project_name, task_id, state, agent_kind=agent_kind,
-                               agent_name=agent_name, fired_at=fired_at)
+                               agent_name=agent_name, fired_at=fired_at,
+                               hook=body.get("hook"), provenance=body)
         except ValueError as exc:
             self._send_error_json(400, str(exc))
             return
@@ -4728,6 +5379,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if not task_id or not TASK_ID_RE.match(task_id):
             self._send_error_json(400, "invalid or missing task id")
+            return
+
+        project = self._placed_or_refuse(project, task_id)
+        if project is None:
+            return
+        if project.get("machine"):
+            # task-207: the session, its linked windows and the sweep are on
+            # the worker; an unreachable worker owes the teardown (202).
+            import remote  # local import: avoids a circular import at module load
+            status, payload = remote.end_session(self.config, project, task_id)
+            if status >= 400:
+                self._send_error_json(status, payload["error"])
+            else:
+                self._send_json(status, payload)
             return
 
         try:
@@ -4826,7 +5491,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             )
             return
 
-        age = pane_capture_age(name)
+        location = task_location(self.config, project, task_id)
+        if location is not None and location.conflict:
+            self._send_error_json(409, location.conflict_reason())
+            return
+        machine_name = location.machine if location else None
+        age = pane_capture_age(pane_capture_key(name, machine_name))
         if age is None or age > SESSION_INPUT_MAX_CAPTURE_AGE_SECONDS:
             self._send_json(409, {
                 "error": (
@@ -4839,7 +5509,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         try:
-            send_session_input(name, kind, value)
+            send_task_input(self.config, project, task_id, name, kind, value,
+                            expected_machine=machine_name, check_machine=True)
         except SessionInputError as exc:
             if exc.status == 404:
                 self._send_error_json(404, f"no live session for {project_name}/{task_id}")
@@ -4910,7 +5581,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 "reason": f"session {name} does not resolve to a known board task",
             }
         else:
-            result = deliver_message(name, text)
+            project = next(p for p in self.config["projects"] if p["name"] == project_name)
+            location = task_location(self.config, project, task_id)
+            if location is not None and location.conflict:
+                result = {"outcome": "tmux-error", "reason": location.conflict_reason()}
+            elif location is not None and location.machine:
+                machine_name = location.machine
+                worker_capture = remote_task_pane_capture.get(
+                    (machine_name, project_name, task_id.upper()))
+                if worker_capture is None:
+                    result = {"outcome": "tmux-error", "reason": "worker pane capture is unavailable"}
+                else:
+                    capture = lambda _name, lines: worker_capture(lines)
+                    send = lambda _name, kind, value: send_task_input(
+                        self.config, project, task_id, name, kind, value,
+                        expected_machine=machine_name, check_machine=True)
+                    result = deliver_message(name, text, capture=capture, send=send)
+            else:
+                result = deliver_message(name, text)
 
         entry = {
             "id": uuid.uuid4().hex,
@@ -4989,7 +5677,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         name = spawn.session_name(project_name, task_id)
-        live = self._session_is_live(name)
+        live = self._session_is_live(name, project, task_id)
         if live is None:
             return
         if live:
@@ -5003,7 +5691,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with task_lifecycle_lock(project_name, task_id):
             # Re-checked under the lock, which spawn/resume also hold
             # while they start a session.
-            live = self._session_is_live(name)
+            live = self._session_is_live(name, project, task_id)
             if live is None:
                 return
             if live:
@@ -5012,17 +5700,46 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 )
                 return
             try:
-                result = spawn.commit_ruling(self.config, project, task_id, sender, text)
+                location = task_location(self.config, project, task_id)
+                if location is not None and location.conflict:
+                    self._send_error_json(409, location.conflict_reason())
+                    return
+                if location is not None and location.machine:
+                    import remote
+                    result = remote.commit_ruling(
+                        self.config, location.placed(), task_id, sender, text)
+                else:
+                    result = spawn.commit_ruling(self.config, project, task_id, sender, text)
             except spawn.SpawnError as exc:
                 self._send_error_json(exc.status, str(exc))
                 return
         result["mode"] = "committed"
         self._send_json(200, result)
 
-    def _session_is_live(self, name):
+    def _session_is_live(self, name, project=None, task_id=None):
         """True/False, or None after answering 502 itself: a session list
         that cannot be read must not read as "no agent" and send the
         ruling around a live one."""
+        location = task_location(self.config, project, task_id) if project is not None else None
+        if location is not None and location.conflict:
+            self._send_error_json(409, location.conflict_reason())
+            return None
+        if location is not None and location.machine:
+            import machines
+
+            machine = machines.machine_named(self.config, location.machine)
+            result = machines.run_on_machine(
+                self.config, location.machine,
+                [*machines.tmux_argv(machine), "has-session", "-t", f"={name}"])
+            if result.status != machines.ANSWERED:
+                self._send_error_json(502, f"failed to check session on {location.machine}: {result.stderr or result.status}")
+                return None
+            if result.returncode == 0:
+                return True
+            if _is_session_gone((result.stderr or "").lower()):
+                return False
+            self._send_error_json(502, f"failed to check session on {location.machine}: {result.stderr or result.returncode}")
+            return None
         try:
             return any(s.get("name") == name for s in list_sessions())
         except BacklogError as exc:
@@ -5078,9 +5795,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         (409) if a live tmux session is still running
         for this task, or if the branch exists but isn't actually fully
         merged. Collects the worktree's uncommitted/untracked paths
-        (dequoted) BEFORE removing it, so the response can name exactly
-        what a forced removal is about to discard -- the TASK-9 lesson
-        that untracked files can be real unsaved work.
+        (dequoted) before removal. task-220: dirty paths get a 409
+        with that list unless force is true, so callers can save them.
 
         task-80: a branch checked out in a worktree Centrale does NOT
         manage (spawn.checkout_state kind "external" -- an out-of-band
@@ -5146,6 +5862,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # discard, an abandon, a merge or a re-spawn of the same task
         # waits rather than interleaving its git operations with these.
         with task_lifecycle_lock(project_name, task_id):
+            project = self._placed_or_refuse(project, task_id)
+            if project is None:
+                return
+            if project.get("machine"):
+                # task-207: the worktree and branch live in the worker's
+                # bare repository; the merged check runs here, on a fresh
+                # fetch of the branch.
+                import remote  # local import: avoids a circular import at module load
+                status, payload = remote.cleanup(self.config, project, task_id, force)
+                if status >= 400:
+                    self._send_json(status, payload)
+                else:
+                    self._send_json(status, payload)
+                return
             self._cleanup_branch_locked(project, project_name, task_id, repo_path, force)
 
     def _cleanup_branch_locked(self, project, project_name, task_id, repo_path, force=False):
@@ -5198,6 +5928,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         discarded_paths = []
         killed_orphans = []
         if wt_exists:
+            status_proc = run_git(["status", "--porcelain"], cwd=wt_dir)
+            if status_proc.returncode != 0:
+                stderr = (status_proc.stderr or status_proc.stdout or "unknown error").strip()
+                self._send_error_json(500, f"failed to check worktree status: {stderr}")
+                return
+            discarded_paths = _dirty_paths_from_status(status_proc.stdout or "")
+            if discarded_paths and not force:
+                self._send_json(409, {
+                    "error": "worktree has uncommitted changes; pass force to discard them",
+                    "discardedPaths": discarded_paths,
+                })
+                return
+
             orphan_pids = _pids_with_cwd_under(wt_dir)
             if orphan_pids and not force:
                 pids_str = ", ".join(str(pid) for pid in orphan_pids)
@@ -5211,13 +5954,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 for pid in orphan_pids:
                     kill_process(pid)
                 killed_orphans = orphan_pids
-
-            status_proc = run_git(["status", "--porcelain"], cwd=wt_dir)
-            if status_proc.returncode != 0:
-                stderr = (status_proc.stderr or status_proc.stdout or "unknown error").strip()
-                self._send_error_json(500, f"failed to check worktree status: {stderr}")
-                return
-            discarded_paths = _dirty_paths_from_status(status_proc.stdout or "")
 
             remove_proc = run_git(["worktree", "remove", "--force", wt_dir], cwd=repo_path)
             if remove_proc.returncode != 0:
@@ -5392,6 +6128,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if identity is None:
             return
         project, task_id = identity
+        if self._send_remote_result(project, task_id, lambda remote_harvest, placed: remote_harvest.discard_preview(
+                self.config, placed, task_id)):
+            return
 
         survey = self._survey_attempt(project, task_id)
         if not survey["branchExists"] and not survey["worktreeExists"]:
@@ -5420,6 +6159,40 @@ class Handler(http.server.BaseHTTPRequestHandler):
             recovery_command(survey["branch"], survey["branchTip"]) if survey["branchTip"] else None
         )
         self._send_json(200, response)
+
+    def _placed_or_refuse(self, project, task_id):
+        """The project as this task sees it (task-224: machines.placed at
+        the task's derived location, read fresh), or None after answering
+        409 for a task found in two places -- every action that needs a
+        location refuses one, with both places named. A project with no
+        machines comes back unchanged, with nothing run."""
+        location = task_location(self.config, project, task_id)
+        if location is None:
+            return project
+        if location.conflict:
+            self._send_error_json(409, location.conflict_reason())
+            return None
+        return location.placed()
+
+    def _send_remote_result(self, project, task_id, call):
+        """task-208: for a task on a machine, answer with remote_harvest's
+        (status, body) -- the worker is surveyed instead of the hub -- and
+        return True. A task in two places is refused (409, True); False
+        (nothing sent) for a task on the hub."""
+        placed = self._placed_or_refuse(project, task_id)
+        if placed is None:
+            return True
+        if not placed.get("machine"):
+            return False
+        project = placed
+        import remote_harvest  # local import: only with a machine configured
+
+        status, body = call(remote_harvest, project)
+        if status >= 400:
+            self._send_error_json(status, body["error"])
+        else:
+            self._send_json(status, body)
+        return True
 
     def _refuse_discard_or_none(self, project, task_id, branch):
         """The refusals /api/discard-attempt and /api/abandon-worktree
@@ -5522,39 +6295,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _refuse_stale_state_or_none(self, survey, expected_tip, expected_paths):
         """True (409 already sent) when the repository is no longer in
-        the state the confirm described. Called with the lifecycle lock
-        held and before any side effect, so a refusal leaves everything
-        exactly as it was.
-
-        Paths are compared order-insensitively: `git status --porcelain`
-        order is not part of what the user reviewed ("3 uncommitted
-        files" is), and a reordering that destroys nothing new should not
-        cost them a second confirm."""
-        branch = survey["branch"]
-        tip = survey["branchTip"]
-        if tip != expected_tip:
-            if expected_tip is None:
-                reason = f"{branch} exists now and did not when that preview was taken"
-            elif tip is None:
-                reason = f"{branch} is already gone -- it was at {expected_tip[:10]}"
-            else:
-                reason = (f"{branch} has moved: it is at {tip[:10]} now,"
-                          f" not {expected_tip[:10]}")
-            self._send_error_json(409, (
-                f"the repository changed after that preview -- {reason}. Nothing was"
-                " discarded; check again what would go."))
-            return True
-
-        paths = survey["dirtyPaths"]
-        if paths is None or sorted(paths) != sorted(expected_paths):
-            now = "an unmeasurable number of" if paths is None else str(len(paths))
-            self._send_error_json(409, (
-                "the worktree changed after that preview -- it holds"
-                f" {now} uncommitted files now, not the"
-                f" {len(expected_paths)} the confirm named. Nothing was discarded; check"
-                " again what would go."))
-            return True
-        return False
+        the state the confirm described -- see stale_state_reason.
+        Called with the lifecycle lock held and before any side effect,
+        so a refusal leaves everything exactly as it was."""
+        reason = stale_state_reason(survey, expected_tip, expected_paths)
+        if reason is None:
+            return False
+        self._send_error_json(409, reason)
+        return True
 
     def _handle_discard_attempt(self):
         """POST /api/discard-attempt (task-119): throw a bad attempt
@@ -5620,6 +6368,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         with task_lifecycle_lock(project["name"], task_id):
+            if self._send_remote_result(project, task_id, lambda remote_harvest, placed: remote_harvest.throw_away(
+                    self.config, placed, task_id, *expected, "discard")):
+                return
             self._discard_attempt_locked(project, task_id, *expected)
 
     def _discard_attempt_locked(self, project, task_id, expected_tip, expected_paths):
@@ -5742,6 +6493,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
 
         with task_lifecycle_lock(project["name"], task_id):
+            if self._send_remote_result(project, task_id, lambda remote_harvest, placed: remote_harvest.throw_away(
+                    self.config, placed, task_id, *expected, "abandon")):
+                return
             self._abandon_worktree_locked(project, task_id, *expected)
 
     def _abandon_worktree_locked(self, project, task_id, expected_tip, expected_paths):
@@ -5985,11 +6739,24 @@ def stale_task_lock_messages(found):
     return messages
 
 
+def doctor_counts(checks):
+    """Count results, never command continuation lines or summaries (task-238)."""
+    counts = dict.fromkeys(("PASS", "WARN", "FAIL"), 0)
+    for level, _ in checks:
+        counts[level] += 1
+    return counts
+
+
+def doctor_summary(name, counts):
+    return f"Summary {name}: {counts['PASS']} PASS, {counts['WARN']} WARN, {counts['FAIL']} FAIL"
+
+
 def run_doctor_check(config_path=None):
     """Runs every prerequisite check --check reports, without starting a
     server or binding a port. Returns (lines, ok): `lines` is one
     already-formatted "[PASS]"/"[WARN]"/"[FAIL] <message>" string per
-    check, in the order run; `ok` is False if any check FAILed (a WARN
+    check (possibly with command continuation lines), in the order run,
+    followed by per-machine and overall summaries; `ok` is False if any check FAILed (a WARN
     alone -- e.g. no tmux, a restricted bwrap userns, or one project
     missing backlog/config.yml -- still leaves ok True, matching how
     Centrale itself degrades: the server still starts, claude spawns are
@@ -6001,10 +6768,20 @@ def run_doctor_check(config_path=None):
     else here despite shelling out for real when actually invoked."""
     lines = []
     ok = True
+    results = {None: []}
 
-    def check(status, message):
+    def finish():
+        for name, checks in results.items():
+            label = "hub" if name is None else (f"machine {name}" if name in ("hub", "overall") else name)
+            lines.append(doctor_summary(label, doctor_counts(checks)))
+        counts = doctor_counts(check for checks in results.values() for check in checks)
+        lines.append(doctor_summary("overall", counts))
+        return lines, ok
+
+    def check(status, message, machine=None):
         nonlocal ok
         lines.append(f"[{status}] {message}")
+        results[machine].append((status, message))
         if status == "FAIL":
             ok = False
 
@@ -6109,7 +6886,10 @@ def run_doctor_check(config_path=None):
         config = load_config(path)
     except ConfigError as exc:
         check("FAIL", f"projects.json failed to load: {exc}")
-        return lines, ok
+        return finish()
+
+    for machine in config.get("machines") or []:
+        results[machine["name"]] = []
 
     projects = config.get("projects", [])
     plural = "" if len(projects) == 1 else "s"
@@ -6158,6 +6938,29 @@ def run_doctor_check(config_path=None):
             continue
         check("PASS", f"{name}: {proj_path} exists and has backlog/config.yml")
 
+    # task-206: each configured machine (doc-3), and (task-224) any machine
+    # taken from a project by hand while that project still had tasks
+    # there. No ssh with no machines configured.
+    import machines  # local import: avoids a circular import at module load
+
+    for level, message in machines.doctor_check(config):
+        name = next((m["name"] for m in config.get("machines") or []
+                     if message.startswith(f"machine {m['name']}:")), None)
+        check(level, message, name)
+    refusals, warnings = machines.stranded_checkouts(config)
+    # These reports also cover removed machines and the hub's fetched refs.
+    # Only a live survey of a configured worker belongs to its counts;
+    # configuration/fetched-copy findings stay with the hub (task-238).
+    def stranded_machine(message):
+        return next((m["name"] for m in config.get("machines") or []
+                     if f"could not list its tasks on machine {m['name']} (" in message
+                     or f", but machine {m['name']} still has its tasks (" in message), None)
+
+    for message in refusals:
+        check("FAIL", message, stranded_machine(message))
+    for message in warnings:
+        check("WARN", message, stranded_machine(message))
+
     # task-172: a read-only task file with no task/<id> branch behind it
     # is a lock that outlived its reason (a branch deleted outside
     # Centrale). --check releases it, as startup does, and says so.
@@ -6205,7 +7008,7 @@ def run_doctor_check(config_path=None):
                 "checkout's current code",
             )
 
-    return lines, ok
+    return finish()
 
 
 def build_arg_parser():
@@ -6266,6 +7069,18 @@ def main():
     global fleet_history
     fleet_history = fleet.Journal(fleet.history_path())
     configure_subprocess_timeout(config["subprocessTimeoutSeconds"])
+    # task-224: a machine leaves a project (or `machines`) only while the
+    # project has no task there (doc-3). A hand edit to projects.json that
+    # took one away anyway is refused here, before anything acts on it.
+    import machines  # local import: avoids a circular import at module load
+
+    refusals, warnings = machines.stranded_checkouts(config)
+    for message in warnings:
+        print(f"Centrale: {message}", file=sys.stderr)
+    if refusals:
+        for message in refusals:
+            print(f"Centrale: {message}", file=sys.stderr)
+        raise SystemExit(1)
     config["capabilities"] = detect_capabilities()
     # task-107: resolved HERE, once, and then only read back -- what the
     # footer and the API report is the build THIS process started from,
@@ -6301,6 +7116,13 @@ def main():
     for message in stale_task_lock_messages(spawn.release_stale_task_locks(config)):
         print(f"Centrale: {message}", file=sys.stderr)
 
+    import remote_status  # local import: avoids a circular import at module load
+
+    # task-209: every worker is connected and its task panes read (each
+    # within a bounded wait) BEFORE anything is announced, so nobody hears
+    # "unknown" followed by a silent correction. Nothing without machines.
+    remote_report = remote_status.start(config)
+
     # task-201: before the first request, so a fresh orchestrator-wait
     # hears every live session's state as this process's first lines.
     if config["capabilities"]["tmux"]:
@@ -6311,8 +7133,10 @@ def main():
                   file=sys.stderr)
         else:
             observe_fleet_sessions(sessions, config)
+            restore_local_pane_states(config, sessions)
             restore_agent_states(config, sessions)
             announce_restart_states(config, sessions)
+    remote_status.announce(config, remote_report)
 
     import harvest  # local import: avoids a circular import at module load
 
@@ -6328,6 +7152,7 @@ def main():
     except OSError as exc:
         print(bind_failure_message(address, exc), file=sys.stderr)
         auto_harvest_thread.stop()
+        remote_status.stop_all()
         raise SystemExit(1) from exc
     # flush=True: stdout is fully block-buffered whenever it isn't a TTY
     # (redirected to a log file, piped, or under systemd/nohup) -- without
@@ -6349,6 +7174,7 @@ def main():
     finally:
         auto_harvest_thread.stop()
         status_page.stop()
+        remote_status.stop_all()
         server.server_close()
 
 

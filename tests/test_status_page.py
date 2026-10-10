@@ -208,6 +208,29 @@ class RouteTests(ListenerTestBase, unittest.TestCase):
         # The snapshot is taken without arming the dashboard's reply box.
         self.assertEqual(self.get_fleet.call_args.kwargs, {"arm_input": False})
 
+    def test_worker_data_exposes_only_display_fields(self):
+        source = fake_fleet_snapshot()
+        source["agents"][0].update({"machine": None, "worktree": PRIVATE_DIR, "reach": "reachable"})
+        source["agents"].append({"project": "app", "taskId": "TASK-2", "agent": "codex",
+                                 "state": "unreachable", "stateSince": None, "parked": False,
+                                 "machine": "box-b", "worktree": PRIVATE_DIR,
+                                 "ssh": "SSH-TARGET-SECRET", "error": "SSH-ERROR-SECRET"})
+        source["machines"] = [{"name": "box-b", "reach": "unreachable", "agentCount": 1,
+                               "maxAgents": 4, "ssh": "SSH-TARGET-SECRET",
+                               "path": PRIVATE_DIR, "error": "SSH-ERROR-SECRET",
+                               "hostname": "HOSTNAME-SECRET"}]
+        self.get_fleet.return_value = source
+        status, _, body = self.request("GET", "/api/status")
+        self.assertEqual(status, 200)
+        for secret in (b"SSH-TARGET-SECRET", b"SSH-ERROR-SECRET", b"HOSTNAME-SECRET", PRIVATE_DIR.encode()):
+            self.assertNotIn(secret, body)
+        data = json.loads(body)
+        self.assertEqual(data["machines"], [{"name": "box-b", "reach": "unreachable",
+                                             "agentCount": 1, "maxAgents": 4}])
+        self.assertEqual([a["machine"] for a in data["agents"]], [None, "box-b"])
+        self.assertEqual(set(data["agents"][1]), {"project", "taskId", "agent", "state",
+                                                   "stateSince", "parked", "machine"})
+
     def test_an_unreadable_fleet_is_a_503_that_names_nothing(self):
         self.get_fleet.side_effect = server.BacklogError("tmux failed in " + os.path.join(PRIVATE_DIR, "secret-repo"))
         status, _, body = self.request("GET", "/api/status")

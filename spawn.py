@@ -26,9 +26,8 @@ import tempfile
 import threading
 import time
 import urllib.parse
-import uuid
-from pathlib import Path
 
+import codex_sessions
 import server
 
 # The built-in spawn prompt. Overridable per install via the top-level
@@ -60,6 +59,29 @@ PROMPT_TEMPLATE = (
     "When you need the owner to decide, add the needs-owner-approval label "
     "with your question as a task comment and stop until answered."
 )
+MAX_FIRST_MESSAGE_CHARS = 8000
+
+
+# task-218: validate before placement or the claim, so a malformed brief
+# cannot start a worker whose first turn lacks the orchestrator's message.
+def validate_first_message(message):
+    """A spawn brief is supplied per request, never stored as task state."""
+    if not isinstance(message, str) or not message.strip():
+        raise SpawnError("firstMessage must be a non-empty string")
+    if len(message) > MAX_FIRST_MESSAGE_CHARS:
+        raise SpawnError(f"firstMessage must be at most {MAX_FIRST_MESSAGE_CHARS} characters")
+    return message
+
+
+def initial_prompt(task_id, config=None, prompt_suffix=None, first_message=None):
+    """Build the launch argument shared by hub and worker spawns."""
+    prompt = prompt_for(task_id, config)
+    if prompt_suffix:
+        prompt = f"{prompt}\n\n{prompt_suffix}"
+    if first_message is not None:
+        prompt += ("\n\nFirst message from the orchestrator for this spawn "
+                   "(follow it before starting task work):\n" + first_message)
+    return prompt
 
 
 class SpawnError(Exception):
@@ -84,11 +106,17 @@ _launch_locks = {}
 _launch_locks_guard = threading.Lock()
 
 
+def project_launch_lock(project_name):
+    """The project's launch lock. Settings also holds it while changing a
+    project's machines (task-224), so no spawn lands on one mid-save."""
+    with _launch_locks_guard:
+        return _launch_locks.setdefault(str(project_name), threading.Lock())
+
+
 def _serialize_project_launch(fn):
     @functools.wraps(fn)
     def launch(config, project_name, task_id, *args, **kwargs):
-        with _launch_locks_guard:
-            lock = _launch_locks.setdefault(str(project_name), threading.Lock())
+        lock = project_launch_lock(project_name)
         with lock:
             return fn(config, project_name, task_id, *args, **kwargs)
     return launch
@@ -300,7 +328,7 @@ def event_url(config, project_name, task_id, agent_kind=None, agent_name=None):
     return f"http://127.0.0.1:{port}/api/agent-event?{query}"
 
 
-def _inject_codex_hooks(codex_argv0):
+def _inject_codex_hooks(codex_argv0, sink="http", supports_hooks=None):
     """The extra argv codex gets from _inject_agent_hooks: the -c notify
     override, always -- belt-and-suspenders for, and the ONLY thing that
     happens on, a codex without the hooks engine (see notify_argv below)
@@ -341,19 +369,24 @@ def _inject_codex_hooks(codex_argv0):
     in advance, before ever appending it, never find out by trying. A
     probe failure (an exception, not just a negative result) is treated
     the same as a negative probe: notify-only, same as an old codex.
+
+    task-209: `sink` is where the hooks report (see server.hook_argv),
+    and `supports_hooks` a probe answer the caller already has -- a
+    worker's codex is probed on the worker, never here.
     """
-    notify_argv = ["python3", server.notify_script_path(), "finished"]
+    notify_argv = server.hook_argv("finished", sink)
     notify_override = ["-c", f"notify={json.dumps(notify_argv)}"]
-    try:
-        supports_hooks = server.probe_codex_hook_trust(codex_argv0)
-    except Exception:
-        supports_hooks = False
+    if supports_hooks is None:
+        try:
+            supports_hooks = server.probe_codex_hook_trust(codex_argv0)
+        except Exception:
+            supports_hooks = False
     if not supports_hooks:
         return notify_override
-    return [*notify_override, *server.codex_hooks_overrides(), "--dangerously-bypass-hook-trust"]
+    return [*notify_override, *server.codex_hooks_overrides(sink), "--dangerously-bypass-hook-trust"]
 
 
-def _inject_agent_hooks(cmd):
+def _inject_agent_hooks(cmd, sink="http", codex_supports_hooks=None):
     """Extra argv to append to `cmd` (the resolved agent argv), right
     before any prompt argument, so the spawned agent reports its own
     lifecycle back to CENTRALE_EVENT_URL. Dispatched on
@@ -382,6 +415,10 @@ def _inject_agent_hooks(cmd):
       event_url, always set regardless) is the entire contract for a
       custom agent that chooses to honor it.
 
+    `sink` (task-209) is "http" for a local agent and "tmux" for one on
+    a worker (see server.hook_argv); `codex_supports_hooks` passes on a
+    probe the caller made where that codex runs (see _inject_codex_hooks).
+
     Shared by spawn() and resume() so both inject identically (AC #6).
     Never raises, and touches no file: everything it returns is built
     in memory.
@@ -390,9 +427,9 @@ def _inject_agent_hooks(cmd):
         return []
     basename = os.path.basename(cmd[0])
     if basename == "claude":
-        return ["--settings", json.dumps(server.hooks_settings_payload(), separators=(",", ":"))]
+        return ["--settings", json.dumps(server.hooks_settings_payload(sink), separators=(",", ":"))]
     if basename == "codex":
-        return _inject_codex_hooks(cmd[0])
+        return _inject_codex_hooks(cmd[0], sink, codex_supports_hooks)
     return []
 
 
@@ -796,7 +833,7 @@ def current_branch(cwd):
 
 
 def _claim_and_commit(project, task_id, assignees=None):
-    """Best-effort: claim the task (status -> "In Progress") and commit any resulting change under backlog/
+    """Best-effort: claim the task (status -> "In Progress") and commit any resulting change to that task's own file
     on the project's current branch, before the worktree is cut for it —
     so the worktree's base branch already contains the claim, instead of
     the `backlog` CLI creating a second, divergent copy of the task file
@@ -823,28 +860,54 @@ def _claim_and_commit(project, task_id, assignees=None):
         stderr = (claim_proc.stderr or claim_proc.stdout or "unknown error").strip()
         warnings.append(f"failed to claim {task_id} before spawn: {stderr}")
 
-    status_proc = server.run_git(["status", "--porcelain", "--", "backlog"], cwd=repo_path)
+    # TASK-221: scoped to the claimed task's OWN file, not backlog/. Another
+    # session's uncommitted board edits (a closed task, a new task file)
+    # sit dirty in this same checkout; a backlog/-wide add + commit
+    # published them under this task's "claim" message.
+    path = task_file_path(repo_path, task_id)
+    if path is None:
+        return warnings  # no single task file; the lock step reports that case
+    rel = os.path.relpath(path, repo_path).replace(os.sep, "/")
+
+    status_proc = server.run_git(["--literal-pathspecs", "status", "--porcelain", "--", rel], cwd=repo_path)
     if status_proc.returncode != 0:
         stderr = (status_proc.stderr or status_proc.stdout or "unknown error").strip()
         warnings.append(f"failed to check backlog status before spawn: {stderr}")
         return warnings
     if not (status_proc.stdout or "").strip():
-        return warnings  # nothing under backlog/ changed: skip the commit silently
+        return warnings  # the claimed file did not change: skip the commit silently
 
-    add_proc = server.run_git(["add", "--", "backlog"], cwd=repo_path)
+    add_proc = server.run_git(["--literal-pathspecs", "add", "--", rel], cwd=repo_path)
     if add_proc.returncode != 0:
         stderr = (add_proc.stderr or add_proc.stdout or "unknown error").strip()
         warnings.append(f"failed to stage backlog changes before spawn: {stderr}")
         return warnings
 
-    # task-169: scoped to backlog/ exactly as the add above is. A bare
-    # `git commit` commits the WHOLE index, so anything another session
-    # had staged in this checkout was swept into a commit that claims to
-    # be only this task's claim (observed in real use: one "claim" commit
-    # carried 126 files of another task's in-flight evidence). --only
-    # commits these paths and leaves every other staged path staged.
+    # task-169: --only commits just the named path and leaves every other
+    # staged path (inside backlog/ or not) staged. A bare `git commit`
+    # commits the WHOLE index. TASK-221: before committing, read back the
+    # staged set under that pathspec and refuse unless it is the claimed
+    # path alone (--literal-pathspecs: a title with glob characters in its
+    # filename must not expand to other files). Staged paths outside the
+    # pathspec are another session's and are deliberately not part of it.
+    staged_proc = server.run_git(
+        ["--literal-pathspecs", "diff", "--cached", "--name-only", "-z", "--", rel],
+        cwd=repo_path,
+    )
+    if staged_proc.returncode != 0:
+        stderr = (staged_proc.stderr or staged_proc.stdout or "unknown error").strip()
+        warnings.append(f"failed to check the staged set before claim commit for {task_id}: {stderr}")
+        return warnings
+    extras = [e for e in (staged_proc.stdout or "").split("\0") if e and e != rel]
+    if extras:
+        warnings.append(
+            f"refused the claim commit for {task_id}: it would also have committed "
+            + ", ".join(extras)
+        )
+        return warnings
+
     commit_proc = server.run_git(
-        ["commit", "--only", "-m", f"backlog: claim {task_id} for spawn", "--", "backlog"],
+        ["--literal-pathspecs", "commit", "--only", "-m", f"backlog: claim {task_id} for spawn", "--", rel],
         cwd=repo_path,
     )
     if commit_proc.returncode != 0:
@@ -970,7 +1033,9 @@ def release_stale_task_locks(config):
         locked = locked_task_files(repo_path) if os.path.isdir(repo_path) else {}
         if not locked:
             continue
-        branches = set(harvest.list_task_branches(repo_path))
+        # task-208/task-224: a project's tasks on machines have their
+        # branches there (the hub's fetched copies).
+        branches = set(harvest.task_branches(config, project))
         for task_key, path in sorted(locked.items()):
             if branch_name(task_key) in branches:
                 continue
@@ -1237,15 +1302,56 @@ def _check_not_done(project, task_id):
     return task
 
 
-def _validate_and_check_session(config, project_name, task_id):
-    """Shared by spawn() and resume(): validates project_name/task_id,
-    checks tmux availability, and raises SpawnError(409) if a session
-    for this project+task is already live -- identical naming/validation/
-    duplicate-session behavior for both. Returns (project, session_name),
-    the latter the session name a fresh spawn/resume actually uses.
+def placement(config, project_name, task_id, requested=None, resume=False):
+    """Where a spawn (or resume) of this task runs (doc-3 revision 5,
+    task-224): a machine name, or None for the hub.
 
-    Never touches git/tmux beyond the list_sessions() check itself.
-    """
+    `requested` is the request's optional "machine": "hub" or one of the
+    project's `machines`; anything else is refused with the allowed list.
+    The task's derived location (machines.locate) decides first: a
+    conflict is refused with both places, a task that already has a
+    location goes there -- and an explicit request for anywhere else is
+    refused, naming where it is. A task with no location goes where it
+    was asked to, else to the project's defaultMachine, else the hub.
+
+    A project with no `machines` answers None without running anything,
+    after refusing a request that names a machine (the single-machine
+    guarantee). An unknown project or malformed id answers None too, so
+    the hub path refuses it with its usual message."""
+    project = _find_project(config, project_name) if isinstance(project_name, str) else None
+    if requested is not None and not isinstance(requested, str):
+        raise SpawnError("machine must be a string: \"hub\" or one of the project's machines", status=400)
+    if project is None or not isinstance(task_id, str) or not server.TASK_ID_RE.match(task_id):
+        return None
+    allowed = list(project.get("machines") or [])
+    if requested is not None and requested != server.HUB and requested not in allowed:
+        listed = ", ".join([server.HUB, *allowed])
+        raise SpawnError(f"machine {requested!r} is not one of {project_name}'s machines (allowed: {listed})",
+                         status=400)
+    target = None if requested in (None, server.HUB) else requested
+    if not allowed:
+        return None
+    import machines  # local import: machines imports server, which imports this module lazily
+
+    location = machines.locate(config, project, task_id)
+    if location.conflict:
+        raise SpawnError(location.conflict_reason(), status=409)
+    if location.found:
+        if requested is not None and location.machine != target:
+            raise SpawnError(
+                f"{task_id.upper()} is already on {machines._where(location.machine)} (its worktree or "
+                f"branch is there), not {machines._where(target)} -- "
+                f"{'resume' if resume else 'spawn'} it there, or remove it there first", status=409)
+        return location.machine
+    if requested is None:
+        return project.get("defaultMachine")
+    return target
+
+
+def _validate_request(config, project_name, task_id):
+    """The request checks every launch shares, on the hub and on a worker
+    alike: project and task id well-formed, tmux available, the project
+    known. Returns the project dict; touches no git, tmux or ssh."""
     if not isinstance(project_name, str) or not project_name:
         raise SpawnError("missing or invalid project", status=400)
     if not isinstance(task_id, str) or not task_id:
@@ -1261,10 +1367,21 @@ def _validate_and_check_session(config, project_name, task_id):
     project = _find_project(config, project_name)
     if project is None:
         raise SpawnError(f"unknown project: {project_name}", status=404)
-
     if not server.TASK_ID_RE.match(task_id):
         raise SpawnError(f"invalid task id: {task_id}", status=400)
+    return project
 
+
+def _validate_and_check_session(config, project_name, task_id):
+    """Shared by spawn() and resume(): validates project_name/task_id,
+    checks tmux availability, and raises SpawnError(409) if a session
+    for this project+task is already live -- identical naming/validation/
+    duplicate-session behavior for both. Returns (project, session_name),
+    the latter the session name a fresh spawn/resume actually uses.
+
+    Never touches git/tmux beyond the list_sessions() check itself.
+    """
+    project = _validate_request(config, project_name, task_id)
     name = session_name(project_name, task_id)
 
     try:
@@ -1277,7 +1394,12 @@ def _validate_and_check_session(config, project_name, task_id):
 
     cap = project.get("maxAgents")
     if cap is not None:
-        live = server.live_sessions_for_project(project_name, config, sessions=existing)
+        # task-224: a project's limit counts its agents on every machine.
+        elsewhere = []
+        if project.get("machines"):
+            import remote  # local import: only for a project with machines
+            elsewhere = remote.sessions_elsewhere(config, project, None)
+        live = server.live_sessions_for_project(project_name, config, sessions=existing + elsewhere)
         if len(live) >= cap:
             raise SpawnError(
                 f"Project {project_name} has {len(live)} live agent sessions "
@@ -1357,56 +1479,11 @@ def hold_session_geometry(name):
     server.run_tmux(["resize-window", "-t", target, "-x", str(columns), "-y", str(rows)])
 
 
-@_serialize_project_launch
-def spawn(config, project_name, task_id, agent=None):
-    """Refuses a task whose status is Done with a 409 (see
-    _check_not_done), before any side effect. Otherwise claims the task
-    and commits that claim (see _claim_and_commit), creates/reuses a
-    worktree from the resulting base-branch commit, and starts a detached
-    tmux session running the resolved agent (see resolve_agent) with the
-    standard task prompt, plus that agent's promptSuffix if it has one.
-    The session's own environment always carries CENTRALE_EVENT_URL (see
-    event_url), even under the CENTRALE_SPAWN_CMD test override; a
-    resolved claude/codex agent's argv additionally gets a
-    lifecycle-event hook/notify override appended (see
-    _inject_agent_hooks) -- skipped, like the rest of agent resolution
-    and the Done-status check, when CENTRALE_SPAWN_CMD is set (see
-    spawn_cmd).
-
-    task-171: the agent is chosen by choose_agent -- `agent` (the
-    request's explicit choice) first, then the task's first assignee --
-    and an unresolvable one is refused with a 409 before any side effect
-    unless requireAgentAssignment is off. When the launched agent did not
-    come from the assignee, the claim records it (assignees_recording).
-
-    Returns {"session": <name>, "attach": "tmux attach -t <name>",
-    "agent": <name>}, plus a "warnings" list of human-readable strings if
-    the claim/commit step hit a problem (it never blocks the spawn) or
-    the default agent was fallen back to. Raises SpawnError on any
-    failure; never raises anything else and never touches git/tmux until
-    project + taskId (and any requested agent) are validated.
-    """
-    project, name = _validate_and_check_session(config, project_name, task_id)
-    requested = validate_requested_agent(config, agent)
-
-    # CENTRALE_SPAWN_CMD overrides everything, including assignee-driven
-    # agent selection, so we never call out to `backlog task view` (and
-    # never launch a real agent) when it's set — this is what keeps the
-    # test suite hermetic (tests spawn probes onto arbitrary/fixture task
-    # ids that don't necessarily reflect real backlog task status). Real
-    # spawns always run the Done-status check below, before any side
-    # effect (task-41).
-    task = None
-    if not spawn_cmd_override():
-        task = _check_not_done(project, task_id)
-
-    # task-70: a branch adopted into a foreign worktree can't be checked
-    # out a second time -- refuse with the path, before the claim below
-    # commits anything on the base branch.
-    _check_not_checked_out_externally(config, project, task_id)
-
-    # task-171: the agent is chosen before any side effect too, so a
-    # refusal leaves nothing claimed, committed or created.
+def _choose_spawn_agent(config, task_id, task, requested):
+    """spawn()'s agent choice (task-171), shared with a spawn on a worker
+    (task-207): (agent_name, cmd, prompt_suffix, agent_kind,
+    recorded_assignees, choice_warning). Under CENTRALE_SPAWN_CMD the
+    override command, with no agent name, kind or suffix."""
     choice_warning = None
     recorded_assignees = None
     if spawn_cmd_override():
@@ -1434,6 +1511,14 @@ def spawn(config, project_name, task_id, agent=None):
                     f"could not be read, and recording would overwrite them",
                 ]))
 
+    return agent_name, cmd, prompt_suffix, agent_kind, recorded_assignees, choice_warning
+
+
+def _claim_for_spawn(config, project, task_id, recorded_assignees, choice_warning):
+    """spawn()'s claim on the hub's base branch, shared with a spawn on a
+    worker (task-207): the claim is always written and committed HERE,
+    on the hub's main, whatever machine the agent then runs on. Returns
+    the warnings list the launch continues to extend."""
     # Claim the task and commit that claim on the base branch *before*
     # cutting the worktree, so the worktree's branch point already
     # contains it (see _claim_and_commit) — this runs even under the
@@ -1452,11 +1537,76 @@ def spawn(config, project_name, task_id, agent=None):
     if choice_warning:
         warnings.insert(0, choice_warning)
 
+    return warnings
+
+
+@_serialize_project_launch
+def spawn(config, project_name, task_id, agent=None, machine=None, first_message=None):
+    """Refuses a task whose status is Done with a 409 (see
+    _check_not_done), before any side effect. Otherwise claims the task
+    and commits that claim (see _claim_and_commit), creates/reuses a
+    worktree from the resulting base-branch commit, and starts a detached
+    tmux session running the resolved agent (see resolve_agent) with the
+    standard task prompt, plus that agent's promptSuffix if it has one.
+    The session's own environment always carries CENTRALE_EVENT_URL (see
+    event_url), even under the CENTRALE_SPAWN_CMD test override; a
+    resolved claude/codex agent's argv additionally gets a
+    lifecycle-event hook/notify override appended (see
+    _inject_agent_hooks) -- skipped, like the rest of agent resolution
+    and the Done-status check, when CENTRALE_SPAWN_CMD is set (see
+    spawn_cmd).
+
+    task-171: the agent is chosen by choose_agent -- `agent` (the
+    request's explicit choice) first, then the task's first assignee --
+    and an unresolvable one is refused with a 409 before any side effect
+    unless requireAgentAssignment is off. When the launched agent did not
+    come from the assignee, the claim records it (assignees_recording).
+
+    Returns {"session": <name>, "attach": "tmux attach -t <name>",
+    "agent": <name>}, plus a "warnings" list of human-readable strings if
+    the claim/commit step hit a problem (it never blocks the spawn) or
+    the default agent was fallen back to. Raises SpawnError on any
+    failure; never raises anything else and never touches git/tmux until
+    project + taskId (and any requested agent) are validated.
+    """
+    # task-224: a task placed on a machine launches there (remote.py);
+    # the hub path below is unchanged for every other task.
+    if first_message is not None:
+        validate_first_message(first_message)
+    target = placement(config, project_name, task_id, machine)
+    if target is not None:
+        import remote  # local import: remote imports this module
+        brief = {"first_message": first_message} if first_message is not None else {}
+        return remote.spawn_on_machine(config, project_name, task_id, agent=agent,
+                                       machine_name=target, **brief)
+    project, name = _validate_and_check_session(config, project_name, task_id)
+    requested = validate_requested_agent(config, agent)
+
+    # CENTRALE_SPAWN_CMD overrides everything, including assignee-driven
+    # agent selection, so we never call out to `backlog task view` (and
+    # never launch a real agent) when it's set — this is what keeps the
+    # test suite hermetic (tests spawn probes onto arbitrary/fixture task
+    # ids that don't necessarily reflect real backlog task status). Real
+    # spawns always run the Done-status check below, before any side
+    # effect (task-41).
+    task = None
+    if not spawn_cmd_override():
+        task = _check_not_done(project, task_id)
+
+    # task-70: a branch adopted into a foreign worktree can't be checked
+    # out a second time -- refuse with the path, before the claim below
+    # commits anything on the base branch.
+    _check_not_checked_out_externally(config, project, task_id)
+
+    # task-171: the agent is chosen before any side effect too, so a
+    # refusal leaves nothing claimed, committed or created.
+    agent_name, cmd, prompt_suffix, agent_kind, recorded_assignees, choice_warning = (
+        _choose_spawn_agent(config, task_id, task, requested))
+    warnings = _claim_for_spawn(config, project, task_id, recorded_assignees, choice_warning)
+
     wt_dir = _ensure_worktree(config, project, task_id, warnings=warnings)
 
-    prompt = prompt_for(task_id, config)
-    if prompt_suffix:
-        prompt = f"{prompt}\n\n{prompt_suffix}"
+    prompt = initial_prompt(task_id, config, prompt_suffix, first_message)
     tmux_args = new_session_args(name, wt_dir)
     if agent_name is not None:
         tmux_args += ["-e", f"CENTRALE_AGENT={agent_name}"]
@@ -1503,70 +1653,30 @@ RESUME_FALLBACK_NOTE = (
 
 def codex_home_dir():
     """The same absolute record/config store for lookup and tmux's child."""
-    return os.path.abspath(os.environ.get("CODEX_HOME") or os.path.expanduser("~/.codex"))
+    return codex_sessions.codex_home()
 
 
 def codex_conversation_id(wt_dir):
-    """Latest interactive UUID belonging to this exact worktree (task-195).
-
-    Read Codex's own records on each resume; never keep a task/session map.
-    CODEX_HOME is shared with the launched CLI. Metadata identifies the
-    original cwd; turn contexts also exclude conversations moved elsewhere.
-    Subagents share cwd but are not the task's interactive conversation.
-    Unreadable, malformed or incomplete records cannot establish identity.
-    """
-    home = Path(codex_home_dir())
-    target = os.path.realpath(wt_dir)
-    candidates = []
-    for folder, _, names in os.walk(home / "sessions"):
-        for name in names:
-            if not name.endswith(".jsonl"):
-                continue
-            path = Path(folder) / name
-            try:
-                with path.open(encoding="utf-8") as stream:
-                    meta = json.loads(stream.readline())
-                payload = meta.get("payload", {})
-                if (meta.get("type") != "session_meta"
-                        or payload.get("source") != "cli"
-                        or not isinstance(payload.get("cwd"), str)
-                        or os.path.realpath(payload["cwd"]) != target):
-                    continue
-                identity = str(uuid.UUID(payload["id"]))
-                # UUID lookup uses the rollout filename too; reject records
-                # whose metadata and filename disagree.
-                if not name.endswith(f"-{identity}.jsonl"):
-                    continue
-                candidates.append((path.stat().st_mtime_ns, identity, path))
-            except (OSError, ValueError, TypeError, KeyError, AttributeError):
-                continue
-    for _, identity, path in sorted(candidates, reverse=True):
-        try:
-            with path.open(encoding="utf-8") as stream:
-                for line in stream:
-                    event = json.loads(line)
-                    if event.get("type") in {"session_meta", "turn_context"}:
-                        cwd = event.get("payload", {}).get("cwd")
-                        if not isinstance(cwd, str) or os.path.realpath(cwd) != target:
-                            break
-                else:
-                    return identity
-        except (OSError, ValueError, TypeError, AttributeError):
-            continue
-    return None
+    """Latest interactive UUID belonging to this exact worktree (task-195):
+    codex_sessions.conversation_id over this hub's CODEX_HOME. The same
+    code runs on a worker for a remote task (task-207, remote.py)."""
+    return codex_sessions.conversation_id(codex_home_dir(), wt_dir)
 
 
-def codex_resume_readiness(name):
+def codex_resume_readiness(name, capture=None):
     """Bounded current-screen check; process creation alone is not resume.
 
     The normal composer plus shortcut footer is evidence the TUI left its
     startup dialogs. Unknown/empty screens fail closed, with the pane left
-    available for inspection. Uses the existing injectable tmux boundary.
+    available for inspection. Uses the existing injectable tmux boundary,
+    or `capture(name)` for a session on a worker (task-207); either raises
+    server.PaneCaptureError.
     """
+    capture = capture or (lambda session: server.capture_session_pane(session, 0))
     deadline = time.monotonic() + 5.0
     while True:
         try:
-            lines = server.capture_session_pane(name, 0)
+            lines = capture(name)
         except server.PaneCaptureError as exc:
             return "unconfirmed", str(exc)
         loading = server.codex_resume_loading(lines)
@@ -1608,9 +1718,8 @@ RECONCILE_PROMPT_TEMPLATE = (
     "merging. Then: merge "
     "`{base_branch}` into this branch (`git merge {base_branch}` -- do NOT "
     "rebase); resolve every conflict, textual and semantic, so the merged "
-    "result is correct for both sides' intent; run the project check "
-    "command ({check_command}) and fix whatever fails until it passes; "
-    "commit the merge and every fix on this branch, including any backlog "
+    "result is correct for both sides' intent. {check_instruction} "
+    "Commit the merge and every fix on this branch, including any backlog "
     "task updates, and leave the worktree clean. Do NOT merge this branch "
     "into `{base_branch}` or delete it -- the dashboard's gated merge "
     "handles integration and will re-verify the result."
@@ -1631,13 +1740,17 @@ RECONCILE_RESUMED_CONTEXT = (
 )
 
 
-def reconcile_prompt_for(task_id, base_branch, check_command=None, resumed=False):
+def reconcile_prompt_for(task_id, base_branch, check_command=None, resumed=False,
+                         reconcile_check=None):
     """The task-66 reconcile prompt: the same no-self-merge boundary as
     PROMPT_TEMPLATE, but the job is merging base_branch INTO the task
     branch and making the combination green -- Centrale itself never
     merges or rebases anything on the agent's behalf. check_command is
     the project's configured checkCommand, spelled out so the agent runs
-    exactly what the dashboard's gate 5 will run afterward.
+    exactly what the dashboard's gate 5 will run afterward, unless the
+    project's reconcileCheck supplies a separate instruction (task-219).
+    Without either, ask for focused tests: a project's README may list
+    full suites that should not race its own integration gate.
 
     resumed=True (task-133) is the prompt as delivered alongside a
     resumed conversation (`claude --continue <prompt>`, `codex resume
@@ -1646,15 +1759,107 @@ def reconcile_prompt_for(task_id, base_branch, check_command=None, resumed=False
     has moved" is the truer framing for an agent that did. The fresh
     variant (resumed=False) is what a fresh start gets, and what the
     orientation instructions were written for."""
-    check = f"`{check_command}`" if check_command else "see the project's AGENTS.md/README"
+    if reconcile_check:
+        check_instruction = reconcile_check.strip()
+        if not check_instruction.endswith((".", "!", "?")):
+            check_instruction += "."
+    elif check_command:
+        check_instruction = f"Run the project check command (`{check_command}`) and fix whatever fails until it passes."
+    else:
+        check_instruction = "Run focused tests covering the changes and conflict resolution, and fix any failures."
     context = RECONCILE_RESUMED_CONTEXT.format(base_branch=base_branch) if resumed else ""
     return RECONCILE_PROMPT_TEMPLATE.format(
-        task_id=task_id, base_branch=base_branch, check_command=check, context=context
+        task_id=task_id, base_branch=base_branch, check_instruction=check_instruction,
+        context=context,
     )
 
 
+def _resume_launch(config, project, task_id, task, reconcile, wt_dir, codex_lookup):
+    """resume()'s choice of what to launch, shared with a resume on a
+    worker (task-207): the three tiers, Codex's verified-UUID path and
+    the reconcile prompt framing documented on resume(). `codex_lookup`
+    returns (codex home, verified UUID or None) for this worktree -- read
+    on the hub here, on the worker for a remote task. Returns a dict:
+    cmd, agent_name, agent_kind, prompt_arg, codex_launch,
+    conversation_id, codex_home, warnings."""
+    warnings = []
+    codex_home = None
+    # task-133: the reconcile prompt comes in two framings -- `resumed`
+    # for a continued conversation (tiers 1 and 2 below), the plain one
+    # for a fresh start (tier 3, and the CENTRALE_SPAWN_CMD override,
+    # which is a fresh process by construction). Built lazily per tier so
+    # the framing always matches the command actually launched.
+    def reconcile_prompt(resumed):
+        return reconcile_prompt_for(
+            task_id, current_branch(project["path"]), project.get("checkCommand"),
+            resumed=resumed, reconcile_check=project.get("reconcileCheck"),
+        )
+
+    conversation_id = None
+    codex_launch = False
+    if spawn_cmd_override():
+        cmd = spawn_cmd()
+        agent_name = None
+        agent_kind = None
+        prompt_arg = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
+    else:
+        agent_name, agent_cmd, prompt_suffix = resolve_agent(config, project, task_id, task=task)
+        agent_kind = agent_kind_for_command(agent_cmd)
+        resume_cmd = resume_cmd_for_agent(config, agent_name)
+        # Plain Resume passes no prompt where a conversation is continued
+        # (it already has its context); reconcile passes the reconcile
+        # prompt at the same tiers, as the trailing argument -- the job is
+        # new even though the conversation is not (task-133).
+        if agent_kind == "codex" or agent_kind_for_command(resume_cmd or []) == "codex":
+            # A custom resume command can select a foreign UUID, remote
+            # server or cwd. Refuse it rather than silently bypass this
+            # identity gate. Removing it enables the safe built-in path.
+            if resume_cmd:
+                raise SpawnError(
+                    "Codex resumeCmd cannot establish task conversation identity; "
+                    "remove resumeCmd to use the worktree-bound UUID resume", status=409,
+                )
+            # These options can redirect identity/cwd or turn this into a
+            # different command. Ordinary model/config/approval flags stay.
+            if any(arg in {"resume", "--last", "--all", "--remote", "--cd", "-C", "--worktree"}
+                   or arg.startswith(("--remote=", "--cd=", "-C"))
+                   for arg in agent_cmd[1:]):
+                raise SpawnError("Codex resume refuses session or working-directory overrides in cmd", status=409)
+            codex_launch = True
+            codex_home, conversation_id = codex_lookup()
+            if conversation_id:
+                cmd = [agent_cmd[0], "resume", conversation_id, *agent_cmd[1:]]
+                prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
+            else:
+                cmd = agent_cmd
+                base_prompt = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
+                prompt_arg = base_prompt + RESUME_FALLBACK_NOTE
+                warnings.append("No verified Codex conversation for this worktree; started fresh with prior-work instructions")
+        elif resume_cmd:
+            cmd = resume_cmd
+            prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
+        elif agent_cmd and agent_cmd[0] == "claude":
+            cmd = ["claude", "--continue", *agent_cmd[1:]]
+            prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
+        else:
+            cmd = agent_cmd
+            base_prompt = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
+            prompt_arg = base_prompt + RESUME_FALLBACK_NOTE
+        # The agent's promptSuffix rides along wherever a prompt is passed
+        # at all -- the fresh-start fallback, and every reconcile tier.
+        if prompt_arg is not None and prompt_suffix:
+            prompt_arg = f"{prompt_arg}\n\n{prompt_suffix}"
+
+    return {
+        "cmd": cmd, "agent_name": agent_name, "agent_kind": agent_kind,
+        "prompt_arg": prompt_arg, "codex_launch": codex_launch,
+        "conversation_id": conversation_id, "codex_home": codex_home,
+        "warnings": warnings,
+    }
+
+
 @_serialize_project_launch
-def resume(config, project_name, task_id, reconcile=False):
+def resume(config, project_name, task_id, reconcile=False, machine=None):
     """Refuses a task whose status is Done with a 409 (see
     _check_not_done), same as spawn(), before the worktree is touched --
     a Done task's worktree may still exist, and resuming an agent onto
@@ -1718,6 +1923,11 @@ def resume(config, project_name, task_id, reconcile=False):
     existing resumed semantics. Returns session/attach/agent too. Raises
     SpawnError on any failure, same as spawn().
     """
+    target = placement(config, project_name, task_id, machine, resume=True)
+    if target is not None:
+        import remote  # local import: remote imports this module
+        return remote.resume_on_machine(config, project_name, task_id, reconcile=reconcile,
+                                        machine_name=target)
     project, name = _validate_and_check_session(config, project_name, task_id)
 
     # A Done task's worktree may still exist (left over from before it was
@@ -1737,77 +1947,18 @@ def resume(config, project_name, task_id, reconcile=False):
     warnings = []
     wt_dir = _ensure_worktree(config, project, task_id, warnings=warnings)
 
-    # task-133: the reconcile prompt comes in two framings -- `resumed`
-    # for a continued conversation (tiers 1 and 2 below), the plain one
-    # for a fresh start (tier 3, and the CENTRALE_SPAWN_CMD override,
-    # which is a fresh process by construction). Built lazily per tier so
-    # the framing always matches the command actually launched.
-    def reconcile_prompt(resumed):
-        return reconcile_prompt_for(
-            task_id, current_branch(project["path"]), project.get("checkCommand"),
-            resumed=resumed,
-        )
-
-    conversation_id = None
-    codex_launch = False
-    if spawn_cmd_override():
-        cmd = spawn_cmd()
-        agent_name = None
-        agent_kind = None
-        prompt_arg = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
-    else:
-        agent_name, agent_cmd, prompt_suffix = resolve_agent(config, project, task_id, task=task)
-        agent_kind = agent_kind_for_command(agent_cmd)
-        resume_cmd = resume_cmd_for_agent(config, agent_name)
-        # Plain Resume passes no prompt where a conversation is continued
-        # (it already has its context); reconcile passes the reconcile
-        # prompt at the same tiers, as the trailing argument -- the job is
-        # new even though the conversation is not (task-133).
-        if agent_kind == "codex" or agent_kind_for_command(resume_cmd or []) == "codex":
-            # A custom resume command can select a foreign UUID, remote
-            # server or cwd. Refuse it rather than silently bypass this
-            # identity gate. Removing it enables the safe built-in path.
-            if resume_cmd:
-                raise SpawnError(
-                    "Codex resumeCmd cannot establish task conversation identity; "
-                    "remove resumeCmd to use the worktree-bound UUID resume", status=409,
-                )
-            # These options can redirect identity/cwd or turn this into a
-            # different command. Ordinary model/config/approval flags stay.
-            if any(arg in {"resume", "--last", "--all", "--remote", "--cd", "-C", "--worktree"}
-                   or arg.startswith(("--remote=", "--cd=", "-C"))
-                   for arg in agent_cmd[1:]):
-                raise SpawnError("Codex resume refuses session or working-directory overrides in cmd", status=409)
-            codex_launch = True
-            conversation_id = codex_conversation_id(wt_dir)
-            if conversation_id:
-                cmd = [agent_cmd[0], "resume", conversation_id, *agent_cmd[1:]]
-                prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
-            else:
-                cmd = agent_cmd
-                base_prompt = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
-                prompt_arg = base_prompt + RESUME_FALLBACK_NOTE
-                warnings.append("No verified Codex conversation for this worktree; started fresh with prior-work instructions")
-        elif resume_cmd:
-            cmd = resume_cmd
-            prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
-        elif agent_cmd and agent_cmd[0] == "claude":
-            cmd = ["claude", "--continue", *agent_cmd[1:]]
-            prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
-        else:
-            cmd = agent_cmd
-            base_prompt = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
-            prompt_arg = base_prompt + RESUME_FALLBACK_NOTE
-        # The agent's promptSuffix rides along wherever a prompt is passed
-        # at all -- the fresh-start fallback, and every reconcile tier.
-        if prompt_arg is not None and prompt_suffix:
-            prompt_arg = f"{prompt_arg}\n\n{prompt_suffix}"
+    launch = _resume_launch(config, project, task_id, task, reconcile, wt_dir,
+                            lambda: (codex_home_dir(), codex_conversation_id(wt_dir)))
+    warnings.extend(launch["warnings"])
+    cmd, agent_name, agent_kind = launch["cmd"], launch["agent_name"], launch["agent_kind"]
+    prompt_arg, codex_launch = launch["prompt_arg"], launch["codex_launch"]
+    conversation_id = launch["conversation_id"]
 
     tmux_args = new_session_args(name, wt_dir)
     if codex_launch:
         # A long-lived tmux server can retain a different CODEX_HOME.
         # Explicitly bind its child to the store whose UUID we verified.
-        tmux_args += ["-e", f"CODEX_HOME={codex_home_dir()}"]
+        tmux_args += ["-e", f"CODEX_HOME={launch['codex_home']}"]
 
     if agent_name is not None:
         tmux_args += ["-e", f"CENTRALE_AGENT={agent_name}"]

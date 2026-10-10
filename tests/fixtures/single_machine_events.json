@@ -1,0 +1,139 @@
+{
+ "hooks": {
+  "claude": [
+   "--settings",
+   "{\"hooks\":{\"UserPromptSubmit\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"python3 <notify> working UserPromptSubmit\"}]}],\"PreToolUse\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"python3 <notify> working PreToolUse\"}]}],\"Notification\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"python3 <notify> notification Notification\"}]}],\"Stop\":[{\"hooks\":[{\"type\":\"command\",\"command\":\"python3 <notify> finished Stop\"}]}]},\"skillOverrides\":{\"auto-mode-setup\":\"off\"},\"crossSessionInbound\":\"accept\"}"
+  ],
+  "codex": [
+   "-c",
+   "notify=[\"python3\", \"<notify>\", \"finished\"]",
+   "-c",
+   "hooks.UserPromptSubmit=[{hooks=[{type=\"command\",command=\"python3 <notify> working\"}]}]",
+   "-c",
+   "hooks.PreToolUse=[{hooks=[{type=\"command\",command=\"python3 <notify> working\"}]}]",
+   "-c",
+   "hooks.PermissionRequest=[{hooks=[{type=\"command\",command=\"python3 <notify> waiting\"}]}]",
+   "-c",
+   "hooks.PostToolUse=[{hooks=[{type=\"command\",command=\"python3 <notify> working\"}]}]",
+   "-c",
+   "hooks.Stop=[{hooks=[{type=\"command\",command=\"python3 <notify> finished\"}]}]",
+   "--dangerously-bypass-hook-trust"
+  ]
+ },
+ "badges": [
+  [
+   "TASK-1",
+   "working",
+   200,
+   {
+    "agentState": "working",
+    "agentKind": "claude"
+   }
+  ],
+  [
+   "TASK-1",
+   "working",
+   200,
+   {
+    "agentState": "working",
+    "agentKind": "claude"
+   }
+  ],
+  [
+   "TASK-1",
+   "waiting",
+   200,
+   {
+    "agentState": "waiting",
+    "agentKind": "claude"
+   }
+  ],
+  [
+   "TASK-1",
+   "working",
+   200,
+   {
+    "agentState": "working",
+    "agentKind": "claude"
+   }
+  ],
+  [
+   "TASK-1",
+   "finished",
+   200,
+   {
+    "agentState": "finished",
+    "agentKind": "claude"
+   }
+  ],
+  [
+   "TASK-1",
+   "finished",
+   200,
+   {
+    "agentState": "finished",
+    "agentKind": "claude"
+   }
+  ],
+  [
+   "TASK-2",
+   "working",
+   200,
+   {
+    "agentState": "working",
+    "agentKind": "codex"
+   }
+  ],
+  [
+   "TASK-2",
+   "waiting",
+   200,
+   {
+    "agentState": "working",
+    "agentKind": "codex"
+   }
+  ],
+  [
+   "TASK-2",
+   "working",
+   200,
+   {
+    "agentState": "working",
+    "agentKind": "codex"
+   }
+  ],
+  [
+   "TASK-2",
+   "finished",
+   200,
+   {
+    "agentState": "idle",
+    "agentKind": "codex"
+   }
+  ],
+  [
+   "TASK-2",
+   "finished",
+   200,
+   {
+    "agentState": "idle",
+    "agentKind": "codex"
+   }
+  ],
+  [
+   "TASK-3",
+   "finished",
+   200,
+   {
+    "agentState": "finished",
+    "agentKind": "unknown"
+   }
+  ]
+ ],
+ "orchestrator": [
+  "TASK-1 waiting for input",
+  "TASK-1 finished (ready to review)",
+  "TASK-2 idle (turn ended, may need input)",
+  "TASK-3 finished (ready to review)"
+ ]
+}

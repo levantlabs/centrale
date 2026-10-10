@@ -710,7 +710,7 @@ class SpawnAgentSelectionIntegrationTests(unittest.TestCase):
         os.environ.pop("CENTRALE_SPAWN_CMD", None)
         self.addCleanup(self.env_patch.stop)
 
-    def _run_spawn(self, config, assignees):
+    def _run_spawn(self, config, assignees, first_message=None):
         fake_git = FakeGit(branch_exists=True, worktree_registered=True, wt_dir="/worktrees/my-app-task-2")
         with mock.patch.object(server, "run_git", side_effect=fake_git), \
              mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)) as run_tmux, \
@@ -720,8 +720,30 @@ class SpawnAgentSelectionIntegrationTests(unittest.TestCase):
              mock.patch.object(server, "probe_codex_hook_trust", return_value=False), \
              mock.patch("os.path.isdir", return_value=True), \
              mock.patch("os.makedirs"):
-            result = spawn.spawn(config, "my-app", "TASK-2")
+            result = spawn.spawn(config, "my-app", "TASK-2", first_message=first_message)
         return result, run_tmux
+
+    def test_first_message_is_in_the_initial_local_prompt_after_agent_suffix(self):
+        self.config["agents"] = {
+            "codex": {"cmd": ["codex"], "promptSuffix": "Use the project check command."}
+        }
+        _, run_tmux = self._run_spawn(self.config, ["@codex"],
+                                      first_message="Wait for a ruling before editing.")
+        prompt = new_session_argv(run_tmux)[-1]
+        self.assertEqual(prompt, spawn.prompt_for("TASK-2") +
+                         "\n\nUse the project check command.\n\n" +
+                         "First message from the orchestrator for this spawn "
+                         "(follow it before starting task work):\n" +
+                         "Wait for a ruling before editing.")
+
+    def test_invalid_first_message_is_refused_before_spawn_side_effects(self):
+        for message in ("", " \n ", 4, "x" * 8001):
+            with self.subTest(message=repr(message)[:30]), \
+                 mock.patch.object(spawn, "placement") as placement:
+                with self.assertRaises(spawn.SpawnError) as caught:
+                    spawn.spawn(self.config, "my-app", "TASK-2", first_message=message)
+                self.assertEqual(caught.exception.status, 400)
+                placement.assert_not_called()
 
     def test_codex_assignee_spawns_codex_argv_and_reports_agent(self):
         # config has no 'agents' key at all: seed defaults apply, exactly
@@ -1437,6 +1459,13 @@ class SpawnHappyPathTests(unittest.TestCase):
                 "sleep", "300", spawn.prompt_for("TASK-2"),
             ],
         )
+
+    def test_hub_ignores_worker_check(self):
+        import remote
+        self.config["projects"][0]["workerCheck"] = {"command": "absent.sh", "doc": "setup.md"}
+        with mock.patch.object(remote, "prepare_worker_readiness", side_effect=AssertionError("hub check")), \
+             mock.patch.object(remote, "check_worker_readiness", side_effect=AssertionError("hub check")):
+            self.test_happy_path_creates_worktree_and_tmux_session()
 
     def test_dotted_subtask_id_gets_tmux_safe_session_but_dotted_worktree(self):
         # task-59 AC #1: a dotted subtask id (TASK-11.2) must produce a
@@ -2231,12 +2260,14 @@ class SpawnClaimAndCommitTests(unittest.TestCase):
 
         def fake_run_git(args, cwd=None):
             calls.append(("git", list(args)))
-            if args[:1] == ["status"]:
+            if "status" in args[:2]:
                 return git_proc(args, 0, status_stdout, "")
-            if args[:1] == ["add"]:
+            if args[:2] == ["--literal-pathspecs", "add"]:
                 stderr = "" if add_returncode == 0 else "add failed"
                 return git_proc(args, add_returncode, "", stderr)
-            if args[:1] == ["commit"]:
+            if "diff" in args[:2]:
+                return git_proc(args, 0, "backlog/tasks/task-2 - T.md\0", "")
+            if args[:2] == ["--literal-pathspecs", "commit"]:
                 stderr = "" if commit_returncode == 0 else "commit failed"
                 return git_proc(args, commit_returncode, "", stderr)
             return fake_git_inner(args, cwd=cwd)
@@ -2245,18 +2276,20 @@ class SpawnClaimAndCommitTests(unittest.TestCase):
              mock.patch.object(server, "run_git", side_effect=fake_run_git), \
              mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)), \
              mock.patch.object(server, "list_sessions", return_value=[]), \
+             mock.patch.object(spawn, "task_file_path",
+                               return_value="/repos/my-app/backlog/tasks/task-2 - T.md"), \
              mock.patch("os.path.isdir", return_value=False), \
              mock.patch("os.makedirs"):
             result = spawn.spawn(self.config, "my-app", "TASK-2")
         return result, calls
 
     def test_claim_and_commit_precede_worktree_creation(self):
-        result, calls = self._run(status_stdout=" M backlog/tasks/task-2.md\n")
+        result, calls = self._run(status_stdout=" M backlog/tasks/task-2 - T.md\n")
 
         self.assertNotIn("warnings", result)
 
         claim_idx = next(i for i, c in enumerate(calls) if c[0] == "backlog_raw")
-        commit_idx = next(i for i, c in enumerate(calls) if c[0] == "git" and c[1][:1] == ["commit"])
+        commit_idx = next(i for i, c in enumerate(calls) if c[0] == "git" and c[1][:2] == ["--literal-pathspecs", "commit"])
         add_idx = next(
             i for i, c in enumerate(calls) if c[0] == "git" and c[1][:2] == ["worktree", "add"]
         )
@@ -2268,23 +2301,23 @@ class SpawnClaimAndCommitTests(unittest.TestCase):
             ("backlog_raw", ["task", "edit", "TASK-2", "-s", "In Progress"]),
         )
         commit_call = calls[commit_idx]
-        self.assertEqual(commit_call[1][0], "commit")
+        self.assertEqual(commit_call[1][:2], ["--literal-pathspecs", "commit"])
         self.assertIn("-m", commit_call[1])
         self.assertEqual(commit_call[1][commit_call[1].index("-m") + 1], "backlog: claim TASK-2 for spawn")
         # task-169: the commit is scoped exactly like the add -- never the
         # whole index.
-        self.assertEqual(commit_call[1][-2:], ["--", "backlog"])
+        self.assertEqual(commit_call[1][-2:], ["--", "backlog/tasks/task-2 - T.md"])
         self.assertIn("--only", commit_call[1])
 
     def test_nothing_to_commit_skips_add_and_commit_silently(self):
         result, calls = self._run(status_stdout="")  # nothing changed under backlog/
 
         self.assertNotIn("warnings", result)
-        self.assertFalse(any(c[0] == "git" and c[1][:1] == ["add"] for c in calls))
-        self.assertFalse(any(c[0] == "git" and c[1][:1] == ["commit"] for c in calls))
+        self.assertFalse(any(c[0] == "git" and c[1][:2] == ["--literal-pathspecs", "add"] for c in calls))
+        self.assertFalse(any(c[0] == "git" and c[1][:2] == ["--literal-pathspecs", "commit"] for c in calls))
         # The status check itself is scoped to the backlog/ path only.
-        status_call = next(c for c in calls if c[0] == "git" and c[1][:1] == ["status"])
-        self.assertEqual(status_call[1], ["status", "--porcelain", "--", "backlog"])
+        status_call = next(c for c in calls if c[0] == "git" and "status" in c[1][:2])
+        self.assertEqual(status_call[1], ["--literal-pathspecs", "status", "--porcelain", "--", "backlog/tasks/task-2 - T.md"])
 
     def test_claim_failure_becomes_warning_but_spawn_still_succeeds(self):
         result, _ = self._run(claim_returncode=1, status_stdout="")
@@ -2295,13 +2328,13 @@ class SpawnClaimAndCommitTests(unittest.TestCase):
         self.assertEqual(result["session"], "centrale-my-app-task-2")
 
     def test_add_failure_becomes_warning_but_spawn_still_succeeds(self):
-        result, _ = self._run(status_stdout=" M backlog/tasks/task-2.md\n", add_returncode=1)
+        result, _ = self._run(status_stdout=" M backlog/tasks/task-2 - T.md\n", add_returncode=1)
 
         self.assertIn("warnings", result)
         self.assertEqual(result["session"], "centrale-my-app-task-2")
 
     def test_commit_failure_becomes_warning_but_spawn_still_succeeds(self):
-        result, _ = self._run(status_stdout=" M backlog/tasks/task-2.md\n", commit_returncode=1)
+        result, _ = self._run(status_stdout=" M backlog/tasks/task-2 - T.md\n", commit_returncode=1)
 
         self.assertIn("warnings", result)
         self.assertEqual(result["session"], "centrale-my-app-task-2")
@@ -2374,6 +2407,53 @@ class ClaimCommitScopeRealGitTests(unittest.TestCase):
         # ...and the other session's work is exactly where it left it.
         staged = sorted(self._git("diff", "--cached", "--name-only").splitlines())
         self.assertEqual(staged, ["README.md", "docs/evidence.md"])
+
+    def test_other_sessions_dirty_and_staged_board_files_are_not_committed(self):
+        # TASK-221: an edited task file (dirty) and a brand-new one (staged)
+        # in the same checkout.
+        other = "backlog/tasks/task-9 - Other.md"
+        new = "backlog/tasks/task-10 - New.md"
+        self._write(other, "status: To Do\n")
+        self._git("add", other)
+        self._git("commit", "-qm", "other")
+        self._write(other, "status: Done\n")
+        self._write(new, "status: To Do\n")
+        self._git("add", new)
+
+        warnings = self._claim()
+
+        self.assertEqual(warnings, [])
+        committed = self._git("-c", "core.quotePath=false", "show", "--name-only",
+                              "--format=", "HEAD").splitlines()
+        self.assertEqual([c for c in committed if c], [self.TASK_FILE])
+        status = self._git("-c", "core.quotePath=false", "status", "--porcelain").splitlines()
+        self.assertEqual(sorted(status), sorted([f' M "{other}"', f'A  "{new}"']))
+
+    def test_claim_that_changes_nothing_commits_nothing_despite_other_dirty_files(self):
+        self._write("backlog/tasks/task-9 - Other.md", "status: Done\n")
+        head = self._git("rev-parse", "HEAD")
+        with mock.patch.object(server, "run_backlog_raw",
+                               return_value=backlog_raw_proc([], 0, "", "")):
+            warnings = spawn._claim_and_commit({"name": "demo", "path": self.repo}, "TASK-2")
+        self.assertEqual(warnings, [])
+        self.assertEqual(self._git("rev-parse", "HEAD"), head)
+
+    def test_staged_set_with_extra_paths_is_refused_naming_them(self):
+        real = server.run_git
+        def fake_git(args, cwd=None):
+            if "diff" in args[:2]:
+                return git_proc(args, 0, f"{self.TASK_FILE}\0backlog/tasks/x.md\0", "")
+            return real(args, cwd=cwd)
+        def fake_backlog(args, cwd):
+            self._write(self.TASK_FILE, "status: In Progress\n")
+            return backlog_raw_proc(args, 0, "", "")
+        head = self._git("rev-parse", "HEAD")
+        with mock.patch.object(server, "run_backlog_raw", side_effect=fake_backlog), \
+             mock.patch.object(server, "run_git", side_effect=fake_git):
+            warnings = spawn._claim_and_commit({"name": "demo", "path": self.repo}, "TASK-2")
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("backlog/tasks/x.md", warnings[0])
+        self.assertEqual(self._git("rev-parse", "HEAD"), head)
 
     def test_a_clean_index_produces_the_same_claim_commit_as_before(self):
         warnings = self._claim()
@@ -2852,6 +2932,22 @@ class ReconcileResumeTests(ResumeIntegrationTests):
     def _project(self, **extra):
         return {"name": "my-app", "path": "/repos/my-app", **extra}
 
+    def test_reconcile_without_check_command_requests_focused_tests(self):
+        prompt = spawn.reconcile_prompt_for("TASK-2", "main")
+        self.assertIn("focused tests", prompt)
+        self.assertNotIn("see the project's AGENTS.md/README", prompt)
+        self.assertNotIn("run the project check command", prompt)
+
+    def test_project_reconcile_check_overrides_full_gate_command_in_launched_prompt(self):
+        instruction = "Run only focused tests named in the task brief; the project gate runs full suites."
+        config = make_config("/worktrees", [self._project(
+            checkCommand="npm test", reconcileCheck=instruction,
+        )])
+        _, run_tmux, _, _ = self._run_resume(config, [], reconcile=True)
+        prompt = new_session_argv(run_tmux)[-1]
+        self.assertIn(instruction, prompt)
+        self.assertNotIn("npm test", prompt)
+
     def _assert_reconcile_prompt_content(self, prompt_arg, resumed):
         """The job itself is the same at every tier: orient, merge base in
         (never rebase), fix textual and semantic conflicts, run the check
@@ -3042,11 +3138,11 @@ class ReconcileResumeTests(ResumeIntegrationTests):
         self.assertIn("`git merge develop`", tmux_args[-1])
         self.assertNotIn("main", tmux_args[-1])
 
-    def test_reconcile_prompt_without_check_command_points_at_project_docs(self):
+    def test_launched_reconcile_without_check_command_requests_focused_tests(self):
         config = make_config("/worktrees", [self._project()])
         _, run_tmux, _, _ = self._run_resume(config, [], reconcile=True)
         tmux_args = new_session_argv(run_tmux)
-        self.assertIn("see the project's AGENTS.md/README", tmux_args[-1])
+        self.assertIn("Run focused tests covering the changes and conflict resolution", tmux_args[-1])
 
     def test_reconcile_never_merges_rebases_reclaims_or_recreates_anything(self):
         # AC #2: Centrale itself performs NO merge/rebase -- the only git
@@ -3582,6 +3678,25 @@ class SpawnHttpApiTests(unittest.TestCase):
             status, _ = self._post("/api/spawn", payload)
         self.assertEqual(status, 200)
         fake_spawn.assert_called_once_with(self.config, "my-app", "TASK-2", agent="codex")
+
+    def test_post_spawn_passes_first_message_to_spawn(self):
+        payload = json.dumps({"project": "my-app", "taskId": "TASK-2",
+                              "firstMessage": "Wait for the plan ruling."}).encode("utf-8")
+        with mock.patch("spawn.spawn", return_value={"session": "s", "attach": "a"}) as fake_spawn:
+            status, _ = self._post("/api/spawn", payload)
+        self.assertEqual(status, 200)
+        fake_spawn.assert_called_once_with(self.config, "my-app", "TASK-2", agent=None,
+                                           first_message="Wait for the plan ruling.")
+
+    def test_post_spawn_rejects_invalid_first_message_before_spawn(self):
+        for message in (None, "", "x" * (spawn.MAX_FIRST_MESSAGE_CHARS + 1)):
+            payload = json.dumps({"project": "my-app", "taskId": "TASK-2",
+                                  "firstMessage": message}).encode("utf-8")
+            with self.subTest(message=repr(message)[:30]), mock.patch("spawn.spawn") as fake_spawn:
+                status, body = self._post("/api/spawn", payload)
+            self.assertEqual(status, 400)
+            self.assertIn("firstMessage", body["error"])
+            fake_spawn.assert_not_called()
 
     def test_post_spawn_surfaces_spawn_error_status(self):
         import spawn as spawn_module

@@ -47,6 +47,61 @@ class DoctorCheckTests(unittest.TestCase):
                 f.write("statuses: [To Do, Done]\n")
         return path
 
+    def test_summary_counts_checks_once_per_machine_and_overall(self):
+        import machines
+        path = self._write_projects_json({"machines": [
+            {"name": name, "ssh": name, "repoRoot": "~/repos", "worktreeRoot": "~/work"}
+            for name in ("box-d", "box-e")]})
+        with mock.patch.object(server, "which", return_value=None), \
+             mock.patch.object(server, "probe_running_server", return_value=None), \
+             mock.patch.object(machines, "doctor_check", return_value=[
+                 ("PASS", "machine box-d: ready"),
+                 ("WARN", "machine box-d: fix\ncommand"),
+                 ("FAIL", "machine box-e: unreachable")]), \
+             mock.patch.object(machines, "stranded_checkouts", return_value=([], [])):
+            lines, ok = server.run_doctor_check(path)
+        self.assertFalse(ok)
+        self.assertEqual(lines[-3:], ["Summary box-d: 1 PASS, 1 WARN, 0 FAIL",
+                                     "Summary box-e: 0 PASS, 0 WARN, 1 FAIL",
+                                     "Summary overall: 4 PASS, 3 WARN, 3 FAIL"])
+        self.assertEqual(lines[-4], "Summary hub: 3 PASS, 2 WARN, 2 FAIL")
+
+    def test_worker_named_hub_does_not_replace_local_counts(self):
+        import machines
+        path = self._write_projects_json({"machines": [
+            {"name": "hub", "ssh": "worker", "repoRoot": "~/repos", "worktreeRoot": "~/work"}]})
+        with mock.patch.object(server, "which", return_value=None), \
+             mock.patch.object(server, "probe_running_server", return_value=None), \
+             mock.patch.object(machines, "doctor_check", return_value=[("FAIL", "machine hub: down")]), \
+             mock.patch.object(machines, "stranded_checkouts", return_value=([], [])):
+            lines, _ = server.run_doctor_check(path)
+        self.assertEqual(lines[-3:], ["Summary hub: 3 PASS, 2 WARN, 2 FAIL",
+                                     "Summary machine hub: 0 PASS, 0 WARN, 1 FAIL",
+                                     "Summary overall: 3 PASS, 2 WARN, 3 FAIL"])
+
+    def test_stranded_worker_survey_warning_counts_against_that_worker(self):
+        import machines
+        path = self._write_projects_json({"projects": [{"name": "p", "path": "/absent"}],
+            "machines": [{"name": "box-d", "ssh": "worker", "repoRoot": "~/repos", "worktreeRoot": "~/work"}]})
+        with mock.patch.object(server, "which", return_value=None), \
+             mock.patch.object(server, "probe_running_server", return_value=None), \
+             mock.patch.object(machines, "doctor_check", return_value=[]), \
+             mock.patch.object(machines, "_fetched_machines", return_value={}), \
+             mock.patch.object(machines, "run_on_machines", return_value={"box-d": [
+                 machines.MachineResult(machines.UNREACHED, None, "", "offline"),
+                 machines.MachineResult(machines.UNREACHED, None, "", "offline")]}):
+            lines, _ = server.run_doctor_check(path)
+        self.assertIn("Summary box-d: 0 PASS, 1 WARN, 0 FAIL", lines)
+        self.assertIn("Summary hub: 3 PASS, 2 WARN, 2 FAIL", lines)
+
+    def test_bad_config_still_ends_with_summary(self):
+        path = self._write_projects_json({"machines": "invalid"})
+        with mock.patch.object(server, "which", return_value=None):
+            lines, ok = server.run_doctor_check(path)
+        self.assertFalse(ok)
+        self.assertEqual(lines[-2:], ["Summary hub: 2 PASS, 1 WARN, 3 FAIL",
+                                     "Summary overall: 2 PASS, 1 WARN, 3 FAIL"])
+
     def test_missing_and_stale_pointers_report_one_executable_repair_command(self):
         repos = [self._make_project_dir(name, with_backlog_config=(name != "neither"))
                  for name in ("missing", "stale", "complete", "neither")]
@@ -328,7 +383,7 @@ class DoctorCheckTests(unittest.TestCase):
         probe.assert_called_once_with(7431)
         self.assertTrue(ok)  # advice, like a missing tmux: the checkout itself is fine
         self.assertEqual(
-            lines[-1],
+            next(line for line in lines if "Centrale serving port" in line),
             "[WARN] the Centrale serving port 7431 started from 055ff59 but its checkout "
             "is now at a088d15, 23 commits later -- the code has changed since that "
             "process started; restart it to load it")
@@ -336,17 +391,17 @@ class DoctorCheckTests(unittest.TestCase):
     def test_one_commit_and_an_uncountable_drift_read_naturally(self):
         lines, _, _ = self._check_with_running_server(
             {"version": "v", "codeDrift": {"loaded": "a", "current": "b", "commitsBehind": 1}})
-        self.assertIn("now at b, 1 commit later --", lines[-1])
+        self.assertIn("now at b, 1 commit later --", next(line for line in lines if "Centrale serving port" in line))
         lines, _, _ = self._check_with_running_server(
             {"version": "v", "codeDrift": {"loaded": "a", "current": "b", "commitsBehind": None}})
-        self.assertIn("now at b -- the code has changed", lines[-1])
+        self.assertIn("now at b -- the code has changed", next(line for line in lines if "Centrale serving port" in line))
 
     def test_a_running_server_on_its_checkouts_head_passes(self):
         lines, ok, _ = self._check_with_running_server(
             {"version": "v0.1.0-14-g4570911", "codeDrift": None})
         self.assertTrue(ok)
         self.assertEqual(
-            lines[-1],
+            next(line for line in lines if "Centrale serving port" in line),
             "[PASS] the Centrale serving port 7420 (v0.1.0-14-g4570911) is running its "
             "checkout's current code")
 
@@ -355,15 +410,15 @@ class DoctorCheckTests(unittest.TestCase):
         # all -- which is itself the finding.
         lines, ok, _ = self._check_with_running_server({"version": "v0.1.0 (055ff59)"})
         self.assertTrue(ok)
-        self.assertTrue(lines[-1].startswith("[WARN] the Centrale serving port 7420 (v0.1.0 (055ff59)) predates this check"))
-        self.assertIn("restart it", lines[-1])
+        self.assertTrue(next(line for line in lines if "Centrale serving port" in line).startswith("[WARN] the Centrale serving port 7420 (v0.1.0 (055ff59)) predates this check"))
+        self.assertIn("restart it", next(line for line in lines if "Centrale serving port" in line))
 
     def test_no_running_server_prints_nothing_about_one(self):
         lines, ok, probe = self._check_with_running_server(None)
         probe.assert_called_once_with(7420)
         self.assertTrue(ok)
         self.assertFalse(any("Centrale serving port" in line for line in lines))
-        self.assertTrue(lines[-1].startswith("[PASS] my-app:"))
+        self.assertTrue(any(line.startswith("[PASS] my-app:") for line in lines))
 
     def test_the_probe_is_never_reached_when_the_config_fails_to_load(self):
         path = os.path.join(self.tmpdir.name, "projects.json")

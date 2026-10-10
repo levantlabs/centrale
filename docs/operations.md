@@ -13,7 +13,16 @@ First, check that everything Centrale needs is actually in place:
 python3 server.py --check
 ```
 
-This reports one `[PASS]`/`[WARN]`/`[FAIL]` line per prerequisite. First
+This reports one `[PASS]`/`[WARN]`/`[FAIL]` result per prerequisite, with setup
+commands on separate lines. It ends with PASS, WARN and FAIL counts for the
+hub, each configured worker, and overall, for example
+`Summary box-d: 15 PASS, 2 WARN, 0 FAIL`. Each result counts once even when
+it includes several command lines; summary lines do not count as checks.
+The hub count includes configuration findings and its fetched branch copies;
+live worker survey findings count against that worker. Workers named `hub`
+or `overall` are labelled `machine hub` or `machine overall` in the summary.
+Settings' **Check this machine** shows the selected worker's counts above
+its results. First
 the build itself — `[PASS] Centrale v0.1.0`, the one line worth quoting in
 a bug report (see [Versioning](#versioning)) — then Python
 version, `git` and `backlog` on `PATH` (with the version each reports),
@@ -35,7 +44,25 @@ from (see [Restarting after a change](#restarting-after-a-change): a
 when nothing is listening). With the [read-only status
 page](#checking-status-from-a-phone) turned on, it also says whether that
 page's port can be listened on (or is already served by the running Centrale)
-and prints the page's links, creating its key if it has none yet. It never
+and prints the page's links, creating its key if it has none yet. With
+[`machines`](configuration.md#setup--configuration) configured, it checks
+each one over ssh in two round trips: reachable with `BatchMode`, `tmux`
+3.2 or later, `git`, tmux control mode (on a private tmux socket, removed
+afterwards), `python3` (the orphan sweep and the agents' hook filter), clock skew
+within 2 s of this machine, the parked project repository and `worktreeLinks`
+sources of each project that lists the machine in its `machines`, and `backlog` and each agent CLI resolved to a
+full path by an interactive shell there (`bash -ic 'command -v ...'`,
+since a per-user install is often on `PATH` only in interactive shells),
+with its version next to this machine's (or, for `backlog`, the tested
+one) and, for `claude` and `codex`, whether it is logged in. Agent versions
+that differ from the hub produce only a warning; no pinning is required. A
+configured machine that no project lists gets one warning asking you to tick
+it under **Machines** on a project's Settings card and save. Its project
+repository root cannot be checked until a project lists it. It also fails
+when a project still has tasks (worktrees or branches, or the hub's fetched
+copies of them) on a machine it no longer lists -- or one no longer
+configured at all. Without `machines` no `ssh` process starts; only the
+hub's own fetched refs are read for that last check. It never
 starts a server -- it only test-binds the status page's port for an instant,
 and binds nothing at all with the page off -- so it's safe to run anytime,
 including while a real Centrale instance is already up.
@@ -107,6 +134,12 @@ theme. It has no buttons, and the listener behind it has no route that could
 change anything: no pane text, no messages, no settings, no spawn, merge or
 any other action (decision-6 in the development board records exactly what it
 exposes).
+
+With workers configured, the cards are grouped under "This machine" and each
+worker's name, as in Fleet. A worker that cannot be reached is labelled
+"unreachable" (or "not answering" while its reach is unknown); the connection
+error is never sent to the phone. With no workers configured, the page keeps
+its single list of project cards.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/status-page-dark.png">
@@ -189,6 +222,402 @@ computer; the saved icon keeps the full link, key included.
 - iPhone, Safari: Share, *Add to Home Screen*.
 - Mac, Safari: File, *Add to Dock*.
 - Chrome on a computer: menu, *Cast, save and share*, *Create shortcut*.
+
+### Setting up a worker
+
+A worker is another Linux machine whose user you can `ssh` into without a
+password prompt. Centrale installs nothing there; you set it up once by
+hand and `python3 server.py --check` tells you what is missing. With no
+[`machines`](configuration.md#setup--configuration) configured none of
+this applies and Centrale starts no `ssh` process.
+
+1. **Reach it.** `ssh -o BatchMode=yes box-b true` must succeed from this
+   machine with keys alone (an agent or a passphrase-less key; BatchMode
+   never asks). On a fresh Ubuntu worker, step by step. Below, `<user>` and
+   `<address>` are placeholders: replace them with the user name and the
+   address the worker prints in the first step (for example `alex` and
+   an address like `192.168.x.y`), and `box-b` with the short name you choose for it:
+
+   On the worker, start an ssh server and find its address and user:
+
+   ```sh
+   sudo apt update && sudo apt install -y openssh-server
+   hostname -I   # prints <address>: use the first one shown
+   whoami        # prints <user>
+   ```
+
+   On this machine, install your key there (it asks for the worker
+   password once; run `ssh-keygen` first if you have no key yet):
+
+   ```sh
+   ssh-copy-id <user>@<address>
+   ```
+
+   Give it a short name by adding to `~/.ssh/config` here:
+
+   ```
+   Host box-b
+       HostName <address>
+       User <user>
+   ```
+
+   Then check that keys alone work: `ssh -o BatchMode=yes box-b true &&
+   echo ok`. In your router, reserve that address for the worker (usually
+   "DHCP reservation"), so it does not change and break the name. Use the
+   short name as the machine's SSH target in Centrale.
+
+   If `ssh-copy-id` says `No route to host` although `hostname -I` gave
+   that address, the worker is not answering on the network yet. Ping this
+   machine from the worker (`ping -c 2 <this machine's address>`) and try
+   again: a worker on Wi-Fi with power saving can stop answering while
+   idle. Prefer Ethernet for a worker; on Wi-Fi, turn power saving off
+   (NetworkManager: set `wifi.powersave = 2` in
+   `/etc/NetworkManager/conf.d/default-wifi-powersave-on.conf`, then
+   `sudo systemctl restart NetworkManager`), or Centrale will see it as
+   unreachable from time to time.
+2. **Install the tools.** `tmux` 3.2 or later, `git`, `python3` (the
+   worker-side orphan sweep and the agents' hook filter run it), `backlog`
+   at the version Centrale tests against, and the agent CLIs you use
+   (`claude`, `codex`), each logged in once by hand on that machine. Set
+   `git config --global user.name` and `git config --global user.email`
+   for the worker user so task commits have the intended author.
+
+   On a fresh Ubuntu worker:
+
+   ```sh
+   # tmux, git, python3 (with venv, for projects that share a .venv)
+   sudo apt update && sudo apt install -y tmux git python3 python3-venv
+
+   # Node.js 22 with npm (for backlog, codex and projects' JavaScript tools).
+   # Ubuntu 24.04's own nodejs is 18, too old for current tooling.
+   curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+   sudo apt install -y nodejs
+   node --version   # v22.x
+
+   # npm installs into your home, no sudo; claude's installer uses ~/.local/bin
+   npm config set prefix ~/.npm-global
+   echo 'export PATH="$HOME/.npm-global/bin:$HOME/.local/bin:$PATH"' >> ~/.bashrc
+   source ~/.bashrc
+
+   # backlog at the version Centrale is tested against; codex at its latest
+   npm install -g backlog.md@1.53.0 @openai/codex
+
+   # claude, with its own installer, at its latest
+   curl -fsSL https://claude.ai/install.sh | bash
+
+   # log in once each (each opens a browser link to sign in)
+   claude      # sign in, then /exit
+   codex login
+
+   # who task commits on this worker are by: use the same name and email
+   # as this machine (git config --global user.name / user.email here)
+   git config --global user.name "<your name>"
+   git config --global user.email "<your email>"
+   ```
+
+   If you will run `codex` there: on Ubuntu 24.04 and later, AppArmor
+   blocks the tool Codex sandboxes commands with (`bwrap`), and `--check`
+   reports `codex sandbox cannot run a command`. Allow just the two `bwrap`
+   programs (Ubuntu's and the one bundled with Codex) on the worker:
+
+   ```sh
+   cbwrap=$(find "$(npm root -g)/@openai/codex" -name bwrap -type f | head -n 1)
+   echo "$cbwrap"   # must print a path; if empty, reinstall codex with npm first
+   sudo tee /etc/apparmor.d/bwrap-userns >/dev/null <<EOF
+   abi <abi/4.0>,
+   include <tunables/global>
+
+   profile bwrap-userns /usr/bin/bwrap flags=(unconfined) {
+     userns,
+   }
+
+   profile codex-bwrap-userns $cbwrap flags=(unconfined) {
+     userns,
+   }
+   EOF
+   sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns
+   codex sandbox true && echo sandbox-ok
+   ```
+
+   `sandbox-ok` means it works; the rule survives reboots. The sandbox
+   also blocks network sockets, including the local test servers some
+   projects' tests start, and `git commit`: Codex keeps every repository's
+   git directory read-only by design, and extra `writable_roots` do not
+   change that. So Codex will stop and ask a person before running such
+   commands outside it. To let Codex review and approve those
+   requests itself, as an unattended worker needs, add this line at the top
+   of `~/.codex/config.toml` on the worker:
+
+   ```toml
+   approvals_reviewer = "auto_review"
+   ```
+
+   It applies to Codex sessions started after the change. Re-run these
+   lines if a Codex update moves its bundled `bwrap`. (Background and the
+   broader alternative: [Troubleshooting](#troubleshooting).)
+
+   Leave out `claude` or `codex` if you will not run that agent there.
+   `backlog` stays at the version Centrale is tested against
+   (`TESTED_BACKLOG_VERSION` in `version.py`), because Centrale reads its
+   output. The agent CLIs can be newer than this machine's; `--check` warns
+   when they differ, and updating either side clears it. The
+   PATH line goes in `~/.bashrc` on purpose: Centrale looks tools up with
+   an interactive shell (see the PATH note below).
+3. **Make the worker's folders and tell Centrale about it.** A worker has
+   two folders of its own, both on the worker: a *repository root* holding
+   one copy of each project placed there, and a *worktree root* holding one
+   folder per task. Pick names that differ from where your projects live
+   on this machine. With `~/centrale-repos` and `~/centrale-work`, and a
+   project called `my-app`, the worker ends up looking like this:
+
+   ```
+   ~/centrale-repos/           repository root
+       my-app/                 the project's copy, parked (see below)
+   ~/centrale-work/            worktree root
+       my-app-task-12/         one folder per task, made by Centrale
+   ```
+
+   On the worker, make both folders and, for each project you will place
+   there, its parked copy. The folder name must be the project's name in
+   Centrale (`my-app` here):
+
+   ```sh
+   mkdir -p ~/centrale-repos ~/centrale-work
+   repo=~/centrale-repos/my-app
+   git init -b parking "$repo"
+   git -C "$repo" -c user.name=Parked -c user.email=parked@localhost commit --allow-empty -m parked
+   git -C "$repo" checkout --detach HEAD
+   ```
+
+   "Parked" means its checkout is detached and nobody works in it: the
+   first spawn there pushes `main` into it from this machine, and every
+   task gets its own folder under the worktree root. The project copy also
+   holds any `worktreeLinks` sources (a `.venv`, `node_modules`) and any
+   gitignored local file a project's `checkCommand` reads (for example a
+   `.release-remote`).
+
+   Then, in Centrale, **Settings → Machines → Add a machine**:
+
+   | Field | Example | What it is |
+   |---|---|---|
+   | Name | `box-b` | How Centrale names the worker |
+   | SSH target | `box-b` | What you type after `ssh` to reach it: the `Host` name from step 1 (its `User` line supplies the user), or `user@address` |
+   | Repository root | `~/centrale-repos` | As typed; `~` is the worker's home |
+   | Worktree root | `~/centrale-work` | As typed |
+   | Max agents | `2` | Optional; agents from all projects on this worker |
+   | tmux socket name | (blank) | Optional; blank uses the worker's normal tmux. A name (`tmux -L <name>`) keeps Centrale's sessions in a separate tmux server there |
+
+   Save, then open each project's card in Settings, tick the worker under
+   **Machines**, optionally make it the **Default machine**, and save.
+   (That writes the project's `machines` in `projects.json`;
+   [configuration](configuration.md#setup--configuration).)
+
+   If a parked copy is missing, `--check` in step 4 prints the two commands
+   that make it: one to run on the worker, and a push of `main` to run
+   here. It does the same for anything else a project needs in its copy: a
+   shared `.venv` or `node_modules` from the project's `worktreeLinks`, or a
+   gitignored file its `checkCommand` reads. Each setup result says
+   `run this on hub:` or `run this on <machine>:` and prints the command
+   on the next line by itself. A missing parked repository remains a FAIL;
+   its first command runs directly on the named worker, then the push runs
+   on the hub. Commands for missing links and ignored files run on the hub
+   (they build or copy the piece over ssh). Run them yourself; Centrale never runs setup.
+4. **Click Check this machine** in Settings, or run `python3 server.py --check`.
+   It reports the machine's tmux and
+   git versions and global author identity, whether tmux control mode works,
+   clock skew, the full
+   path of each agent CLI with its version next to this machine's, and
+   whether each is logged in. For Codex, it runs `codex sandbox true` on the
+   worker without a model request, so a broken sandbox reports its actual
+   error. A failed sandbox is a warning when that worker's Codex config has
+   `approvals_reviewer = "auto_review"`: commands can then run unsandboxed
+   after automatic review. Otherwise it is a failure; see
+   [Troubleshooting](#troubleshooting). Settings saves start, replace, or stop the
+   worker status connection live. If Save warns that a connection could
+   not start, fix the stated cause and restart Centrale.
+5. **Trust the project folder once per agent CLI on that worker.** Run
+   `cd <repoRoot>/<project> && codex` or `cd <repoRoot>/<project> && claude`
+   there, accept the folder, then quit without sending a prompt. Do this
+   for every agent CLI you use. `--check` reads the tools' settings and
+   names each project and CLI whose trust is missing; Centrale does not
+   write those settings.
+
+#### Adding a project to a worker
+
+1. In Settings, add the machine to the project's **Machines** list and
+   save. Click **Check this machine** (or run `python3 server.py --check`
+   on the hub). The two views show the same check lines.
+2. Run the check's parked-repository creation command, then its hub
+   `git push ... main:main` command. The parked checkout remains detached.
+3. For each missing `worktreeLinks` source, run the printed command on
+   the hub. A `.venv` command freezes the hub venv without editable
+   installs, streams those requirements to the worker, creates a fresh
+   venv there, installs them, and removes its temporary requirements file.
+   `mktemp` uses the worker's `TMPDIR` when set. A `node_modules` command
+   streams `package.json` and `package-lock.json` from the link's parent
+   directory on the hub, then runs `npm ci` in that same parent under the
+   parked checkout. Nested `.venv` links likewise use their own parent.
+   Any other link source is copied from
+   the hub with `tar` over SSH. Check that the hub source and lock file
+   exist before running a printed command.
+4. If the project has a `checkCommand`, the check also looks for
+   top-level ignored dotfiles in the hub checkout, such as
+   `.release-remote`. It prints a copy command for each one absent from
+   the worker's parked checkout. Review which files the check command
+   actually needs before copying them; the check reads names only and
+   never transfers their contents itself. Config kept outside the hub
+   checkout still needs a manual copy.
+5. Set any missing git author identity and perform the printed Claude
+   and Codex trust steps once **for this project** on this worker.
+   Re-run the check until its project lines pass. Trusting a parent
+   folder does not trust this repository.
+
+**Migrating a worker from the old bare layout.** Do this for each project
+with `<repoRoot>/<project>.git`, with new spawns paused on that project.
+Leave existing task worktrees in place, including ones with uncommitted work.
+On the worker, first run `git --git-dir=<repoRoot>/<project>.git worktree list
+--porcelain` and note every task worktree path. The project folder
+`<repoRoot>/<project>` already holds the `worktreeLinks` sources. Then run:
+
+```sh
+repo=/path/to/repoRoot/project
+mv "$repo.git" "$repo/.git"
+git -C "$repo" config core.bare false
+git -C "$repo" worktree repair "/path/to/task-worktree"
+git -C "$repo" checkout --detach main
+git -C "$repo" worktree list --porcelain
+```
+
+Pass every task worktree path to `worktree repair`; omit that argument if
+there are none. Quote paths containing spaces. `repair` updates their `.git`
+links after the move without discarding branches or worktree files. The
+checkout may refuse if an existing link source conflicts with a tracked
+file; resolve that conflict before proceeding. Verify each task worktree
+still opens and its uncommitted files remain, then run `--check` from the
+hub. The check names this procedure while it sees the legacy bare layout.
+
+Two things bit the first worker this was tried on:
+
+- **Pin the agent CLI versions.** Codex updated itself right after its
+  first login, the update was interrupted, and the `codex` command was
+  left missing until reinstalled. Install a specific version on the worker
+  (for example `npm install -g @openai/codex@<version>`), turn the tool's
+  auto-update off where it has such a setting, and read `--check`'s
+  version line against this machine's before relying on it.
+- **A per-user install may be on `PATH` only in interactive shells.**
+  Ubuntu's default `~/.bashrc` returns early for a non-interactive shell,
+  so an npm user install that adds `~/.npm-global/bin` below that line is
+  invisible to `ssh host command` and to `bash -lc`. Centrale probes with
+  `bash -ic 'command -v <tool>'` and launches each agent by the full path
+  it finds. For each worker spawn or resume, it also adds the directories
+  found for `backlog`, `claude` and `codex` to the worker login PATH in the
+  tmux session and the first agent process, so non-interactive agent shells
+  can run those tools. The worker needs `backlog`; an unused agent CLI may
+  be absent. This works without touching the worker's profile; `--check`
+  prints the tool paths.
+- **Codex folder trust is a manual step.** Codex ignores per-run `-c`
+  trust overrides for its "Trust this folder?" prompt. A task worktree
+  inherits trust from the parked project repository you accepted once.
+
+#### What you see
+
+Without machines nothing below appears: no machine label, no grouping.
+
+- Placement is per task (doc-3 revision 5): one project can have tasks on
+  this machine and on several workers at once. A spawn goes to the
+  machine it names, else the project's `defaultMachine`, else this
+  machine; a task that already has a worktree or branch somewhere stays
+  there. Where each task is, is read from git on every refresh, never
+  stored -- see [Where a task is](configuration.md#where-a-task-is).
+- Task and session API responses carry `machine` and `worktree` (the path
+  on that machine) for a task on a worker, and `location` for every task
+  of a project with machines. A board card and a sidebar session row show
+  the machine only for a task on a worker, and the row's attach command is
+  the `ssh -t ... tmux attach` that reaches it. End session, Resume and
+  Merge work from the same buttons as for a local task.
+- A task found in two places at once (say, a branch here and a worktree on
+  a worker) is never guessed between: every action that needs a location
+  is refused naming both, until you remove the copy that is not the task.
+  The card shows an "in hub + box-b" chip, the drawer and the sidebar
+  session row name both places, and Spawn, Resume, Merge, Abandon, Discard
+  and End session are disabled with that reason.
+- **Choosing the machine (task-225).** For a project that lists machines,
+  a task with no worktree or branch yet gets a machine picker beside Spawn
+  on its card and above the button in its drawer: "hub (this machine)" and
+  each of the project's machines, the project's `defaultMachine`
+  preselected. The choice is sent as the spawn's `machine`. A task that is
+  already somewhere gets no picker -- it runs where it is -- and a project
+  with no machines never shows one.
+- **Settings.** Each project's card in Settings (the gear) lists the
+  configured machines as checkboxes -- where its tasks may run besides this
+  machine -- and a "Default machine" choice among this machine and the ones
+  ticked. Unticking a machine that still has the project's tasks is
+  refused by the server, and its reason appears under that field.
+- The Fleet view groups its project cards under one heading per machine
+  with that machine's capacity ("box-b 2/4 agents"), this machine first;
+  each agent counts where its session runs, and a project whose agents run
+  in several places has a card in each group, listing only the agents there.
+
+![The board with machines configured: the machine picker beside Spawn, and a card showing the machine it runs on](img/board-machines-light.png)
+*The board with machines configured, from the synthetic screenshot fixture.*
+
+![Fleet grouped by machine: box-b answering with two agents, box-c unreachable](img/view-fleet-machines-light.png)
+*Fleet with machines configured, from the synthetic screenshot fixture
+(two invented machines, one of them not answering).*
+
+#### When a machine cannot be reached
+
+Centrale keeps trying (every refresh, and the control connection
+reconnects every few seconds) and changes nothing on its own: nothing is
+ended, cleaned up or merged automatically.
+
+- Its agents show **machine unreachable**, not "state unknown": unknown
+  is an agent Centrale could read that has reported nothing, unreachable
+  is one it cannot read at all. The machine's heading in Fleet says so.
+  Which agents are listed comes from the fleet journal (the tasks last
+  seen running there), since the machine cannot be asked.
+- Actions that need the machine are disabled with that reason, and the
+  server refuses them with its own: Merge, Discard, Abandon, End session
+  and Resume, and spawning there. Its tasks are still located by the
+  hub's last fetched copies of their branches, so they keep showing as on
+  that machine. The exception is a teardown that was
+  already under way: an End session or the cleanup after a merge the
+  machine stops answering for is recorded as owed (HTTP 202) and carried
+  out when it answers again. See [Tasks on another
+  machine](merging.md#tasks-on-another-machine) for the gates.
+- Boards, other machines and this machine's own projects are unaffected:
+  each machine gets a time budget per refresh, and machines are asked in
+  parallel.
+
+### Agents on another machine: how their status gets here
+
+With [`machines`](configuration.md#setup--configuration) configured, an
+agent running on a worker reports its status without ever contacting
+Centrale: its hooks (run by the agent tool on each event, never by the
+model) write a note on the agent's own tmux pane on the worker, and
+Centrale reads those notes over one long-lived ssh connection per worker,
+a tmux control-mode client attached to a session named `centrale_control`
+there, into which each task's window is linked. There is no reverse tunnel,
+because Centrale has no login and a tunnel would open its whole API to
+anything on the worker; and there is no status file, because a file would
+outlive a crashed agent. See [How a remote agent's status reaches
+Centrale](architecture.md#how-a-remote-agents-status-reaches-centrale) for
+the details.
+
+What you will see:
+
+- **A restart** reads every worker's notes before announcing anything, so
+  a remote task comes back with its current state (`working` included),
+  marked "read back from <machine>". Startup waits up to about 8 s for a
+  worker that does not answer, then announces that worker as unreachable
+  for each task last seen running there.
+- **A network drop** is retried every few seconds; on reconnect the current
+  state of every task pane arrives within a second.
+- **tmux crashing on the worker** takes its agents with it. Their tasks
+  show as ended sessions, with Resume.
+- Leave `centrale_control` running on the worker: Centrale creates it when
+  it is missing, and killing it only makes Centrale link the task windows
+  into a new one.
 
 ### Restarting after a change
 
@@ -434,35 +863,27 @@ most of the causes below in one pass.
   restriction`; confirm it yourself with
   `cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns` (`1` means
   restricted). Two fixes, in order of preference:
-  - **Targeted (recommended)** — grant the exception to `bwrap` itself,
-    not to every unprivileged process on the system. Save as e.g.
-    `/etc/apparmor.d/bwrap-userns`:
-    ```
-    abi <abi/4.0>,
-    include <tunables/global>
-
-    profile bwrap-userns /usr/bin/bwrap flags=(unconfined) {
-      userns,
-    }
-    ```
-    then load it: `sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns`.
-    (Confirm `bwrap`'s actual path first with `which bwrap` — adjust the
-    profile if it differs, and expect minor syntax differences across
-    AppArmor/Ubuntu versions.)
+  - **Targeted (recommended)** — grant the exception only to the two
+    `bwrap` programs: Ubuntu's `/usr/bin/bwrap`, and the copy bundled with
+    Codex that it actually runs. The exact commands, which find the bundled
+    path for you and test the result, are in
+    [Setting up a worker](#setting-up-a-worker), step 2. They find the
+    bundled copy where npm installs Codex; for another install method, point
+    `cbwrap` at that install's `codex-resources/bwrap` instead (`find ~
+    -path '*codex-resources/bwrap'`). Expect minor syntax differences across
+    AppArmor/Ubuntu versions.
   - **Global (simpler, broader)** — disables the restriction for *every*
     unprivileged process on the machine, not just `bwrap`, which is a real
     reduction in this specific sandboxing protection: `sudo sysctl -w
     kernel.apparmor_restrict_unprivileged_userns=0` (add
     `kernel.apparmor_restrict_unprivileged_userns=0` to a file under
     `/etc/sysctl.d/` to persist it across reboots).
-  This is non-fatal to Centrale itself either way — only codex's own
-  sandboxed spawns are affected, and `--check` reports it as a `[WARN]`,
-  not a `[FAIL]`. The shipped `worktreeRoot: "@repo"` (see "Setup /
-  configuration" in [docs/configuration.md](configuration.md#setup--configuration)) largely sidesteps this already, since it gives a
-  spawned worktree the project's own directory trust instead of an
-  untrusted sibling path — both fixes above are mainly needed if you've
-  switched to a custom, out-of-repo `worktreeRoot`, or for other tools
-  that shell out to `bwrap` outside of a Centrale spawn.
+  A worker's `--check` uses `codex sandbox true` to exercise Codex's own
+  sandbox without model usage. It reports `[FAIL]` when that fails, or
+  `[WARN]` if the worker has `approvals_reviewer = "auto_review"` in
+  `~/.codex/config.toml`. That setting permits an unsandboxed command after
+  automatic review; it does not repair the sandbox. The hub's direct
+  `bwrap` check remains a warning. Folder trust is a separate check.
 
 ## Tests
 
@@ -555,7 +976,8 @@ lifecycle, spawn, harvest, resume, cleanup, discarding an attempt,
 reconcile, the first-run settings path, the release script, and the
 tier's own tmux-socket namespacing.
 
-The tier needs `git`, `tmux` and the `backlog` CLI on `PATH` — plus `tar`,
+The tier needs `git`, `tmux` and the `backlog` CLI on `PATH` — plus `timeout`
+and `setsid` for worker-readiness scratch tests and `tar`,
 which only the release-script module needs, and `node`, which that module
 and the settings one both need; a
 module whose tests need a missing tool skips cleanly rather than failing. It
@@ -635,7 +1057,7 @@ This is the reproducible manual check to run against a real repository
 ## Regenerating the documentation screenshots
 
 `docs/img/` holds the images the README and the docs lead with —
-`board-light.png`, `board-dark.png`, `drawer-pane.png`, `drawer-deps.png`,
+`board-light.png`, `board-dark.png`, `board-machines-light.png` / `board-machines-dark.png`, `drawer-pane.png`, `drawer-deps.png`,
 `session-theater.png`, the `view-*` set and the phone-width
 `status-page-light.png` / `status-page-dark.png`. They are generated, not hand-taken:
 
@@ -1233,3 +1655,49 @@ refuse any push whose target remote matches `.release-remote`'s
 regardless of how the remote got added. This is optional and not installed
 automatically — the copy-paste recipe lives in `scripts/release.sh`'s own
 header comment (`.git/hooks/pre-push`, executable).
+
+
+## Project worker readiness
+
+Centrale installs nothing on workers. Each project owns its setup script,
+setup document, read-only readiness check and forbidden-file list. Keep
+sudo steps as exact commands for the owner to run. Checks must only read:
+no installation, no transient memory/gate-lock decisions, and report a
+forbidden file by name only, never its contents. Add the declaration only
+after the script is on the project's main branch:
+
+```json
+"workerCheck": {
+  "command": "scripts/worker/check.sh --check",
+  "doc": "docs/WORKER-SETUP.md"
+}
+```
+
+For a spawn on box-b, Centrale pushes and pins the hub base, creates a
+unique detached scratch worktree on box-b, applies the project's
+`worktreeLinks`, runs the command from that root, and removes the scratch
+worktree before claiming the task. The parked tree may be empty. A passing
+check continues with the existing claim, push, task worktree and launch.
+No declaration keeps the existing path; hub spawns and Resume skip the check.
+
+The check is bounded to 10 seconds, with a 2-second kill grace. Scratch
+processes receive TERM, a bounded wait, then KILL if needed; cleanup verifies
+none remain before removing the worktree/log on pass, failure and timeout.
+Worker temporary paths use `$TMPDIR` (default `/tmp`) with unique
+`centrale-worker-check-XXXXXX` names and a sibling `.output` log; set
+`TMPDIR` in the worker environment to change that resource root. Cleanup
+failure is a refusal, rather than a passing check. Error output is limited
+to 2000 characters. A missing or non-executable check file is named as "setup not finished";
+a present check exiting 126/127 is an ordinary check failure (for example,
+a required tool is missing). On workers without `/proc`, the process
+sweep is skipped and scratch tree/log removal still runs.
+The refusal includes the machine and reason followed by:
+
+> read docs/WORKER-SETUP.md in app and set up box-b, or spawn on the hub
+
+`python3 server.py --check` and Settings **Check this machine** run declared
+checks for each project placed on that worker and count PASS/WARN/FAIL rows.
+They never push: the scratch tree uses the worker's existing parked base
+ref, using the hub checkout's current branch name (e.g. `master`). A missing ref is WARN ("not pushed yet; checked at the next spawn"); a
+worker base behind or differing from the hub base is named in the line. Spawn always
+checks the freshly pushed base. Readiness results are never stored.

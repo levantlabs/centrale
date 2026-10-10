@@ -23,6 +23,68 @@ would protect is the shape of `projects.json`, the `/api` endpoints
 documented in [docs/api.md](docs/api.md), and what a spawned agent is
 handed.
 
+## v0.6.0 — agents on other machines
+
+Centrale can now run agents on other machines over ssh, while the board,
+merges and every status stay on the machine Centrale runs on.
+
+Tested against **`backlog` v1.53.0**, unchanged from v0.5.0. Remote machines
+are tested with Ubuntu 24.04 workers; other Linux systems and macOS are
+untested.
+
+**New:**
+
+- **Run agents on other machines.** Add a machine in Settings (a name, the
+  ssh target, a folder for project copies and one for task folders, and an
+  optional agent limit), tick it on the projects that may use it, and pick
+  it beside Spawn. The agent runs there; its branch is fetched back, merge
+  gates run on the worker, and the merge happens here. Status, the session
+  view, typed replies, End session, Discard and Abandon all work for a
+  remote agent. A project's agent limit counts every machine, and each
+  machine has its own limit across projects. Fleet groups agents by
+  machine, an unreachable machine is shown as such, and the phone status
+  page says where each agent runs. Projects without `machines` work exactly
+  as before. Setup guide:
+  [docs/operations.md](docs/operations.md#setting-up-a-worker).
+- **`python3 server.py --check` covers every machine**: ssh, git, tmux, the
+  agent CLIs and their logins, folder trust, Codex's sandbox and each
+  project's copy there. Missing pieces come with the exact commands to run,
+  and the output ends with pass, warning and failure counts per machine.
+  Settings' **Check this machine** shows the same.
+- **An optional readiness check per project (`workerCheck`).** A project can
+  name a read-only check script and a setup document. Before an agent is
+  sent to another machine, Centrale runs the check there in a throwaway
+  copy; if it fails, the spawn is refused before anything is claimed, and
+  the reply says what failed and which document to read. Centrale stores
+  only the two paths and installs nothing.
+- **Machine status in the sidebar.** Free RAM, swap in use, free disk and
+  CPU load for this machine and every worker, turning amber or red when
+  they get tight, refreshed every 30 seconds. Fleet's machine headers show
+  the same.
+
+**Changed:**
+
+- **Agents Centrale launches start with Claude Code's prompt suggestions
+  off.** An idle agent's input box no longer shows a guessed next message
+  that can read like a real instruction. Your own sessions are unaffected.
+- **Agent status survives a Centrale restart** instead of showing unknown,
+  for agents here and on workers.
+- **An orchestrator's first message reaches the agent before it starts**,
+  rather than racing the spawn prompt.
+- **The reconcile prompt no longer tells agents to run full test suites**
+  when a project has no `checkCommand`.
+
+**Fixed:**
+
+- **The spawn claim commits only the task's own file**, no longer sweeping
+  up another session's uncommitted board edits.
+- **End session no longer stops Codex's shared background service** when
+  Codex first started it inside the task's folder.
+- **Cleaning up a branch refuses to delete uncommitted work** unless you
+  force it, and lists what would be lost first.
+- **The release scan no longer flags the project's own public repository
+  URL** when the machine's account shares its owner's name.
+
 ## v0.5.0 — status page for your phone
 
 You can now check on your agents from a phone, and a few startup and

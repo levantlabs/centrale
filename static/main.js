@@ -77,5 +77,6 @@
   // Boot
   // ------------------------------------------------------------------
 
+  document.addEventListener("DOMContentLoaded", function () { C.startSystemPolling(); });
   C.doRefresh(true);
 })(window.Centrale = window.Centrale || {});

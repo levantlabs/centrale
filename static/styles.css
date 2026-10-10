@@ -451,6 +451,12 @@
   }
   .chip-checkbox:focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); border-radius: 3px; }
   .chip .proj-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip .proj-fetch {
+    font-size: 10px;
+    color: var(--text-faint);
+    flex: none;
+  }
+  .chip .proj-fetch.stale { color: var(--warning); }
   .chip .proj-count {
     flex: none;
     font-size: 10.5px;
@@ -795,6 +801,34 @@
     text-overflow: ellipsis;
     white-space: nowrap;
   }
+  .settings-machine-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 8px;
+    font-size: 12px;
+  }
+  .settings-machine-row span { flex: 1 1 120px; color: var(--text-dim); }
+  #settings-machine-editor {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 10px;
+    margin-top: 8px;
+  }
+  #settings-machine-editor .settings-label:not(:first-child) { margin-top: 8px; }
+  #settings-machine-editor .btn { margin-top: 10px; margin-right: 5px; }
+  .settings-machine-check-results {
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    max-height: 240px;
+    overflow-y: auto;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: 8px;
+    font-size: 11px;
+    color: var(--text);
+  }
 
   /* task-78: Agents editor (collapsed <details> section). */
   #settings-agents-section > summary, #settings-projects-section > summary {
@@ -1071,6 +1105,13 @@
   .fleet-k-review { --c: var(--accent); }
   .fleet-k-idle, .fleet-k-unknown { --c: var(--text-faint); }
   .fleet-k-block { --c: var(--danger); }
+  .fleet-k-unreachable { --c: var(--warning); }
+  .fleet-machine { margin-bottom: 18px; }
+  .fleet-machine-head { display: flex; align-items: baseline; gap: 10px; margin: 0 2px 8px; }
+  .fleet-machine-name { font-weight: 700; font-size: 14px; }
+  .fleet-machine-cap { color: var(--text-dim); font-size: 12.5px; }
+  .fleet-machine-cap.full { color: var(--danger); font-weight: 600; }
+  .fleet-machine-reach.down { color: var(--warning); background: var(--warning-dim); border-radius: 999px; padding: 1px 9px; font-size: 11.5px; font-weight: 600; }
   .fleet-empty { color: var(--text-dim); padding: 12px 4px; }
 
   .fleet-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr)); gap: 14px; }
@@ -1537,6 +1578,28 @@
     background: transparent;
     border: 1px dashed var(--success);
   }
+  .agent-badge-unreachable {
+    color: var(--warning);
+    background: var(--warning-dim);
+    border: 1px solid var(--warning);
+  }
+  .machine-chip {
+    font-size: 10.5px;
+    font-weight: 600;
+    padding: 1px 7px;
+    border-radius: 999px;
+    color: var(--text-dim);
+    border: 1px solid var(--border-strong);
+  }
+  .machine-chip.location-conflict, .session-machine.location-conflict {
+    color: var(--warning);
+    border-color: var(--warning);
+  }
+  .spawn-machine-label { font-size: 11.5px; color: var(--text-dim); margin-right: 6px; }
+  .spawn-machine-picker { max-width: 100%; }
+  .settings-machine-checks { display: flex; flex-wrap: wrap; gap: 4px 14px; }
+  .settings-machine-checks label { font-size: 12.5px; display: inline-flex; gap: 5px; align-items: center; }
+  .session-machine { font-size: 11.5px; color: var(--text-dim); overflow-wrap: anywhere; }
   .agent-badge-unknown {
     color: var(--text-faint);
     background: var(--bg-input);
@@ -1595,9 +1658,13 @@
   /* task-171: the agent picker offered beside Spawn when the task's
      assignee names no configured agent -- the button keeps the width. */
   .card-footer { gap: 6px; }
-  .card-footer .spawn-agent-picker { flex: 0 0 auto; max-width: 55%; min-width: 0; margin-top: 2px; font-size: 11px; }
+  .card-footer .spawn-agent-picker, .card-footer .spawn-machine-picker { flex: 0 0 auto; max-width: 55%; min-width: 0; margin-top: 2px; font-size: 11px; }
+  /* task-225: with a machine picker too, the pickers share one row and the button takes the next. */
+  .card-footer.card-footer-wrap { flex-wrap: wrap; }
+  .card-footer-wrap .spawn-agent-picker, .card-footer-wrap .spawn-machine-picker { flex: 1 1 40%; max-width: none; }
+  .card-footer-wrap .spawn-inline { flex: 1 1 100%; }
   .card-footer .spawn-inline { flex: 1 1 auto; min-width: 0; }
-  .spawn-agent-picker {
+  .spawn-agent-picker, .spawn-machine-picker {
     background: var(--bg-input);
     border: 1px solid var(--border-strong);
     color: var(--text);
@@ -1606,9 +1673,9 @@
     font-size: 12px;
     font-family: inherit;
   }
-  .spawn-agent-picker:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+  .spawn-agent-picker:focus, .spawn-machine-picker:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
   .spawn-agent-pick-row { display: flex; margin-bottom: 6px; }
-  .spawn-agent-pick-row .spawn-agent-picker { flex: 1 1 auto; padding: 6px 8px; }
+  .spawn-agent-pick-row .spawn-agent-picker, .spawn-agent-pick-row .spawn-machine-picker { flex: 1 1 auto; padding: 6px 8px; }
   .spawn-status-line.spawn-agent-reason { margin: 0 0 8px; word-break: normal; color: var(--text-dim); }
   .spawn-status-line {
     font-size: 10.5px;
@@ -2528,3 +2595,11 @@ body.phone-page { display: block; height: auto; min-height: 100%; overflow: auto
 .phone-foot { font-size: 12px; color: var(--text-faint); text-align: center; padding-top: 4px; }
 .settings-status-links { margin: 6px 0 0; padding-left: 18px; font-family: var(--mono); font-size: 12px; }
 .settings-status-links a { overflow-wrap: anywhere; }
+
+/* task-242: metric colours follow the active theme. */
+.machine-row { padding: 6px 10px; font-size: 11px; line-height: 1.6; }
+.machine-metrics { font-size: 11px; font-weight: normal; }
+.machine-metrics .amber { color: var(--warning); }
+.machine-metrics .red { color: var(--danger); }
+.machine-metrics.unavailable { color: var(--text-faint); }
+.fleet-machine-head { flex-wrap: wrap; }

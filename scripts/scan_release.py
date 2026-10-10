@@ -232,6 +232,19 @@ ALLOWLIST = [
      "the SSH remote URL form, identical for every GitHub user"),
 ]
 
+# task-231: the published URL appears in README, the UI and tests, but
+# RELEASE_REMOTE is local, gitignored configuration and is absent from a
+# snapshot. Name this one public repository here so an account with the
+# same name as its owner does not make the release scan fail. The match
+# stops at the repository boundary; another repository or prose is not
+# covered. A path beneath the repository may follow that boundary.
+PUBLIC_REPO_URL = re.compile(
+    r"(?<![A-Za-z0-9./-])(?:https?://|git@)?"
+    r"github\.com[/:]" + "levant" + "labs" + r"/centrale(?:\.git)?"
+    r"(?:/[^\s\"'<>),;]*)?(?=$|[?#\s\"'<>),;])",
+    re.IGNORECASE,
+)
+
 
 # --- paths whose identity rules are deliberately not enforced -----------
 
@@ -411,9 +424,10 @@ def derived_identity_rules(root):
     full_name = git_config(root, "user.name")
     if full_name:
         candidates.append(("git-name", full_name))
-        # Search the parts too: a snapshot leaks "Chammas" as readily as
-        # it leaks the full string. Short parts are dropped as prose.
-        for part in re.split(r"\s+", full_name):
+        # Search the parts too: a snapshot leaks a surname alone as readily
+        # as the full string, including either half of a hyphenated one.
+        # Short parts are dropped as prose.
+        for part in re.split(r"[\s-]+", full_name):
             if len(part) >= 5 and re.fullmatch(r"[A-Za-z][A-Za-z'-]+", part):
                 candidates.append(("git-name", part))
 
@@ -612,6 +626,12 @@ def allowlisted(rule_name, matched):
     return False
 
 
+def in_public_repo_url(line, match):
+    """Whether this account hit is part of Centrale's own public URL."""
+    return any(url.start() <= match.start() and match.end() <= url.end()
+               for url in PUBLIC_REPO_URL.finditer(line))
+
+
 def identity_exempt(relpath):
     return relpath.startswith(IDENTITY_EXEMPT_PREFIXES)
 
@@ -640,6 +660,8 @@ def scan_file(root, relpath, rules):
                 continue
             for match in rule.pattern.finditer(line):
                 matched = match.group(0)
+                if rule.name == "machine-account" and in_public_repo_url(line, match):
+                    continue
                 if allowlisted(rule.name, matched):
                     continue
                 findings.append(Finding(relpath, lineno, rule, matched))

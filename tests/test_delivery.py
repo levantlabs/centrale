@@ -517,6 +517,77 @@ class RuleApiTests(ApiHarness):
         self.assertEqual((entry["sender"], entry["text"], entry["outcome"]),
                          ("lead-agent", expected, "delivered"))
 
+    def test_rule_reaches_a_live_worker_session(self):
+        import machines
+
+        self.config["projects"][0]["machines"] = ["box-d"]
+        self.config["machines"] = [{"name": "box-d", "tmuxSocket": "stand-in"}]
+        self.addCleanup(self.config["projects"][0].pop, "machines")
+        self.addCleanup(self.config.pop, "machines")
+        location = mock.Mock(conflict=False, machine="box-d")
+        expected = f"[ruling from lead-agent] {self.RULING}"
+        captures = iter([["› ready"], ["› " + expected]])
+        capture = mock.Mock(side_effect=lambda _: next(captures))
+        server.remote_task_pane_capture[("box-d", "my-app", "TASK-9")] = capture
+        self.addCleanup(server.remote_task_pane_capture.clear)
+        answer = machines.MachineResult(machines.ANSWERED, 0, "", "", "box-d")
+        with mock.patch.object(server, "task_location", return_value=location), \
+             mock.patch.object(machines, "run_on_machine", return_value=answer) as run, \
+             mock.patch.object(server, "run_tmux", side_effect=AssertionError("hub tmux used")), \
+             mock.patch.object(server, "list_sessions", side_effect=AssertionError("hub sessions used")):
+            status, body = self._request("POST", "/api/rule", {
+                "project": "my-app", "taskId": "TASK-9", "sender": "lead-agent", "text": self.RULING})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["mode"], "delivered")
+        self.assertEqual(body["echo"], "› " + expected)
+        self.assertEqual([call.args[2][3] for call in run.call_args_list],
+                         ["has-session", "load-buffer", "paste-buffer", "send-keys"])
+        self.assertEqual(run.call_args_list[1].kwargs["input"], expected)
+        self.commit.assert_not_called()
+
+    def test_rule_refuses_a_worker_move_between_dialog_capture_and_send(self):
+        import machines
+
+        self.config["projects"][0]["machines"] = ["box-d", "box-e"]
+        self.config["machines"] = [{"name": "box-d"}, {"name": "box-e"}]
+        self.addCleanup(self.config["projects"][0].pop, "machines")
+        self.addCleanup(self.config.pop, "machines")
+        first = mock.Mock(conflict=False, machine="box-d")
+        moved = mock.Mock(conflict=False, machine="box-e")
+        server.remote_task_pane_capture[("box-d", "my-app", "TASK-9")] = lambda _: ["› ready"]
+        self.addCleanup(server.remote_task_pane_capture.clear)
+        answer = machines.MachineResult(machines.ANSWERED, 0, "", "", "box-d")
+        with mock.patch.object(server, "task_location", side_effect=[first, first, moved]), \
+             mock.patch.object(machines, "run_on_machine", return_value=answer) as run:
+            status, body = self._request("POST", "/api/rule", {
+                "project": "my-app", "taskId": "TASK-9", "sender": "lead-agent", "text": self.RULING})
+        self.assertEqual(status, 500, body)
+        self.assertEqual(body["outcome"], "tmux-error")
+        self.assertIn("location changed", body["reason"])
+        self.assertEqual(len(run.call_args_list), 1)  # has-session only; no paste or Enter
+        self.commit.assert_not_called()
+
+    def test_rule_with_no_worker_session_commits_on_worker_branch(self):
+        import machines
+        import remote
+
+        self.config["projects"][0]["machines"] = ["box-d"]
+        self.config["machines"] = [{"name": "box-d", "tmuxSocket": "stand-in"}]
+        self.addCleanup(self.config["projects"][0].pop, "machines")
+        self.addCleanup(self.config.pop, "machines")
+        location = mock.Mock(conflict=False, machine="box-d")
+        gone = machines.MachineResult(machines.ANSWERED, 1, "", "can't find session", "box-d")
+        committed = {"branch": "task/task-9", "worktree": "/worker/wt", "path": "backlog/tasks/task-9 - X.md", "commit": "abc"}
+        with mock.patch.object(server, "task_location", return_value=location), \
+             mock.patch.object(machines, "run_on_machine", return_value=gone), \
+             mock.patch.object(remote, "commit_ruling", return_value=committed) as commit:
+            status, body = self._request("POST", "/api/rule", {
+                "project": "my-app", "taskId": "TASK-9", "sender": "lead-agent", "text": self.RULING})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["mode"], "committed")
+        commit.assert_called_once()
+        self.commit.assert_not_called()
+
     def test_a_failed_delivery_to_a_live_agent_is_returned_and_nothing_is_written_around_it(self):
         status, body, _ = self._rule(
             lambda: [{"name": SESSION}],

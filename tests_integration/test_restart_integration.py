@@ -71,12 +71,17 @@ class ServerRestartIntegrationTests(base.IntegrationCase):
         base.tmux("new-session", "-d", "-s", name, "sleep 300", check=True)
         return name
 
-    def notify(self, task, state):
+    def notify(self, task, state, pane=False):
         event_url = self.url("/api/agent-event", project=PROJECT, task=task.upper(),
                              agentKind="claude")
+        extra = {"CENTRALE_EVENT_URL": event_url}
+        if pane:
+            name = f"centrale-{PROJECT}-{task}"
+            extra["TMUX_PANE"] = base.tmux("display-message", "-p", "-t", name,
+                                           "#{pane_id}", check=True).stdout.strip()
         started = time.monotonic()
         subprocess.run([sys.executable, os.path.join(self.app_dir, "centrale_notify.py"), state],
-                       env=self.env({"CENTRALE_EVENT_URL": event_url}), check=True,
+                       env=self.env(extra), check=True,
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
         return time.monotonic() - started
 
@@ -142,3 +147,20 @@ class ServerRestartIntegrationTests(base.IntegrationCase):
                          ("finished", since))
         self.assertEqual(agents["TASK-2"]["state"], "finished")
         self.assertEqual(agents["TASK-3"]["state"], "unknown")
+
+    def test_local_pane_working_note_survives_server_restart(self):
+        first = self.start_server()
+        name = self.new_session("task-1")
+        self.fleet_agents()
+        self.notify("task-1", "working", pane=True)
+        note = base.tmux("show-option", "-p", "-v", "-t", name,
+                         "@centrale_state", check=True).stdout.strip()
+        self.assertTrue(note.startswith("working "), note)
+        fired_at = float(note.split(" ")[1])
+        self.stop_server(first)
+        self.start_server()
+        _, lines = self.drain("TASK-1 working after the server restart")
+        self.assertEqual(lines, ["TASK-1 working after the server restart"])
+        agent = self.fleet_agents()["TASK-1"]
+        self.assertEqual(agent["state"], "working")
+        self.assertEqual(agent["stateSince"], fired_at)

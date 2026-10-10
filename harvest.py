@@ -210,6 +210,41 @@ def list_task_branches(repo_path):
     return [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
 
 
+def task_branches(config, project):
+    """list_task_branches for a project wherever its tasks' branches live:
+    the hub's refs/heads plus -- for each machine the project lists
+    (task-208, task-224) -- the hub's fetched copies under
+    refs/remotes/<machine>/task/*, returned as the same task/<id> names,
+    each once. Those copies are as fresh as the last task/* fetch (the
+    board shows its age); every gate re-reads the worker before deciding
+    anything."""
+    branches = list_task_branches(project["path"])
+    if not project.get("machines"):
+        return branches
+    import machines  # local import: only for a project with machines
+
+    seen = set(branches)
+    for name in project["machines"]:
+        for branch in sorted(machines.fetched_task_branches(project, name) - seen):
+            seen.add(branch)
+            branches.append(branch)
+    return branches
+
+
+def locate_for_merge(config, project, task_id):
+    """(the project placed at the task's derived location, None) or
+    (None, the refusal) for a task in two places (task-224). A project
+    with no machines, or one already placed, comes back as it is."""
+    if "machine" in project or not project.get("machines"):
+        return project, None
+    import machines  # local import: only for a project with machines
+
+    location = machines.locate(config, project, task_id)
+    if location.conflict:
+        return None, location.conflict_reason()
+    return location.placed(), None
+
+
 def _branch_exists(repo_path, branch):
     """Cheap single-ref existence check, used by evaluate_branch() to
     tell "nothing here to evaluate, it's already merged/gone" apart from
@@ -666,6 +701,19 @@ def evaluate_branch(config, project, task_id, on_gate=None):
     rather than run, nor for the already-merged early return. Default
     None, so an evaluate-only GET publishes nothing.
     """
+    placed, conflict = locate_for_merge(config, project, task_id)
+    if conflict:
+        branch = spawn.branch_name(task_id)
+        return _report(task_id, branch, [_gate(GATE_NAMES[0], False, conflict)]
+                       + [_skipped(n) for n in GATE_NAMES[1:]], None, None)
+    project = placed
+    if project.get("machine"):
+        # task-208: the task's worktree, session and branch are on a
+        # worker; every gate there is read from the worker itself.
+        import remote_harvest  # local import: only with a machine configured
+
+        return remote_harvest.evaluate(config, project, task_id, on_gate=on_gate)
+
     branch = spawn.branch_name(task_id)
 
     def began(name):
@@ -802,7 +850,7 @@ def evaluate_all_branches(config, project_name):
         raise HarvestError(f"project path not found: {repo_path or '(empty)'}", status=502)
 
     reports = []
-    for branch in list_task_branches(repo_path):
+    for branch in task_branches(config, project):
         task_id = task_id_from_branch(branch)
         if task_id is None:
             continue
@@ -892,9 +940,26 @@ def harvest_branch(
     # holds the per-task lock ever asks for _harvest_lock, so there is
     # no cycle to deadlock on.
     with _harvest_lock, server.task_lifecycle_lock(project_name, task_id):
+        # task-224: the task's location is derived fresh, under its lock.
+        placed, conflict = locate_for_merge(config, project, task_id)
+        if conflict:
+            raise HarvestError(conflict, status=409)
+        project = placed
+        if project.get("machine") and (adopt_done or discard_main_task_edit):
+            # Both act in the agent's worktree or against a gate report the
+            # remote evaluation never produces (no Done divergence is offered
+            # for a task on a machine).
+            raise HarvestError(
+                f"that merge action is not available for a task on machine {project['machine']}",
+                status=409,
+            )
         _begin_progress(project_name, task_id, spawn.branch_name(task_id), trigger)
         try:
-            if adopt_done:
+            if project.get("machine"):
+                import remote_harvest  # local import: only with a machine configured
+
+                report = remote_harvest.harvest_locked(config, project, project_name, task_id)
+            elif adopt_done:
                 report = _adopt_done_and_harvest_locked(
                     config, project, project_name, task_id
                 )
@@ -1034,19 +1099,15 @@ def _discard_main_task_edit_and_harvest_locked(config, project, project_name, ta
     return report
 
 
-def _harvest_branch_locked(config, project, project_name, task_id):
-    """The actual evaluate-then-merge body of harvest_branch(), run
-    under _harvest_lock. Split out only so the lock/event-recording
-    wrapper above has a single, simple call site."""
-    report = evaluate_branch(config, project, task_id, on_gate=_set_progress_stage)
-    if not report["harvestable"]:
-        report["merged"] = False
-        return report
-
+def main_checkout_gate(report, project, task_id, base_branch, merge_ref):
+    """The final pre-merge check of the project's own checkout, appended
+    to `report` as the "mainCheckoutClean" gate. Returns the number of
+    unrelated uncommitted files the merge may pass, or None after marking
+    the report blocked. `merge_ref` is what will be merged: the branch
+    locally, the pinned fetched commit for a task on a machine."""
     repo_path = project["path"]
-    branch = report["branch"]
-    base_branch = spawn.current_branch(repo_path)
-
+    project_name = project["name"]
+    branch = merge_ref
     # Final immediate pre-merge safety check. Gates 4/5 evaluate in an
     # isolated scratch worktree and never look at the project's own
     # checkout, so its cleanliness could have changed since. Unlike the
@@ -1063,7 +1124,7 @@ def _harvest_branch_locked(config, project, project_name, task_id):
         report["gates"].append(_gate("mainCheckoutClean", False, f"failed to check {project_name}'s checkout: {stderr}"))
         report["harvestable"] = False
         report["merged"] = False
-        return report
+        return None
 
     staged_paths, other_paths = _parse_dirty_paths(status_proc.stdout or "")
     touched_paths = _merge_touched_paths(repo_path, base_branch, branch)
@@ -1074,7 +1135,7 @@ def _harvest_branch_locked(config, project, project_name, task_id):
         ))
         report["harvestable"] = False
         report["merged"] = False
-        return report
+        return None
 
     # Staged changes block unconditionally (even to a path the merge
     # never touches); an unstaged/untracked path only blocks when it
@@ -1087,7 +1148,9 @@ def _harvest_branch_locked(config, project, project_name, task_id):
         # refusal and is never touched by Centrale.
         task_path = _safe_task_path(report.get("taskPath"), task_id)
         unstaged_tracked = _unstaged_tracked_paths(status_proc.stdout or "")
-        if task_path and blocking_paths == {task_path} and task_path in unstaged_tracked:
+        # Not for a task on a machine: that action is refused there.
+        if (task_path and not project.get("machine") and blocking_paths == {task_path}
+                and task_path in unstaged_tracked):
             report["discardableMainTaskEdit"] = {"path": task_path}
         file_list = ", ".join(sorted(blocking_paths))
         n = len(blocking_paths)
@@ -1098,14 +1161,32 @@ def _harvest_branch_locked(config, project, project_name, task_id):
         ))
         report["harvestable"] = False
         report["merged"] = False
-        return report
+        return None
     report["gates"].append(_gate("mainCheckoutClean", True, None))
 
     # Everything left in other_paths at this point is unrelated dirt
     # that's safe to merge straight past -- noted on the success report
     # below (see harvest_branch's docstring) once the merge actually
     # happens, not claimed here before it does.
-    unrelated_dirty_count = len(other_paths)
+    return len(other_paths)
+
+
+def _harvest_branch_locked(config, project, project_name, task_id):
+    """The actual evaluate-then-merge body of harvest_branch(), run
+    under _harvest_lock. Split out only so the lock/event-recording
+    wrapper above has a single, simple call site."""
+    report = evaluate_branch(config, project, task_id, on_gate=_set_progress_stage)
+    if not report["harvestable"]:
+        report["merged"] = False
+        return report
+
+    repo_path = project["path"]
+    branch = report["branch"]
+    base_branch = spawn.current_branch(repo_path)
+
+    unrelated_dirty_count = main_checkout_gate(report, project, task_id, base_branch, branch)
+    if unrelated_dirty_count is None:
+        return report
 
     _set_progress_stage(STAGE_MERGE)
     title = report.get("taskTitle") or task_id
@@ -1174,7 +1255,7 @@ def harvest_all_ready(config, project_name, trigger="click"):
 
     merged = []
     not_ready = []
-    for branch in list_task_branches(repo_path):
+    for branch in task_branches(config, project):
         task_id = task_id_from_branch(branch)
         if task_id is None:
             continue

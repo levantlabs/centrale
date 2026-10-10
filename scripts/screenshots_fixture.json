@@ -591,6 +591,32 @@
       "theme": "dark"
     },
     {
+      "name": "view-fleet-machines-light",
+      "kind": "view",
+      "view": "fleet",
+      "machines": true,
+      "theme": "light"
+    },
+    {
+      "name": "view-fleet-machines-dark",
+      "kind": "view",
+      "view": "fleet",
+      "machines": true,
+      "theme": "dark"
+    },
+    {
+      "name": "board-machines-light",
+      "kind": "board",
+      "machines": true,
+      "theme": "light"
+    },
+    {
+      "name": "board-machines-dark",
+      "kind": "board",
+      "machines": true,
+      "theme": "dark"
+    },
+    {
       "name": "view-timeline-light",
       "kind": "view",
       "view": "timeline",

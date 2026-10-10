@@ -586,3 +586,19 @@ one.
 
 Errors (e.g. an unknown project, or a launch failure) show up as a
 dismissible toast in the top-right of the page rather than blocking the UI.
+
+### Machine resources
+
+The sidebar's Machines section, below Sessions, shows the hub and every
+configured worker's available RAM, swap in use, free disk, and one-minute CPU
+load divided by its core count. Fleet machine headers show the same observations, refreshed
+every 30 seconds. Unknown figures read
+`n/a`; a worker awaiting its first read shows `checking…` in grey. A completed
+failed worker read shows `unreachable` in grey. Metrics are added to existing
+Fleet machine headers; the existing reach badges and grouping rules remain.
+
+Available RAM is amber below 20% of total and red below 10%. Free disk is amber
+below 15% and red below 5%. Swap in use is amber above 50% of the swap space
+and red above 80%; a machine with no swap space shows no colour. Load is amber
+above the core count and red above 1.5 times that count. Equality stays at the less severe level. These thresholds
+are fixed; there are no usage-limit controls or Settings for them (task-242).
