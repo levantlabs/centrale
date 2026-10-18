@@ -53,7 +53,7 @@ SSH_OPTIONS = (
     ("BatchMode", "yes"),
     ("ConnectTimeout", "5"),
     ("ServerAliveInterval", "5"),
-    ("ServerAliveCountMax", "1"),
+    ("ServerAliveCountMax", "3"),
     ("ControlMaster", "auto"),
     ("ControlPersist", "60"),
 )

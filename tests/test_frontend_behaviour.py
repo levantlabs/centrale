@@ -8507,6 +8507,26 @@ class FleetAndTimelineViewTests(unittest.TestCase):
     def test_fleet_without_machines_has_no_machine_grouping(self):
         self.assertEqual(self.fleet_only["machineGroups"], [])
 
+    def test_empty_hub_keeps_heading_count_and_metrics_without_a_grid(self):
+        driver = FLEET_VIEWS_DRIVER_JS.replace(
+            'var out = {};',
+            '''loadFrontend(["sessions.js"]);
+SNAP.agents.forEach(function (a) { a.machine = "box-b"; });
+SNAP.machines = [{name: "box-b", reach: "reachable", agentCount: 2}];
+SNAP.hub = {agentCount: 0};
+C.systemData = [{name: "hub", reachable: true, ramTotal: 1e10, ramAvailable: 5e9,
+  diskTotal: 1e11, diskFree: 5e10, load1: 1, cores: 4, swapUsed: 0, swapTotal: 0}];
+var out = {};''', 1).replace(
+            'machine: g.attrs["data-machine"],',
+            'grids: find(g, "fleet-grid").length, metrics: find(g, "machine-metrics").map(text), machine: g.attrs["data-machine"],', 1)
+        out = js_harness.cached_driver(self, driver, "view-fleet.js")
+        self.assertEqual([g["machine"] for g in out["machineGroups"]], ["hub", "box-b"])
+        hub = out["machineGroups"][0]
+        self.assertTrue(hub["head"].startswith("This machine0 agents"))
+        self.assertEqual((hub["cards"], hub["grids"]), (0, 0))
+        self.assertEqual(len(hub["metrics"]), 1)
+        self.assertIn("RAM 5.0 GB free", hub["metrics"][0])
+
     def test_fleet_groups_capacity_by_machine_and_marks_unreachable(self):
         # task-210: atlas runs on box-b (which does not answer), orbit on the hub.
         driver = FLEET_VIEWS_DRIVER_JS.replace(
@@ -8959,6 +8979,51 @@ SNAP.agents.push({ project: "atlas", taskId: "TASK-3", agent: "codex",
         ])
 
 
+    def test_machine_metrics_boundaries_states_and_single_machine_layout(self):
+        driver = PHONE_DRIVER_JS.split("(async function () {")[0] + r"""
+(async function () {
+  await settle();
+  var root = document.getElementById("phone-cards");
+  function metrics() { return find(root, "machine-metrics").map(function (n) {
+    return {text:n.textContent, cls:n.className, levels:n.childNodes.filter(function (c) {
+      return c.textContent !== " · "; }).map(function (c) {return c.className;})}; }); }
+  var initial = {groups:find(root,"fleet-machine").length, metrics:metrics(), text:root.textContent};
+  SNAP.machines = [{name:"box-b",reach:"reachable"},{name:"box-c",reach:"unknown"}];
+  SNAP.machineMetrics = [{name:"hub",reachable:true,ramTotal:100,ramAvailable:20,
+    swapTotal:100,swapUsed:50,diskTotal:100,diskFree:15,load1:8,cores:8},
+    {name:"box-b",reachable:false}, {name:"box-c",reachable:null}];
+  await C.phone.poll();
+  var states=metrics(), levels=[];
+  Object.assign(SNAP.machineMetrics[0], {ramAvailable:2500000000,swapUsed:1200000000,
+    diskFree:42000000000,load1:2.16});
+  await C.phone.poll(); var formatted=metrics()[0].text;
+  for (var values of [[20,50,15,8],[19,51,14,8.1],[10,80,5,12],[9,81,4,12.1]]) {
+    Object.assign(SNAP.machineMetrics[0], {ramAvailable:values[0],swapUsed:values[1],diskFree:values[2],load1:values[3]});
+    await C.phone.poll(); levels.push(metrics()[0] ? metrics()[0].levels : []);
+  }
+  SNAP.machineMetrics[0]={name:"hub",reachable:true}; await C.phone.poll();
+  var missing=metrics()[0] ? metrics()[0].text : "";
+  SNAP.agents=[]; await C.phone.poll();
+  var emptyHub=find(root,"fleet-machine").map(function(n){return n.getAttribute("data-machine");});
+  SNAP.machines=[]; SNAP.projects=[]; await C.phone.poll();
+  console.log(JSON.stringify({initial:initial,states:states,levels:levels,missing:missing,
+    formatted:formatted,emptyHub:emptyHub,emptyProjects:metrics()}));
+})();
+"""
+        out = js_harness.run_driver(self, driver)
+        self.assertEqual(out["initial"]["groups"], 0)
+        self.assertEqual(len(out["initial"]["metrics"]), 1)
+        self.assertIn("This machine", out["initial"]["text"])
+        self.assertEqual(out["levels"], [["", "", "", ""], ["amber"] * 4,
+                                         ["amber"] * 4, ["red"] * 4])
+        self.assertEqual([m["text"] for m in out["states"]][1:], ["unreachable", "checking…"])
+        self.assertTrue(all("unavailable" in m["cls"] for m in out["states"][1:]))
+        self.assertEqual(out["missing"], "RAM n/a · swap n/a · disk n/a · load n/a")
+        self.assertEqual(out["formatted"], "RAM 2.5 GB free · swap 1.2 GB used · disk 42.0 GB free · load 2.2/8")
+        self.assertEqual(out["emptyHub"], ["hub", "box-b", "box-c"])
+        self.assertEqual(len(out["emptyProjects"]), 1)
+
+
 SETTINGS_STATUS_PAGE_DRIVER_JS = js_harness.LOAD_SOURCES_JS + r"""
 global.setTimeout = function () { return 0; };
 var C = loadFrontend(["state.js", "dom.js", "tasks.js", "settings.js"]);
@@ -9371,3 +9436,19 @@ class MachineUnreachableBehaviourTests(unittest.TestCase):
         self.assertIn("Resume agent", texts)
         self.assertFalse(out["reachableCard"]["disabled"])
         self.assertFalse(out["hubCard"]["disabled"])
+
+
+class WorktreeResumeAgentBehaviourTests(unittest.TestCase):
+    @js_harness.requires_node
+    def test_resume_names_fresh_server_resolution_not_main_assignee(self):
+        driver = MACHINE_UNREACHABLE_DRIVER_JS.replace(
+            'fs.writeSync(1, JSON.stringify(out));',
+            '\n'.join([
+                'setup("reachable", "box-b");',
+                'C.currentDrawer.summary.assignees = ["@claude"];',
+                'C.currentDrawer.resumeAgent = "codex";',
+                'C.renderDrawerHarvestArea();',
+                'fs.writeSync(1, JSON.stringify(harvestArea()));',
+            ]))
+        out = js_harness.run_driver(self, driver)
+        self.assertIn("Resume codex", [n["text"] for n in out])

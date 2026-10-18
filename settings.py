@@ -86,6 +86,8 @@ def current_settings(config):
         "checkCommands": check_commands,
         "workerCheck": {p["name"]: p.get("workerCheck") for p in config.get("projects", [])},
         "maxAgents": max_agents,
+        "hubMaxAgents": config.get("hubMaxAgents"),
+        "machineMaxAgents": {p["name"]: dict(p.get("machineMaxAgents") or {}) for p in config.get("projects", [])},
         "worktreeLinks": worktree_links,
         "defaultAgent": config.get("defaultAgent") or server.DEFAULT_AGENT_NAME,
         "agents": sorted((config.get("agents") or {}).keys()),
@@ -103,8 +105,9 @@ def current_settings(config):
         # may run on besides the hub, and where a spawn naming none goes.
         result["projectMachines"] = {p["name"]: list(p.get("machines") or [])
                                      for p in config.get("projects", [])}
-        result["defaultMachine"] = {p["name"]: p.get("defaultMachine") or server.HUB
-                                    for p in config.get("projects", [])}
+        result["defaultMachine"] = {
+            p["name"]: p.get("defaultMachine") or (server.HUB if p.get("defaultMachineExplicit") else None)
+            for p in config.get("projects", [])}
     # task-228: keep the old names-only field for project pickers; the
     # editor needs the complete definitions even on an empty install.
     result["machineEntries"] = [dict(m) for m in config.get("machines") or []]
@@ -659,6 +662,12 @@ def apply_settings(config, body, path=None, port=None):
 
     fields = {}
 
+    if "hubMaxAgents" in body:
+        try:
+            server.normalize_project_max_agents(body["hubMaxAgents"], "hubMaxAgents")
+        except server.ConfigError as exc:
+            fields["hubMaxAgents"] = str(exc).removeprefix("projects.json: ")
+
     harvest_mode = body.get("harvestMode")
     if "harvestMode" in body:
         err = _validate_harvest_mode(harvest_mode)
@@ -726,6 +735,29 @@ def apply_settings(config, body, path=None, port=None):
     # there -- checked, written and applied under the project's launch
     # lock, so no spawn lands there between the check and the save.
     _validate_project_machines(body, config, known_names, fields, project_settings, machine_entries)
+    submitted_caps = body.get("machineMaxAgents", {})
+    if not isinstance(submitted_caps, dict):
+        raise SettingsError("machineMaxAgents must be an object mapping project name to machine limits")
+    caps_out = {}
+    for name in submitted_caps:
+        if name not in known_names:
+            fields[f"machineMaxAgents.{name}"] = "unknown project"
+    for project in config.get("projects", []):
+        name = project["name"]
+        allowed = project_settings.get("machines", {}).get(name, project.get("machines") or [])
+        if machine_entries is not None:
+            allowed = [m for m in allowed if m in {entry["name"] for entry in machine_entries}]
+        if name in submitted_caps:
+            try:
+                caps_out[name] = server.normalize_machine_max_agents(
+                    submitted_caps[name], allowed, f"projects.{name}.machineMaxAgents")
+            except server.ConfigError as exc:
+                fields[f"machineMaxAgents.{name}"] = str(exc).removeprefix("projects.json: ")
+        elif project.get("machineMaxAgents") and ("projectMachines" in body or machine_entries is not None):
+            caps_out[name] = {m: cap for m, cap in project["machineMaxAgents"].items()
+                              if m == server.HUB or m in allowed}
+    if caps_out:
+        project_settings["machineMaxAgents"] = caps_out
 
     agents_map = None
     if "agents" in body:
@@ -850,6 +882,8 @@ def _validate_project_machines(body, config, known_names, fields, project_settin
             try:
                 defaults_out[name] = server.normalize_project_default_machine(
                     defaults[name], allowed, f"projects.{name}.defaultMachine")
+                if defaults[name] == server.HUB:
+                    defaults_out[name] = server.HUB
             except server.ConfigError as exc:
                 fields[f"defaultMachine.{name}"] = str(exc).removeprefix("projects.json: ")
         else:
@@ -929,6 +963,11 @@ def _write_whitelisted_changes(
         raw["sessionPreview"] = dict(raw_preview) if isinstance(raw_preview, dict) else {}
         raw["sessionPreview"]["mode"] = session_preview_mode
 
+    if "hubMaxAgents" in body:
+        if body["hubMaxAgents"] is None:
+            raw.pop("hubMaxAgents", None)
+        else:
+            raw["hubMaxAgents"] = body["hubMaxAgents"]
     if "refreshIntervalSeconds" in body:
         raw["refreshIntervalSeconds"] = refresh_interval
 
@@ -978,7 +1017,7 @@ def _write_whitelisted_changes(
             if not isinstance(entry, dict) or entry.get("name") not in values:
                 continue
             value = values[entry["name"]]
-            if value is None or value == [] or value == "":
+            if value is None or value == [] or value == {} or value == "":
                 entry.pop(key, None)
             else:
                 entry[key] = value
@@ -1077,6 +1116,8 @@ def _apply_to_live_config(
         config["harvest"] = {"mode": harvest_mode}
     if "sessionPreviewMode" in body:
         config["sessionPreview"] = {"mode": session_preview_mode}
+    if "hubMaxAgents" in body:
+        config["hubMaxAgents"] = body["hubMaxAgents"]
     if "refreshIntervalSeconds" in body:
         config["refreshIntervalSeconds"] = refresh_interval
     if "defaultAgent" in body:
@@ -1094,6 +1135,7 @@ def _apply_to_live_config(
             project["machines"] = [m for m in project.get("machines") or [] if m not in removed]
             if project.get("defaultMachine") in removed:
                 project["defaultMachine"] = None
+                project["defaultMachineExplicit"] = False
     if "removeProject" in body:
         config["projects"] = [p for p in config.get("projects", []) if p["name"] != remove_project]
     if "checkCommands" in body:
@@ -1105,6 +1147,9 @@ def _apply_to_live_config(
             if project["name"] in values:
                 value = values[project["name"]]
                 project[key] = list(value) if key in ("worktreeLinks", "machines") else value
+                if key == "defaultMachine":
+                    project["defaultMachineExplicit"] = value is not None
+                    project[key] = None if value == server.HUB else value
     if add_project is not None:
         config.setdefault("projects", []).append({
             "name": add_project["name"],

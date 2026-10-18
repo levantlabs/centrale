@@ -126,16 +126,49 @@
         trackSince(C.h("span", { className: "fleet-agent-since" }), agent.since)] })] });
   }
 
+  // Mirror sessions.js formatting without loading dashboard controls (task-247).
+  function machineLevel(kind, value, total) {
+    if (value == null || total == null || total <= 0) return "";
+    var ratio = value / total;
+    if (kind === "load") return ratio > 1.5 ? "red" : ratio > 1 ? "amber" : "";
+    if (kind === "swap") return ratio > 0.8 ? "red" : ratio > 0.5 ? "amber" : "";
+    var red = kind === "ram" ? 0.10 : 0.05;
+    var amber = kind === "ram" ? 0.20 : 0.15;
+    return ratio < red ? "red" : ratio < amber ? "amber" : "";
+  }
+  function machineMetrics(m) {
+    var row = C.h("span", {className: "machine-metrics"});
+    if (!m || !m.reachable) {
+      row.className += " unavailable";
+      row.textContent = !m || m.reachable == null ? "checking…" : "unreachable";
+      return row;
+    }
+    function bytes(value) { return value == null ? "n/a" : (value / 1000000000).toFixed(1) + " GB free"; }
+    [["ram", "RAM " + bytes(m.ramAvailable), m.ramAvailable, m.ramTotal],
+     ["swap", "swap " + (m.swapUsed == null ? "n/a" : (m.swapUsed / 1000000000).toFixed(1) + " GB used"), m.swapUsed, m.swapTotal],
+     ["disk", "disk " + bytes(m.diskFree), m.diskFree, m.diskTotal],
+     ["load", "load " + (m.load1 == null || m.cores == null ? "n/a" : m.load1.toFixed(1) + "/" + m.cores), m.load1, m.cores]].forEach(function (metric, i) {
+       if (i) row.appendChild(C.h("span", {text: " · "}));
+       row.appendChild(C.h("span", {className: machineLevel(metric[0], metric[2], metric[3]), text: metric[1]}));
+     });
+    return row;
+  }
+
   function cards(model, snap) {
     var projects = snap.projects || [];
-    if (!projects.length) return [C.h("div", { className: "fleet-empty", text: "No projects configured" })];
     var nodes = [];
     var idle = [];
     var machines = snap.machines || [];
+    function metricsFor(name) {
+      return machineMetrics((snap.machineMetrics || []).find(function (m) { return m.name === name; }));
+    }
     projects.forEach(function (p) {
       if (!model.agents.some(function (a) { return a.project === p.name && a.live; })) idle.push(p.name);
     });
     if (!machines.length) {
+      nodes.push(C.h("div", { className: "phone-machine-summary", children: [
+        C.h("span", { text: "This machine · " }), metricsFor("hub")] }));
+      if (!projects.length) nodes.push(C.h("div", { className: "fleet-empty", text: "No projects configured" }));
       projects.forEach(function (p) {
         var live = model.agents.filter(function (a) { return a.project === p.name && a.live; });
         if (live.length) nodes.push(card(p, live));
@@ -154,7 +187,6 @@
             (a.live.machine || "") === spec.name; });
           if (live.length) grid.appendChild(card(p, live));
         });
-        if (spec.hub && !grid.childNodes.length) return;
         var down = !spec.hub && spec.reach !== "reachable";
         var full = typeof spec.maxAgents === "number" && spec.agentCount >= spec.maxAgents;
         var head = C.h("div", { className: "fleet-machine-head", children: [
@@ -164,7 +196,7 @@
           C.h("span", { className: "fleet-machine-reach" + (down ? " down" : ""),
             text: down ? spec.label + " " + (spec.reach === "unknown" ? "not answering" : "unreachable") : "" })] });
         nodes.push(C.h("section", { className: "fleet-machine", attrs: { "data-machine": spec.name || "hub" },
-          children: [head].concat(grid.childNodes.length ? [grid] : []) }));
+          children: [head, metricsFor(spec.name || "hub")].concat(grid.childNodes.length ? [grid] : []) }));
       });
     }
     if (idle.length) nodes.push(C.h("div", { className: "fleet-quiet", text: "No agents: " + idle.join(", ") }));

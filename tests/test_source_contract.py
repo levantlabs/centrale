@@ -474,7 +474,7 @@ class AgentsDocQuotesTheCodeTests(unittest.TestCase):
                 elif isinstance(e, ast.Name) and e.id == "conversation_id":
                     head.append("<UUID>")
                 elif ast.unparse(e) == "agent_cmd[0]":
-                    head.append("codex")
+                    head.append("claude" if any(isinstance(x, ast.Constant) and x.value == "--continue" for x in elts) else "codex")
                 else:
                     return None
             return head or None

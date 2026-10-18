@@ -18,6 +18,7 @@ from __future__ import annotations
 import contextlib
 import functools
 import json
+import math
 import os
 import re
 import shlex
@@ -104,6 +105,9 @@ class SpawnError(Exception):
 # lock. The registry stores locks only, never remembered session counts.
 _launch_locks = {}
 _launch_locks_guard = threading.Lock()
+# task-245: the hub cap shares slots across projects, including auto placement.
+# Acquired inside the project lock; no holder asks for another project lock.
+_hub_capacity_lock = threading.Lock()
 
 
 def project_launch_lock(project_name):
@@ -118,6 +122,16 @@ def _serialize_project_launch(fn):
     def launch(config, project_name, task_id, *args, **kwargs):
         lock = project_launch_lock(project_name)
         with lock:
+            if config.get("hubMaxAgents") is not None:
+                # Resolve only established placement here: automatic selection
+                # still runs inside the hub lock because it may choose the hub.
+                # Both launch signatures put machine after agent/reconcile.
+                requested = kwargs.get("machine", args[1] if len(args) > 1 else None)
+                target = placement(config, project_name, task_id, requested,
+                                   resume=fn.__name__ == "resume")
+                if target is None:
+                    with _hub_capacity_lock:
+                        return fn(config, project_name, task_id, *args, **kwargs)
             return fn(config, project_name, task_id, *args, **kwargs)
     return launch
 
@@ -438,8 +452,8 @@ def _fetch_task(project, task_id):
     `project`, via the server.run_backlog boundary. Returns {} if the CLI
     call fails or returns malformed data -- never raises. Shared by the
     pre-claim Done-status check (see spawn()/resume()) and resolve_agent's
-    assignee lookup below, so a single spawn/resume call only ever makes
-    one `backlog task view` CLI call, not two.
+    assignee lookup below. Fresh spawn shares that read; worktree-backed
+    launches read their agent choice separately (task-248).
     """
     try:
         data = server.run_backlog(["task", "view", task_id, "--json"], cwd=project["path"])
@@ -448,6 +462,44 @@ def _fetch_task(project, task_id):
     if isinstance(data, dict):
         return data.get("task") or {}
     return {}
+
+
+def worktree_agent_task(data, main_task, task_id, warnings):
+    """Use a CLI worktree task for agent choice only; main still gates Done."""
+    task = data.get("task") if isinstance(data, dict) and data.get("schemaVersion") == 1 else None
+    if isinstance(task, dict) and task:
+        return task
+    warnings.append(f"Could not read {task_id}'s worktree task; using the main copy for agent selection")
+    return main_task
+
+
+def local_worktree_agent_task(wt_dir, main_task, task_id, warnings):
+    return worktree_agent_task(server._task_view_or_none(wt_dir, task_id), main_task, task_id, warnings)
+
+
+def branch_agent_task(data, main_task, task_id, warnings, reason=None):
+    """Validate a committed CLI task and make an unreadable branch explicit."""
+    task = data.get("task") if isinstance(data, dict) and data.get("schemaVersion") == 1 else None
+    if isinstance(task, dict) and task:
+        return task
+    warnings.append(f"Could not read {task_id}'s branch task: "
+                    f"{reason or 'Backlog returned no valid task'}; "
+                    "using the main copy for agent selection")
+    return main_task
+
+
+def local_branch_agent_task(project, task_id, main_task, warnings):
+    # task-252: a parked branch still owns its committed assignee. Use the
+    # existing disposable read snapshot so Backlog remains the only parser.
+    data, reason = None, None
+    try:
+        with detached_snapshot(project["path"], branch_name(task_id)) as (path, error):
+            reason = error
+            if error is None:
+                data = server.run_backlog(["task", "view", task_id, "--json"], cwd=path)
+    except (server.BacklogError, OSError) as exc:
+        reason = str(exc)
+    return branch_agent_task(data, main_task, task_id, warnings, reason)
 
 
 def resolve_agent(config, project, task_id, task=None):
@@ -462,9 +514,8 @@ def resolve_agent(config, project, task_id, task=None):
     already under way, and must not start refusing it.
 
     `task` is the already-fetched task dict (see _fetch_task) when the
-    caller has one on hand -- spawn()/resume() fetch it once for the
-    pre-claim Done-status check and pass it through here so this doesn't
-    make a second, redundant `backlog task view` call. Fetches it itself
+    caller has one on hand. Resume passes the worktree task, falling back
+    to its separate main-copy Done-check read on failure. Fetches it itself
     (unchanged behavior) when not given one, e.g. when called directly.
 
     Normalization (accepting either a plain argv list or a `{"cmd": [...],
@@ -1302,7 +1353,94 @@ def _check_not_done(project, task_id):
     return task
 
 
-def placement(config, project_name, task_id, requested=None, resume=False):
+def choose_placement(rows):
+    """Pure filter-then-score over observations; no task or machine state (task-244).
+
+    Returns (machine name, one-line explanation), or (None, refusal).
+    Hub is named "hub" here, so None unambiguously means no candidate.
+    Equal scores keep candidate order: hub, then the project's machine list.
+    """
+    def number(value):
+        return (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and math.isfinite(value) and value >= 0)
+
+    def figures(row):
+        ram = row.get("ramAvailable")
+        load, cores = row.get("load1"), row.get("cores")
+        ratio = load / cores if number(load) and number(cores) and cores > 0 else None
+        return ram if number(ram) else None, ratio
+
+    def score(row):
+        ram, ratio = figures(row)
+        return (ram if ram is not None else -1, -ratio if ratio is not None else -math.inf)
+
+    def description(row):
+        ram, ratio = figures(row)
+        memory = f"{ram / 1e9:.1f} GB free" if ram is not None else "free RAM unknown"
+        load = f"{ratio:.2f} load/core" if ratio is not None else "load/core unknown"
+        return f"{memory}, {load}"
+
+    rejected = {}
+    eligible = []
+    for row in rows:
+        reason = ("unreachable" if not row.get("reachable") else
+                  row.get("capacityReason") or row.get("workerCheckReason"))
+        if reason:
+            rejected[row["name"]] = " ".join(str(reason).split())
+        else:
+            eligible.append(row)
+    chosen = max(eligible, key=score) if eligible else None
+    parts = ([f"placed on {chosen['name']}: {description(chosen)}"] if chosen else
+             ["no machine qualifies"])
+    for row in rows:
+        if row is not chosen:
+            parts.append(f"{row['name']} skipped: {rejected.get(row['name']) or description(row)}")
+    return (chosen["name"] if chosen else None), "; ".join(parts)
+
+
+def auto_placement(config, project, task_id, agent=None):
+    """Collect fresh eligible-machine observations through existing boundaries.
+
+    Called under the project launch lock, before claim. The chosen launch
+    still runs its normal checks; a failed launch is never retried elsewhere.
+    """
+    import machines
+    import remote
+    import system_status
+
+    requested = validate_requested_agent(config, agent)
+    task = None if spawn_cmd_override() else _check_not_done(project, task_id)
+    _choose_spawn_agent(config, task_id, task, requested)
+    rows = []
+    for name in [server.HUB, *project["machines"]]:
+        machine = machines.machine_named(config, None if name == server.HUB else name)
+        row = dict(system_status.read_local(project["path"]), name=name, reachable=True) if machine is None else (
+            system_status.read_worker(config, machine))
+        row = dict(row)
+        rows.append(row)
+        if not row.get("reachable"):
+            continue
+        try:
+            if machine is None:
+                _validate_and_check_session(config, project["name"], task_id)
+            else:
+                sessions, _home, _checkouts = remote.survey(config, machine, project, task_id)
+                remote._check_capacity(config, machine, project, session_name(project["name"], task_id), sessions)
+        except SpawnError as exc:
+            row["capacityReason"] = exc.message
+            continue
+        if project.get("workerCheck"):
+            passed, reason = (remote.check_hub_readiness(config, project) if machine is None else
+                              remote.prepare_worker_readiness(config, machine, project))
+            if not passed:
+                row["workerCheckReason"] = f"{reason}; read {project['workerCheck']['doc']}"
+    chosen, reason = choose_placement(rows)
+    if chosen is None:
+        raise SpawnError(reason, status=409)
+    return chosen, reason
+
+
+def placement(config, project_name, task_id, requested=None, resume=False, automatic=None, agent=None):
     """Where a spawn (or resume) of this task runs (doc-3 revision 5,
     task-224): a machine name, or None for the hub.
 
@@ -1312,7 +1450,9 @@ def placement(config, project_name, task_id, requested=None, resume=False):
     conflict is refused with both places, a task that already has a
     location goes there -- and an explicit request for anywhere else is
     refused, naming where it is. A task with no location goes where it
-    was asked to, else to the project's defaultMachine, else the hub.
+    was asked to, else to the project's defaultMachine. Spawn supplies an
+    `automatic` response dict to enable auto placement for an unplaced task
+    with no default; other callers (including resume) keep the hub fallback.
 
     A project with no `machines` answers None without running anything,
     after refusing a request that names a machine (the single-machine
@@ -1344,7 +1484,13 @@ def placement(config, project_name, task_id, requested=None, resume=False):
                 f"{'resume' if resume else 'spawn'} it there, or remove it there first", status=409)
         return location.machine
     if requested is None:
-        return project.get("defaultMachine")
+        default = project.get("defaultMachine")
+        if automatic is not None and not resume and default is None and not project.get("defaultMachineExplicit"):
+            _validate_request(config, project_name, task_id)
+            chosen, reason = auto_placement(config, project, task_id, agent)
+            automatic.update(machine=chosen, placementReason=reason)
+            return None if chosen == server.HUB else chosen
+        return None if default == server.HUB else default
     return target
 
 
@@ -1408,7 +1554,29 @@ def _validate_and_check_session(config, project_name, task_id):
                 status=409,
             )
 
+    cap = config.get("hubMaxAgents")
+    if cap is not None:
+        live = sorted({s["name"] for s in existing
+                       if server._parse_session_project_and_task(s["name"], config)[0]})
+        if len(live) >= cap:
+            raise SpawnError(
+                f"Machine hub has {len(live)} live agent sessions (hubMaxAgents: {cap}): "
+                f"{', '.join(live)}. End a session before launching another agent.", status=409)
+    check_machine_project_capacity(config, project, server.HUB, existing)
     return project, name
+
+
+def check_machine_project_capacity(config, project, machine_name, sessions):
+    """Count only this project's live sessions at this location (task-245)."""
+    cap = (project.get("machineMaxAgents") or {}).get(machine_name)
+    if cap is None:
+        return
+    live = server.live_sessions_for_project(project["name"], config, sessions=sessions)
+    if len(live) >= cap:
+        raise SpawnError(
+            f"Project {project['name']} on machine {machine_name} has {len(live)} live agent sessions "
+            f"(machineMaxAgents: {cap}): {', '.join(sorted(live))}. "
+            "End a session before launching another agent.", status=409)
 
 
 def new_session_args(name, wt_dir):
@@ -1479,7 +1647,7 @@ def hold_session_geometry(name):
     server.run_tmux(["resize-window", "-t", target, "-x", str(columns), "-y", str(rows)])
 
 
-def _choose_spawn_agent(config, task_id, task, requested):
+def _choose_spawn_agent(config, task_id, task, requested, claim_task=None):
     """spawn()'s agent choice (task-171), shared with a spawn on a worker
     (task-207): (agent_name, cmd, prompt_suffix, agent_kind,
     recorded_assignees, choice_warning). Under CENTRALE_SPAWN_CMD the
@@ -1500,10 +1668,11 @@ def _choose_spawn_agent(config, task_id, task, requested):
         # when an explicit choice overrides it for this launch. A task
         # that could not be read has assignees nobody can see, and
         # `-a` replaces the list -- so nothing is recorded, and it says so.
-        assignee = _first_assignee(task)
+        claim_task = task if claim_task is None else claim_task
+        assignee = _first_assignee(claim_task)
         if source != "assignee" and not (assignee and assignee.lower() in _agents_lc(config)):
-            if task:
-                recorded_assignees = assignees_recording(task, agent_name)
+            if claim_task:
+                recorded_assignees = assignees_recording(claim_task, agent_name)
             else:
                 choice_warning = "; ".join(filter(None, [
                     choice_warning,
@@ -1573,12 +1742,15 @@ def spawn(config, project_name, task_id, agent=None, machine=None, first_message
     # the hub path below is unchanged for every other task.
     if first_message is not None:
         validate_first_message(first_message)
-    target = placement(config, project_name, task_id, machine)
+    automatic = {}
+    target = placement(config, project_name, task_id, machine, automatic=automatic, agent=agent)
     if target is not None:
         import remote  # local import: remote imports this module
         brief = {"first_message": first_message} if first_message is not None else {}
-        return remote.spawn_on_machine(config, project_name, task_id, agent=agent,
-                                       machine_name=target, **brief)
+        result = remote.spawn_on_machine(config, project_name, task_id, agent=agent,
+                                         machine_name=target, **brief)
+        result.update(automatic)
+        return result
     project, name = _validate_and_check_session(config, project_name, task_id)
     requested = validate_requested_agent(config, agent)
 
@@ -1598,11 +1770,19 @@ def spawn(config, project_name, task_id, agent=None, machine=None, first_message
     # commits anything on the base branch.
     _check_not_checked_out_externally(config, project, task_id)
 
+    warnings = []
+    main_task = task
+    existing_wt = worktree_dir(config, project_name, task_id)
+    if not spawn_cmd_override() and os.path.isdir(existing_wt):
+        task = local_worktree_agent_task(existing_wt, task, task_id, warnings)
+    elif not spawn_cmd_override() and _branch_exists(project["path"], branch_name(task_id)):
+        task = local_branch_agent_task(project, task_id, task, warnings)
+
     # task-171: the agent is chosen before any side effect too, so a
     # refusal leaves nothing claimed, committed or created.
     agent_name, cmd, prompt_suffix, agent_kind, recorded_assignees, choice_warning = (
-        _choose_spawn_agent(config, task_id, task, requested))
-    warnings = _claim_for_spawn(config, project, task_id, recorded_assignees, choice_warning)
+        _choose_spawn_agent(config, task_id, task, requested, claim_task=main_task))
+    warnings.extend(_claim_for_spawn(config, project, task_id, recorded_assignees, choice_warning))
 
     wt_dir = _ensure_worktree(config, project, task_id, warnings=warnings)
 
@@ -1637,6 +1817,7 @@ def spawn(config, project_name, task_id, agent=None, machine=None, first_message
     }
     if warnings:
         result["warnings"] = warnings
+    result.update(automatic)
     return result
 
 
@@ -1649,6 +1830,42 @@ RESUME_FALLBACK_NOTE = (
 # Appended to prompt_for(task_id)'s own output (see resume()'s fresh-start
 # fallback below) -- PROMPT_TEMPLATE's own no-self-merge boundary is
 # already in there, so this note doesn't repeat it separately.
+
+
+def claude_conversation_exists(wt_dir, home=None):
+    """Read Claude's own transcript store, never infer from a directory alone.
+
+    Self-contained so remote.py can send this same reader to the worker.
+    CLAUDE_CONFIG_DIR overrides ~/.claude, as it does for Claude itself.
+    Only interactive messages for this exact cwd count; sidechains and
+    empty/malformed records do not establish a conversation (task-248).
+    """
+    import json
+    import os
+    import re
+    from pathlib import Path
+    target = os.path.realpath(os.path.expanduser(wt_dir))
+    home = home or os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    folder = Path(home) / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", target)
+    try:
+        for path in folder.glob("*.jsonl"):
+            try:
+                with path.open(encoding="utf-8") as stream:
+                    for line in stream:
+                        try:
+                            row = json.loads(line)
+                        except ValueError:
+                            continue
+                        if (isinstance(row, dict) and row.get("type") in {"user", "assistant"}
+                                and row.get("isSidechain") is False
+                                and isinstance(row.get("cwd"), str)
+                                and os.path.realpath(row["cwd"]) == target):
+                            return True
+            except (OSError, UnicodeError):
+                continue
+    except OSError:
+        pass
+    return False
 
 
 def codex_home_dir():
@@ -1774,7 +1991,7 @@ def reconcile_prompt_for(task_id, base_branch, check_command=None, resumed=False
     )
 
 
-def _resume_launch(config, project, task_id, task, reconcile, wt_dir, codex_lookup):
+def _resume_launch(config, project, task_id, task, reconcile, wt_dir, codex_lookup, claude_lookup=None):
     """resume()'s choice of what to launch, shared with a resume on a
     worker (task-207): the three tiers, Codex's verified-UUID path and
     the reconcile prompt framing documented on resume(). `codex_lookup`
@@ -1784,6 +2001,7 @@ def _resume_launch(config, project, task_id, task, reconcile, wt_dir, codex_look
     conversation_id, codex_home, warnings."""
     warnings = []
     codex_home = None
+    claude_exists = False
     # task-133: the reconcile prompt comes in two framings -- `resumed`
     # for a continued conversation (tiers 1 and 2 below), the plain one
     # for a fresh start (tier 3, and the CENTRALE_SPAWN_CMD override,
@@ -1806,6 +2024,11 @@ def _resume_launch(config, project, task_id, task, reconcile, wt_dir, codex_look
         agent_name, agent_cmd, prompt_suffix = resolve_agent(config, project, task_id, task=task)
         agent_kind = agent_kind_for_command(agent_cmd)
         resume_cmd = resume_cmd_for_agent(config, agent_name)
+        if agent_kind == "claude" or agent_kind_for_command(resume_cmd or []) == "claude":
+            if claude_lookup is not None:
+                claude_exists = claude_lookup()
+            else:
+                claude_exists = claude_conversation_exists(wt_dir)
         # Plain Resume passes no prompt where a conversation is continued
         # (it already has its context); reconcile passes the reconcile
         # prompt at the same tiers, as the trailing argument -- the job is
@@ -1835,11 +2058,16 @@ def _resume_launch(config, project, task_id, task, reconcile, wt_dir, codex_look
                 base_prompt = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
                 prompt_arg = base_prompt + RESUME_FALLBACK_NOTE
                 warnings.append("No verified Codex conversation for this worktree; started fresh with prior-work instructions")
+        elif (agent_kind == "claude" or agent_kind_for_command(resume_cmd or []) == "claude") and not claude_exists:
+            cmd = agent_cmd
+            base_prompt = reconcile_prompt(resumed=False) if reconcile else prompt_for(task_id, config)
+            prompt_arg = base_prompt + RESUME_FALLBACK_NOTE
+            warnings.append("No verified Claude conversation for this worktree; started fresh with prior-work instructions")
         elif resume_cmd:
             cmd = resume_cmd
             prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
-        elif agent_cmd and agent_cmd[0] == "claude":
-            cmd = ["claude", "--continue", *agent_cmd[1:]]
+        elif agent_kind == "claude":
+            cmd = [agent_cmd[0], "--continue", *agent_cmd[1:]]
             prompt_arg = reconcile_prompt(resumed=True) if reconcile else None
         else:
             cmd = agent_cmd
@@ -1946,6 +2174,9 @@ def resume(config, project_name, task_id, reconcile=False, machine=None):
 
     warnings = []
     wt_dir = _ensure_worktree(config, project, task_id, warnings=warnings)
+
+    if not spawn_cmd_override():
+        task = local_worktree_agent_task(wt_dir, task, task_id, warnings)
 
     launch = _resume_launch(config, project, task_id, task, reconcile, wt_dir,
                             lambda: (codex_home_dir(), codex_conversation_id(wt_dir)))

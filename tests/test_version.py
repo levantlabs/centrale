@@ -13,6 +13,7 @@ all, and a machine with no `git` binary.
 """
 
 import ast
+import fnmatch
 import os
 import re
 import subprocess
@@ -238,10 +239,38 @@ class DetectVersionTests(unittest.TestCase):
                 resolved, _ = self._detect(proc=proc)
                 self.assertEqual(resolved, self.constant)
 
+    def test_recovery_tags_never_name_the_build(self):
+        # Losing the release-tag filter must expose the nearest recovery
+        # tag and fail, even when an older release tag is reachable.
+        recovery = "abandoned/task-246-20261016-205000"
+        for release in (None, self.constant, self.constant + "-14-g4570911"):
+            for dirty in (False, True):
+                with self.subTest(release=release, dirty=dirty):
+                    suffix = "-dirty" if dirty else ""
+
+                    def fake_git(args, cwd=None):
+                        self.assertEqual(args[0], "describe")
+                        self.assertIn("--tags", args)
+                        self.assertIn("--always", args)
+                        self.assertIn("--dirty", args)
+                        pattern = args[args.index("--match") + 1] if "--match" in args else "*"
+                        if fnmatch.fnmatchcase(recovery, pattern):
+                            return _proc(0, recovery + suffix + "\n")
+                        if release and fnmatch.fnmatchcase(self.constant, pattern):
+                            return _proc(0, release + suffix + "\n")
+                        return _proc(0, "4570911" + suffix + "\n")
+
+                    with mock.patch.object(server, "which", return_value="/usr/bin/git"), \
+                         mock.patch.object(server.os.path, "exists", return_value=True), \
+                         mock.patch.object(server, "run_git", side_effect=fake_git):
+                        resolved = server.detect_version()
+                    expected = release + suffix if release else f"{self.constant} (4570911{suffix})"
+                    self.assertEqual(resolved, expected)
+
     def test_it_describes_the_repository_it_is_running_from(self):
         _, run_git = self._detect(proc=_proc(0, "v1.2.3\n"))
         run_git.assert_called_once_with(
-            ["describe", "--tags", "--always", "--dirty"], cwd=server.BASE_DIR)
+            ["describe", "--tags", "--match", "v[0-9]*", "--always", "--dirty"], cwd=server.BASE_DIR)
 
 
 class ServedVersionTests(unittest.TestCase):

@@ -264,7 +264,7 @@
       };
       specs.forEach(function (spec) {
         var mine = busy.filter(function (p) { return runsAt(p, spec.key); });
-        if (spec.hub && !mine.length) return;
+        // task-251: keep the hub heading and metrics visible even without agents.
         var group = groups[spec.key] || (groups[spec.key] = {
           el: C.h("section", { className: "fleet-machine", attrs: { "data-machine": spec.key || "hub" } }),
           title: C.h("span", { className: "fleet-machine-name" }),

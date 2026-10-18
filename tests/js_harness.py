@@ -439,6 +439,7 @@ global.wireSettingsShell = function () {
    "settings-session-preview-toggle", "settings-session-reply-field",
    "settings-session-reply-toggle", "settings-error-sessionPreviewMode",
    "settings-refresh-interval", "settings-error-refreshIntervalSeconds",
+   "settings-hub-max-agents", "settings-error-hubMaxAgents",
    "settings-check-commands",
    "settings-agents-section", "settings-agents-summary", "settings-agents-table",
    "settings-add-agent-btn", "settings-error-agents", "settings-default-agent",

@@ -487,6 +487,12 @@ no git call at all, and a task with no `task/<id>` branch costs exactly one
 `git rev-parse --verify` and nothing else — no worktree listing, no snapshot,
 no second `backlog` call.
 
+`resumeAgent` previews the agent from `branchTask`, falling back to the main
+task when that copy is unavailable. `resumeAgentWarnings` contains the fallback
+warning when present. For a worker this uses the hub's fetched branch copy:
+opening the drawer performs no ssh. Launch re-reads the live worktree, so an
+assignee edit since the last fetch can change the agent that actually runs.
+
 `branchTask` is best-effort at every step: a worktree that's gone, a snapshot
 git refuses, or a `backlog` failure or malformed response reading any of them
 just omits the field — it never fails the request, since the main-checkout
@@ -1570,15 +1576,18 @@ curl -s 'http://127.0.0.1:7420/api/settings' | python3 -m json.tool
 }
 ```
 
-`workerCheck` maps every project to its command/doc object or `null`; readiness checks run only on non-hub spawns.
+`workerCheck` maps every project to its command/doc object or `null`; readiness checks run on worker spawns and on all candidates for automatic placement.
 
 `checkCommands` maps every configured project name to its `checkCommand`, or
-`null` if it has none (no test gate). `maxAgents` maps each project name to
+`null` if it has none (no test gate). `hubMaxAgents` is the optional hub-wide
+positive cap or `null`. `machineMaxAgents` maps each project name to its
+per-machine limit object (empty when unlimited). `maxAgents` maps each project name to
 its positive integer cap or `null`; `worktreeLinks` maps each project name
 to its array of repo-relative paths (empty when unset). With `machines`
 configured (only then), `machines` lists their names, `projectMachines` maps
 each project to the machines its tasks may run on besides this one, and
-`defaultMachine` maps each project to `"hub"` or the machine a spawn naming
+`defaultMachine` maps each project to `null` (automatic), explicit `"hub"`,
+or the machine a spawn naming
 none goes to (task-224).
 `agents` is every key in the configured
 `agents` map (for a default-agent dropdown), not each entry's full command.
@@ -1775,6 +1784,16 @@ was skipped. These warnings do not block the spawn.
   effect. Count-through-launch is serialized per project in this server
   process. Omitted or `null` means no cap; an idle or finished session still
   counts until it ends.
+- **Machine and project-on-machine caps.** Top-level `hubMaxAgents` counts
+  all configured projects' live hub sessions. Worker `maxAgents` counts
+  its projects' live worker sessions. A project's `machineMaxAgents`
+  maps `hub` or one of its machines to that project's cap at that location.
+  All apply to spawn and resume; existing project and worker limits are
+  checked first, then the new limits. Refusals return 409 naming the limit
+  and live sessions. Auto placement skips full candidates and includes these
+  reasons in `placementReason`, or in the 409 error if none qualifies.
+  Omitted limits add no restriction. Hub-cap launches are serialized across
+  projects in this server process when `hubMaxAgents` is configured.
 - **Worktree links.** Each newly created worktree receives the project's
   `worktreeLinks` as symlinks to paths in the main checkout. Root-anchored
   entries in the shared `.git/info/exclude` keep them out of ordinary
@@ -1846,7 +1865,34 @@ the project lists ([Where a task is](configuration.md#where-a-task-is)):
   is spawned there, and a `machine` naming anywhere else is refused with
   **409** (`TASK-7 is already on machine box-b ... not the hub`);
 - a task with no location goes to `machine`, else the project's
-  `defaultMachine`, else the hub.
+  `defaultMachine`, else automatic placement if the project lists workers
+  (the hub alone if it lists none).
+
+**Automatic placement** (task-244) considers the hub and only the project's
+own `machines`. It drops unreachable candidates, candidates at the project
+or machine `maxAgents` limit, and candidates failing the declared
+`workerCheck` (including the hub). It selects the most `ramAvailable`,
+then the lowest `load1 / cores`. Missing RAM ranks after known RAM; missing
+load ranks last for equal RAM. Exact ties keep the hub first, then project
+machine order. Unknown figures alone do not exclude a reachable machine.
+Resource figures are read fresh through the `/api/system` readers; session
+counts and readiness are checked for this spawn. No check declaration means
+no readiness probe. Projects without `machines` run no placement probes.
+
+An automatically placed success adds `machine` (`"hub"` or the worker name)
+and `placementReason`, a single line naming the chosen machine and every
+skipped candidate, for example:
+
+```json
+{"machine":"box-b","placementReason":"placed on box-b: 5.1 GB free, 0.25 load/core; hub skipped: 0.9 GB free, 0.10 load/core"}
+```
+
+If no candidate qualifies, **409** `error` names every candidate and its
+reason. The chosen launch still performs its ordinary checks; a later failure
+is returned without trying another machine. Name `machine` in the request or
+set the project's `defaultMachine` (including explicit `"hub"`) to opt out.
+An absent or null default enables automatic placement. Existing task locations
+and Resume keep their previous rules; automatic placement never moves a task.
 
 A project's `maxAgents` counts its live sessions on the hub and on every
 machine it lists; a machine's own `maxAgents` applies as well. Orchestrators
@@ -1874,7 +1920,7 @@ removes the worktree (and branch) that spawn created. `POST /api/resume`
 behaves the same way; codex's verified conversation is looked up in that
 machine's `~/.codex/sessions`. A resume goes where the task is; its
 optional `machine` only places a task that has no location yet, with the
-same rules as a spawn.
+explicit/default rules as before, falling back to the hub (no automatic ranking).
 
 ## `POST /api/resume`
 
@@ -1886,6 +1932,14 @@ resolved agent's *resume* command (its configured `resumeCmd`, else `claude
 by the agent's own `cmd` arguments such as `--model`, else a
 fresh prompt noting prior work already exists). See "Resuming an interrupted agent" in
 [docs/agents.md](agents.md#resuming-an-interrupted-agent).
+
+Resume and re-spawn agent selection (task-248): Resume reads the task in
+its worktree; spawn does the same when reusing an existing worktree. Missing
+or unreadable worktree task data falls back to main with a response warning.
+Fresh spawn and the main-copy Done check retain their existing semantics.
+Claude Resume checks its own `CLAUDE_CONFIG_DIR` transcript store for an
+interactive conversation at that worktree; without one it starts fresh with
+the workflow prompt and prior-work note and reports a warning.
 
 **Body:** identical shape to `/api/spawn` — `{"project": "<name>", "taskId": "<id>"}`.
 
@@ -2698,12 +2752,14 @@ and `projects`, are not accepted back.
 | `sessionPreviewMode` | `"interact"` \| `"view"` \| `"off"` | Stored as `projects.json`'s `sessionPreview.mode`. `"interact"` (default): live pane plus the reply row. `"view"`: read-only pane only — the reply row is absent *and* `POST /api/session-input` refuses (403). `"off"`: no drawer section, and `GET /api/session-pane` refuses too. One tiered key so the reply can be switched off independently of the read-only pane. The settings modal shows it as two toggles. |
 | `refreshIntervalSeconds` | integer ≥ 5 | |
 | `checkCommands` | `{"<project>": "<command>" \| null, ...}` | `null` (or an empty/whitespace string) clears that project's check gate. Only named projects are touched. |
+| `hubMaxAgents` | `positive integer \| null` | All configured projects' live sessions on the hub. `null` clears it; workers are unaffected. |
+| `machineMaxAgents` | `{"<project>": {"hub" or "<project machine>": positive integer}}` | Replaces the named project's per-machine limits. `{}` clears them. Unknown machines and non-positive/non-integer values are invalid. Machine removal drops its key. |
 | `maxAgents` | `{"<project>": positive integer \| null, ...}` | Sets a project's live-session cap. `null` clears it. Booleans, zero, negative, fractional and string values are invalid. Applies to the next spawn/resume; existing sessions remain. |
 | `workerCheck` | `{"<project>": {"command": "scripts/check.sh", "doc": "docs/setup.md"} \| null, ...}` | Sets the read-only worker readiness command and setup doc; both repo-relative, both required. `null` removes the entry. GET returns the same project map. Errors use `workerCheck.<project>`. |
 | `worktreeLinks` | `{"<project>": ["relative/path", ...] \| null, ...}` | Sets links for new worktrees; `null` or `[]` clears. Paths must be canonical, literal, repo-relative and non-overlapping; see [Configuration](configuration.md#setup--configuration). Existing worktrees stay unchanged. |
 | `projectMachines` | `{"<project>": ["<machine name>", ...] \| null, ...}` | The configured machines a project's tasks may run on besides this one; `null` or `[]` means the hub only. Removing a machine is refused (400, naming the tasks) while the project still has a task worktree or task branch there -- the hub's fetched copies included -- and when that machine cannot be asked; checked under the project's launch lock so no spawn lands there mid-save (task-224). Field errors are `"projectMachines.<project>"`. |
-| `machines` | complete list of machine objects | Writes top-level `projects.json` machines after `server.normalize_machines` validation. Removing a machine checks each project that listed it under the project launch lock; an allowed removal clears its placement and resets its default to the hub. Added and changed control connections start live; removed ones stop, and unchanged ones remain. A connection thread that cannot start adds a warning asking for a restart after the cause is fixed. Field errors are `"machines"`. |
-| `defaultMachine` | `{"<project>": "hub" \| "<machine name>", ...}` | Where a spawn naming no machine goes; must be one of the machines the same save leaves the project with. A save that would leave the current default out of `projectMachines` is refused unless it names a new one. Field errors are `"defaultMachine.<project>"`. |
+| `machines` | complete list of machine objects | Writes top-level `projects.json` machines after `server.normalize_machines` validation. Removing a machine checks each project that listed it under the project launch lock; an allowed removal clears its placement and removes a default that named it (enabling automatic placement if workers remain). Added and changed control connections start live; removed ones stop, and unchanged ones remain. A connection thread that cannot start adds a warning asking for a restart after the cause is fixed. Field errors are `"machines"`. |
+| `defaultMachine` | `{"<project>": "hub" \| "<machine name>" \| null, ...}` | Where a spawn naming no machine goes; `null` removes the default and enables automatic placement for projects with workers; must be one of the machines the same save leaves the project with. A save that would leave the current default out of `projectMachines` is refused unless it names a new one. Field errors are `"defaultMachine.<project>"`. |
 | `requireAgentAssignment` | boolean | Whether `POST /api/spawn` refuses (409) a task whose first assignee names no configured agent, rather than launching `defaultAgent` with a warning. Anything but a JSON boolean is a 400. |
 | `lockSpawnedTaskFiles` | boolean | Whether `POST /api/spawn` makes the main checkout's copy of the task file read-only after its claim commit (task-172). Takes effect on the next spawn; existing locks are kept. Anything but a JSON boolean is a 400. |
 | `defaultAgent` | string | Must name a key in the configured `agents` map — or, when `agents` is in the same request, in the map that request installs. |

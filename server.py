@@ -125,6 +125,23 @@ def normalize_project_max_agents(raw, source="maxAgents"):
     return raw
 
 
+def normalize_machine_max_agents(raw, allowed, source="machineMaxAgents"):
+    """Optional project limits at individual locations (task-245)."""
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ConfigError(f"projects.json: {source} must be an object mapping machine names to positive whole numbers")
+    result = {}
+    for name, value in raw.items():
+        if name not in [HUB, *allowed]:
+            raise ConfigError(f"projects.json: {source}.{name} is not hub or one of the project's machines")
+        cap = normalize_project_max_agents(value, f"{source}.{name}")
+        if cap is None:
+            raise ConfigError(f"projects.json: {source}.{name} must be a positive whole number")
+        result[name] = cap
+    return result
+
+
 MACHINE_PATH_KEYS = ("repoRoot", "worktreeRoot")
 
 
@@ -741,12 +758,16 @@ def load_config(path=None):
             "checkTimeoutSeconds": check_timeout_seconds,
             "worktreeRoot": project_worktree_root,
             "maxAgents": max_agents,
+            "machineMaxAgents": normalize_machine_max_agents(entry.get("machineMaxAgents"), project_machines, f"projects.{name}.machineMaxAgents"),
             "worktreeLinks": worktree_links,
             "machines": project_machines,
             "defaultMachine": default_machine,
+            # Preserve explicit "hub" despite the legacy None representation (task-244).
+            **({"defaultMachineExplicit": True} if entry.get("defaultMachine") == HUB else {}),
         })
 
     return {
+        "hubMaxAgents": normalize_project_max_agents(raw.get("hubMaxAgents"), "hubMaxAgents"),
         "port": port,
         "worktreeRoot": worktree_root,
         "projects": projects,
@@ -993,8 +1014,9 @@ def detect_version():
       1. `version.__version__` -- always available, ships as tracked
          content, needs no parsing. This is the floor, and it is the
          whole answer in a downloaded zip with no `.git` in it.
-      2. `git describe --tags --always --dirty`, layered on when this
-         checkout actually has a `.git`. It answers "which build" and
+      2. `git describe --tags --match v[0-9]* --always --dirty`, layered on when this
+         checkout actually has a `.git`. Only release tags match; recovery
+         tags such as `abandoned/...` are ignored (task-250). It answers "which build" and
          "how far past the release" at once: in a released snapshot,
          whose release commit release.sh tagged, it reads a clean
          "v0.1.0"; in a development checkout it reads
@@ -1004,7 +1026,7 @@ def detect_version():
     nothing (a `.git` that is not readable, a repository with no commits
     at all), falls back to layer 1 rather than reporting anything
     uncertain -- the constant is never wrong about what shipped, it is
-    only less specific. And when git answers but no tag is reachable
+    only less specific. And when git answers but no release tag is reachable
     yet, the two are shown together
     ("v0.1.0 (e773bdb-dirty)"): a bare hash names the build without
     naming the version the changelog is keyed to.
@@ -1018,7 +1040,7 @@ def detect_version():
     # directory, and git describes it exactly as well.
     if which("git") is None or not os.path.exists(os.path.join(BASE_DIR, ".git")):
         return fallback
-    proc = run_git(["describe", "--tags", "--always", "--dirty"], cwd=BASE_DIR)
+    proc = run_git(["describe", "--tags", "--match", "v[0-9]*", "--always", "--dirty"], cwd=BASE_DIR)
     described = (proc.stdout or "").strip()
     if proc.returncode != 0 or not described:
         return fallback
@@ -1028,7 +1050,7 @@ def detect_version():
         # "v0.1.0-14-g4570911-dirty"), so it says everything the
         # constant does and more. Show it alone.
         return described
-    # No tag is reachable yet (before the first release, or in a clone
+    # No release tag is reachable yet (before the first release, or in a clone
     # fetched without tags), so `--always` fell back to a bare commit
     # hash -- which names the build but not the version. Neither half
     # answers the question on its own here, so show both rather than
@@ -4861,6 +4883,20 @@ class Handler(http.server.BaseHTTPRequestHandler):
         branch_data = _branch_task_view(self.config, project, task_id, location=location)
         if branch_data is not None:
             response["branchTask"] = branch_data
+
+        # task-248: preview the branch assignee without ssh on drawer open.
+        # Workers use the hub's fetched branch report; launch re-reads the
+        # live worktree, which may have changed since the last fetch.
+        import spawn
+        agent_task = data.get("task") or {}
+        warnings = []
+        if (branch_data is not None
+                or (location is not None and location.machine and not location.conflict)
+                or os.path.isdir(spawn.worktree_dir(self.config, project_name, task_id))):
+            agent_task = spawn.worktree_agent_task(branch_data, agent_task, task_id, warnings)
+        response["resumeAgent"] = spawn.resolve_agent(self.config, project, task_id, task=agent_task)[0]
+        if warnings:
+            response["resumeAgentWarnings"] = warnings
 
         self._send_json(200, response)
 

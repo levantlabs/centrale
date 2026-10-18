@@ -397,8 +397,28 @@ class ControlConnectionTests(RemoteStatusCase):
         with mock.patch.object(M, "ssh_command", return_value=["ssh", "-F", "/c"]):
             argv = R.control_argv(self.MACHINE)
         self.assertEqual(argv[:4], ["ssh", "-F", "/c", "u@box-b"])
-        self.assertEqual(shlex.split(argv[4]), ["tmux", "-L", "cw", "-C", "new-session", "-A", "-s",
+        self.assertEqual(shlex.split(argv[4]), ["tmux", "-L", "cw", "-C", "new-session", "-A", "-D", "-s",
                                                 "centrale_control", "sleep infinity"])
+
+    def test_every_reattach_requests_eviction_only_in_the_control_session(self):
+        # Exercise the real reconnect loop and argv builder, replacing only
+        # Popen. tmux -A -D detaches other clients of the named session;
+        # no global detach or agent-session command is sent (task-249).
+        first, second = FakeControl(), FakeControl()
+        with mock.patch.object(M, "ssh_command", return_value=["ssh", "-F", "/c"]), \
+                mock.patch.object(R.subprocess, "Popen", side_effect=[first, second]) as popen, \
+                mock.patch.object(R, "RECONNECT_DELAYS", (0.01,)):
+            try:
+                R.start(self.config, wait=5)
+                first.drop()
+                self.assertTrue(wait_for(lambda: popen.call_count == 2 and second.commands))
+                for call in popen.call_args_list:
+                    self.assertEqual(shlex.split(call.args[0][-1]), [
+                        "tmux", "-L", "cw", "-C", "new-session", "-A", "-D",
+                        "-s", "centrale_control", "sleep infinity"])
+                    self.assertEqual(call.kwargs["stdin"], subprocess.PIPE)
+            finally:
+                R.stop_all()
 
     def test_identity_options_are_set_at_spawn_by_pane(self):
         self.assertEqual(R.identity_commands("=centrale-p-task-1:", "p", "task-1", "codex"), [

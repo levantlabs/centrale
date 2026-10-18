@@ -2603,3 +2603,12 @@ body.phone-page { display: block; height: auto; min-height: 100%; overflow: auto
 .machine-metrics .red { color: var(--danger); }
 .machine-metrics.unavailable { color: var(--text-faint); }
 .fleet-machine-head { flex-wrap: wrap; }
+
+/* task-245: compact per-machine project capacity fields. */
+.settings-machine-checks label[hidden] { display: none; }
+.settings-machine-limit { width: 5em; margin-left: .4em; }
+
+/* Phone metrics wrap beneath each heading, including the single-hub summary. */
+.phone-machine-summary { font-size: 11px; color: var(--text-dim); }
+.phone-page .fleet-machine > .machine-metrics { display: block; margin: 0 0 8px; }
+.phone-page .machine-metrics { white-space: normal; overflow-wrap: anywhere; }

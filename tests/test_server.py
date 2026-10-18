@@ -3566,6 +3566,7 @@ class HttpApiTests(unittest.TestCase):
         main_view = load_fixture("my_app_view.json")
         branch_view = json.loads(json.dumps(main_view))
         branch_view["task"]["status"] = "Done"
+        branch_view["task"]["assignees"] = ["@codex"]
         branch_view["task"]["acceptanceCriteria"][0]["checked"] = True
         branch_view["task"]["implementationNotes"] = "Ran the campaign; results archived."
         wt_dir = os.path.join(self.config["worktreeRoot"], "my-app-task-2")
@@ -3586,6 +3587,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn("branchTask", body)
         self.assertEqual(body["branchTask"]["task"]["status"], "Done")
         self.assertEqual(body["branchTask"]["task"]["implementationNotes"], "Ran the campaign; results archived.")
+        self.assertEqual(body["resumeAgent"], "codex")
 
     def test_api_task_omits_branch_task_when_worktree_backlog_read_fails(self):
         main_view = load_fixture("my_app_view.json")

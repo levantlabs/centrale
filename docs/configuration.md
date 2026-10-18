@@ -286,6 +286,11 @@ Fields:
   does to the default. It applies to a spawn and to the fresh-start
   fallback of a resume; the "Resume to reconcile" prompt ([docs/agents.md](agents.md#resume-to-reconcile-a-branch-that-fell-behind-main)) is separate and
   not affected.
+- `hubMaxAgents` — optional positive integer limiting all configured projects'
+  live agents on the hub. Omitted or `null` means no cap. Workers are
+  unaffected. Counts fresh tmux sessions on spawn and resume; Settings
+  applies changes immediately without ending existing sessions.
+
 - `machines` (optional) — other Linux machines a project's tasks may run
   on, reached over ssh from this machine (the hub). Omitted, `null` or `[]`
   means none: everything runs here exactly as before, and Centrale never
@@ -311,13 +316,26 @@ Fields:
   Add or edit these entries in Settings → Machines. The machine's
   `maxAgents` counts live agents from every project on that machine; a
   project's `maxAgents` counts its live agents across the hub and every
-  worker. A spawn must fit both limits. For example, with my-app capped
+  worker. All three scopes apply together: project total, machine total,
+  and project on one machine. The optional top-level `hubMaxAgents`
+  (positive integer, omitted or `null` = unlimited) is the hub's machine
+  total, counting every configured project's live hub sessions. Workers
+  keep their own `maxAgents`; `hubMaxAgents` never limits workers.
+  A project's optional `machineMaxAgents`, for example
+  `{"hub": 2, "box-d": 3}`, limits that project at each named location.
+  Omitted keys mean no limit. Keys must be `hub` or one of that project's
+  `machines`, and values must be positive integers. Removing a machine
+  removes its project limit too. Spawn and resume must fit every applicable
+  limit; the first reached returns 409 naming the limit and live sessions.
+  Settings has a hub limit and project limits beside the machine choices;
+  empty inputs remove limits. Lowering a limit never ends existing sessions.
+  For example, with my-app capped
   at 2 and both my-app agents on box-d, further my-app spawns are
   refused anywhere. If box-d is also capped at 2, further spawns of
   any project on box-d are refused until a session ends.
 
   Centrale reaches a machine with `BatchMode=yes`, `ConnectTimeout=5`,
-  `ServerAliveInterval=5`, `ServerAliveCountMax=1` and a kept-open
+  `ServerAliveInterval=5`, `ServerAliveCountMax=3` and a kept-open
   connection (`ControlMaster=auto`, `ControlPersist=60`), written to a
   generated ssh config that includes your `~/.ssh/config` first, so any
   value you set there wins. The generated config and the control sockets
@@ -416,6 +434,9 @@ Fields:
     the error. The [Fleet view](board.md#views) shows used/max slots per
     project. Other projects have independent caps. Settings applies a changed cap to the
     next launch; lowering it does not stop existing sessions.
+  - `machineMaxAgents` (optional) — a map of `hub` or one of this project's
+    machines to a positive integer, limiting this project on that machine.
+    Omitted or empty means no additional cap.
   - `worktreeLinks` (optional) — an array of literal repo-relative paths,
     e.g. `[".venv", "local/data"]`. Omitted, `null` or `[]` means no links.
     Each **new** worktree receives symlinks to these paths in the configured
@@ -452,8 +473,12 @@ Fields:
     `--check` verifies per project and machine. The project's `path` stays a
     checkout on the hub, which keeps `main` and does every merge.
   - `defaultMachine` (optional) — where a spawn that names no machine goes:
-    `"hub"` (the same as omitting it) or one of the project's own
-    `machines`; anything else is rejected at startup. Each spawn may name a
+    explicit `"hub"` or one of the project's own `machines`. Omitted or
+    `null` enables automatic placement among the hub and the project's
+    workers, choosing the eligible machine with most available RAM (then
+    lower load per core); a project without workers stays hub-only.
+    See [automatic placement](api.md#post-apispawn) for filters and reasons.
+    Any other value is rejected at startup. Each spawn may name a
     machine instead (`POST /api/spawn`'s `machine`, see
     [docs/api.md](api.md)).
 

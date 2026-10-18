@@ -114,6 +114,8 @@
         // and only the drawer ever fetches it -- stash it on currentDrawer
         // so renderDrawerSessionArea() can read it without a call of its
         // own, then re-render that area now that it's available.
+        C.currentDrawer.resumeAgent = data.resumeAgent || null;
+        C.currentDrawer.resumeAgentWarnings = data.resumeAgentWarnings || [];
         C.currentDrawer.branchTask = branchTask;
         // task-93: the theater's task rail reads the description and
         // acceptance criteria from THIS response too -- stashing it
@@ -1048,12 +1050,15 @@
 
     var btn = C.h("button", {
       className: "btn btn-sm" + (armed ? " confirming" : ""),
-      text: loading ? "Resuming…" : (armed ? "Confirm resume?" : "Resume agent")
+      text: loading ? "Resuming…" : (armed ? "Confirm resume?" : (C.currentDrawer.resumeAgent ? "Resume " + C.currentDrawer.resumeAgent : "Resume agent"))
     });
     btn.disabled = !C.isTmuxAvailable() || loading;
     btn.title = !C.isTmuxAvailable()
       ? C.TMUX_UNAVAILABLE_TOOLTIP
       : "Continue this task's interrupted agent session in its existing worktree -- picks up the same conversation where it left off, uncommitted changes included.";
+    if (C.currentDrawer.resumeAgentWarnings && C.currentDrawer.resumeAgentWarnings.length) {
+      btn.title += " " + C.currentDrawer.resumeAgentWarnings.join("; ");
+    }
     btn.addEventListener("click", function () { C.handleResumeClick(projectName, taskId); });
     row.appendChild(btn);
 

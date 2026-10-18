@@ -139,7 +139,14 @@ With workers configured, the cards are grouped under "This machine" and each
 worker's name, as in Fleet. A worker that cannot be reached is labelled
 "unreachable" (or "not answering" while its reach is unknown); the connection
 error is never sent to the phone. With no workers configured, the page keeps
-its single list of project cards.
+its single list of project cards, with one small "This machine" metrics line.
+
+Under each machine heading, a compact line shows RAM available, swap used,
+disk free and one-minute load/core count. Amber and red use the same thresholds
+as the dashboard sidebar. Missing figures say "n/a"; an unreachable metric
+probe says "unreachable", and a cold cache says "checking…", both grey.
+These figures come only from the dashboard's existing 30-second system cache:
+phone polling never starts SSH probes or warms the cache itself.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="img/status-page-dark.png">
@@ -339,6 +346,15 @@ this applies and Centrale starts no `ssh` process.
    codex sandbox true && echo sandbox-ok
    ```
 
+   If Codex was installed without npm (for example with its own installer,
+   which puts `codex` in `~/.local/bin`), it keeps a `bwrap` for each
+   release under `~/.codex/packages/`. Replace the `cbwrap=` line with this
+   wildcard, so one rule covers every release, including later updates:
+
+   ```sh
+   cbwrap="$HOME/.codex/packages/*/releases/*/codex-resources/bwrap"
+   ```
+
    `sandbox-ok` means it works; the rule survives reboots. The sandbox
    also blocks network sockets, including the local test servers some
    projects' tests start, and `git commit`: Codex keeps every repository's
@@ -353,7 +369,8 @@ this applies and Centrale starts no `ssh` process.
    ```
 
    It applies to Codex sessions started after the change. Re-run these
-   lines if a Codex update moves its bundled `bwrap`. (Background and the
+   lines if a Codex update moves its bundled `bwrap` (not needed with the
+   wildcard above). (Background and the
    broader alternative: [Troubleshooting](#troubleshooting).)
 
    Leave out `claude` or `codex` if you will not run that agent there.
@@ -525,10 +542,28 @@ Without machines nothing below appears: no machine label, no grouping.
 
 - Placement is per task (doc-3 revision 5): one project can have tasks on
   this machine and on several workers at once. A spawn goes to the
-  machine it names, else the project's `defaultMachine`, else this
-  machine; a task that already has a worktree or branch somewhere stays
+  machine it names, else the project's `defaultMachine`, else automatic
+  placement among the hub and the project's workers; a task that already
+  has a worktree or branch somewhere stays
   there. Where each task is, is read from git on every refresh, never
   stored -- see [Where a task is](configuration.md#where-a-task-is).
+- **Automatic placement (task-244).** When an API spawn names no machine
+  and the project has no `defaultMachine`, Centrale filters the hub and
+  the project's own `machines`: unreachable, full (project `maxAgents`, machine `maxAgents`/`hubMaxAgents`,
+  or project `machineMaxAgents`), or failing
+  the project's `workerCheck` are skipped. It chooses the most available
+  RAM, breaking ties by lower load per CPU core. Unknown RAM ranks last;
+  unknown load ranks last at equal RAM; exact ties favor the hub then the
+  project's machine order. Figures are read fresh using the system resource
+  readers, and unknown figures alone never exclude a reachable machine.
+  The reply's `machine` and `placementReason` name the choice and each
+  skipped machine; no eligible machine returns 409 with every reason.
+  To opt out, name a `machine` in the spawn request or configure
+  `"defaultMachine": "hub"` (or a worker name). Remove the default or set
+  it to `null` to enable auto placement. A project without `machines`
+  remains hub-only and runs no placement probes. Existing task locations
+  and Resume are unchanged. The dashboard's machine picker sends an
+  explicit machine, so its choice continues to win.
 - Task and session API responses carry `machine` and `worktree` (the path
   on that machine) for a task on a worker, and `location` for every task
   of a project with machines. A board card and a sidebar session row show
@@ -550,8 +585,8 @@ Without machines nothing below appears: no machine label, no grouping.
   with no machines never shows one.
 - **Settings.** Each project's card in Settings (the gear) lists the
   configured machines as checkboxes -- where its tasks may run besides this
-  machine -- and a "Default machine" choice among this machine and the ones
-  ticked. Unticking a machine that still has the project's tasks is
+  machine -- and a "Default machine" choice of Automatic, this machine or
+  one of the workers ticked. Automatic clears the configured default. Unticking a machine that still has the project's tasks is
   refused by the server, and its reason appears under that field.
 - The Fleet view groups its project cards under one heading per machine
   with that machine's capacity ("box-b 2/4 agents"), this machine first;
@@ -603,6 +638,20 @@ anything on the worker; and there is no status file, because a file would
 outlive a crashed agent. See [How a remote agent's status reaches
 Centrale](architecture.md#how-a-remote-agents-status-reaches-centrale) for
 the details.
+
+The generated SSH config defaults to `ServerAliveInterval=5` and
+`ServerAliveCountMax=3`, allowing about 15 seconds of unanswered keepalives
+before disconnecting. `ConnectTimeout=5` and the other defaults are unchanged;
+your `~/.ssh/config` values take precedence (see
+[configuration](configuration.md#setup--configuration)). This tolerates brief
+network stalls without repeatedly rebuilding the shared connection.
+
+Every control-client attach, including a reconnect, uses `new-session -A -D`
+to detach earlier clients of `centrale_control`, including orphans left by a
+dead SSH connection. Clients attached to agent sessions or other sessions are
+untouched. Only one Centrale instance should monitor a given worker tmux
+socket: another instance attaching to the same control session replaces the
+previous client.
 
 What you will see:
 
@@ -845,7 +894,12 @@ most of the causes below in one pass.
   checkout's copy is read-only so an edit there cannot conflict with the
   agent's at merge time. Send a ruling through `POST /api/rule` instead —
   see "Ruling on a spawned task" in
-  [docs/agents.md](agents.md#ruling-on-a-spawned-task). A locked file
+  [docs/agents.md](agents.md#ruling-on-a-spawned-task). To switch a paused
+  task's agent, edit its assignee in its own worktree (on the worker when
+  remote), commit the task file on that branch, then Resume or re-spawn.
+  Both read that worktree first and warn on fallback to main. Resume starts
+  fresh with a prior-work note when the new agent has no conversation there;
+  switching back continues that agent's earlier conversation. A locked file
   with no `task/<id>` branch behind it (the branch was deleted outside
   Centrale) is unlocked at the next startup or `--check`, which reports
   it; `chmod u+w` it by hand in the meantime, or turn the lock off with
@@ -868,9 +922,11 @@ most of the causes below in one pass.
     Codex that it actually runs. The exact commands, which find the bundled
     path for you and test the result, are in
     [Setting up a worker](#setting-up-a-worker), step 2. They find the
-    bundled copy where npm installs Codex; for another install method, point
-    `cbwrap` at that install's `codex-resources/bwrap` instead (`find ~
-    -path '*codex-resources/bwrap'`). Expect minor syntax differences across
+    bundled copy where npm installs Codex; for a Codex installed without
+    npm, the same step gives a wildcard under `~/.codex/packages/` that
+    covers every release. For any other install, point `cbwrap` at that
+    install's `codex-resources/bwrap` (`find ~ -path
+    '*codex-resources/bwrap'`). Expect minor syntax differences across
     AppArmor/Ubuntu versions.
   - **Global (simpler, broader)** — disables the restriction for *every*
     unprivileged process on the machine, not just `bwrap`, which is a real
@@ -884,6 +940,27 @@ most of the causes below in one pass.
   `~/.codex/config.toml`. That setting permits an unsandboxed command after
   automatic review; it does not repair the sandbox. The hub's direct
   `bwrap` check remains a warning. Folder trust is a separate check.
+- **A worker shows as unreachable now and then, or stops answering until
+  someone wakes it** — two common causes on small Wi-Fi workers:
+  - **It went to sleep.** Ubuntu's desktop can suspend an idle machine even
+    when nobody is logged in at its screen. On a worker nobody uses
+    directly, turn sleep off: `sudo systemctl mask sleep.target
+    suspend.target hibernate.target hybrid-sleep.target` (undo with
+    `unmask`). `systemctl is-enabled suspend.target` then prints `masked`.
+  - **Realtek Wi-Fi power saving.** A worker with a Realtek card on the
+    `rtw88` driver (for example the RTL8822CE) can drop off even with
+    NetworkManager's power saving off (step 1 of
+    [Setting up a worker](#setting-up-a-worker)). A count above zero from
+    `sudo journalctl -k | grep -c 'failed to leave lps state'` confirms it.
+    Turn the driver's own power saving off, then reboot:
+
+    ```sh
+    printf 'options rtw88_core disable_lps_deep=y\noptions rtw88_pci disable_aspm=y\n' |
+      sudo tee /etc/modprobe.d/rtw88-no-powersave.conf
+    sudo reboot
+    ```
+
+    After the reboot, the same count stays at 0.
 
 ## Tests
 
@@ -1388,8 +1465,11 @@ from there. See [The tested backlog baseline](#the-tested-backlog-baseline)
 below; bumping it is a separate procedure from bumping `__version__`, and
 the two are usually done in the same release.
 
-The server layers `git describe --tags --always --dirty` on top of the
-constant when the checkout has a `.git`, so a development checkout reports
+The server layers `git describe --tags --match 'v[0-9]*' --always --dirty`
+on top of the constant when the checkout has a `.git`. It uses release tags
+only: recovery tags such as `abandoned/...` never name the build. Without a
+reachable release tag it reports `v<version> (<sha>[-dirty])`. With a
+release tag, a development checkout reports
 `v0.1.0-14-g4570911` (a suffix that moves with every commit) while a
 released snapshot — whose release commit carries the tag — reports a clean
 `v0.1.0`. A downloaded zip has no `.git` and reports the constant alone,
@@ -1678,14 +1758,19 @@ unique detached scratch worktree on box-b, applies the project's
 `worktreeLinks`, runs the command from that root, and removes the scratch
 worktree before claiming the task. The parked tree may be empty. A passing
 check continues with the existing claim, push, task worktree and launch.
-No declaration keeps the existing path; hub spawns and Resume skip the check.
+No declaration skips the check. Explicit/default hub spawns and Resume
+skip it too. Automatic placement checks every otherwise eligible candidate,
+including the hub, using the same pinned detached scratch-tree execution
+and cleanup. A selected worker is checked again by its normal launch path;
+readiness results are never reused across spawns.
 
 The check is bounded to 10 seconds, with a 2-second kill grace. Scratch
 processes receive TERM, a bounded wait, then KILL if needed; cleanup verifies
 none remain before removing the worktree/log on pass, failure and timeout.
-Worker temporary paths use `$TMPDIR` (default `/tmp`) with unique
+Worker and automatic hub-check temporary paths use `$TMPDIR` (default `/tmp`) with unique
 `centrale-worker-check-XXXXXX` names and a sibling `.output` log; set
-`TMPDIR` in the worker environment to change that resource root. Cleanup
+`TMPDIR` in the worker environment (or the hub server environment for hub
+checks) to change that resource root. Cleanup
 failure is a refusal, rather than a passing check. Error output is limited
 to 2000 characters. A missing or non-executable check file is named as "setup not finished";
 a present check exiting 126/127 is an ordinary check failure (for example,
@@ -1701,3 +1786,16 @@ They never push: the scratch tree uses the worker's existing parked base
 ref, using the hub checkout's current branch name (e.g. `master`). A missing ref is WARN ("not pushed yet; checked at the next spawn"); a
 worker base behind or differing from the hub base is named in the line. Spawn always
 checks the freshly pushed base. Readiness results are never stored.
+
+### Agent capacity limits
+
+All three scopes apply to spawn and resume: a project's `maxAgents` counts
+its live agents across machines; a worker's `maxAgents` or top-level
+`hubMaxAgents` counts all projects on that machine; a project's
+`machineMaxAgents` limits it on each named machine. All are optional.
+Set the hub cap in Settings and per-project caps beside the hub and ticked
+machine choices; blank means no limit. A 409 names the reached limit and
+live sessions. End a session or raise that limit before retrying. Idle and
+finished agents still count while their tmux sessions live. Lowering a cap
+never terminates agents. Automatic placement skips capped machines and
+explains each skip; if all are full, its 409 lists their reasons.

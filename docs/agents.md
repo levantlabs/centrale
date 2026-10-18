@@ -331,6 +331,36 @@ the existing worktree, Resume starts a tmux session there running the
 resolved agent's **resume command**, continuing that same dead
 conversation instead:
 
+To switch a paused spawned task to another agent, edit its first assignee
+**inside the task's worktree** (on the worker for a remote task), commit the
+task-file change on that branch, then click **Resume** or **Re-spawn**:
+
+```sh
+backlog task edit TASK-123 -a @codex
+git add -- 'backlog/tasks/task-123 - Task title.md'
+git commit -m "backlog: switch TASK-123 to codex"
+```
+
+Use the actual task ID and filename. Resume and re-spawn with an existing
+worktree read its task through Backlog for agent selection. If that copy is
+missing or unreadable, they fall back to the main copy and return a warning.
+If the worktree is missing but the task branch exists, re-spawn reads the
+committed task on that branch, on the hub or on the worker that owns it
+(task-252). An unreadable branch copy falls back to main with a warning
+naming the failure. The read uses a disposable detached snapshot through
+Backlog, cleaned up before the claim and launch; its unique temporary path
+uses `TMPDIR` on the machine doing the read (default `/tmp`).
+Fresh spawns with no branch still use the main task. The Done check and task-file lock rules
+are unchanged. The drawer's Resume label uses the branch task; for a worker this is the
+hub's fetched copy, which may lag the live worktree read at launch.
+
+Resume continues the selected agent's conversation for this worktree when
+one exists. If the new Claude or Codex agent has no conversation there, it
+starts fresh with the workflow prompt, a prior-work note to inspect the
+branch and uncommitted changes, and a warning. **Switching back to an agent
+that ran there before continues its earlier conversation**, which may predate
+the other agent's changes. Re-spawn always sends a fresh workflow prompt.
+
 For **Codex** (including aliases and absolute paths whose executable is named
 `codex`), Centrale reads `$CODEX_HOME/sessions` on each request, defaulting to
 `~/.codex/sessions`. Only interactive CLI records whose metadata and recorded
@@ -351,11 +381,21 @@ and `--worktree` also refuse on Resume. Put ordinary model/config/approval
 options on `cmd`; those still carry through. Wrapper scripts whose executable
 is not named `codex` remain custom agents, outside Codex identity verification.
 
-For other agents the existing priority order is:
+For **Claude** (including aliases and absolute executable paths), Centrale
+checks interactive transcript messages for this exact worktree under
+`$CLAUDE_CONFIG_DIR/projects`, defaulting to `~/.claude/projects`. Missing,
+unreadable, empty and sidechain-only records do not establish a conversation.
+This lookup only reads the store. Launch keeps its inherited environment;
+Centrale does not set `CLAUDE_CONFIG_DIR`, since setting it also changes
+where Claude reads its global configuration and trust/onboarding state.
+Without one, even a configured Claude resume command is replaced by a fresh
+start with the workflow prompt and prior-work note, with a warning.
+
+With a Claude conversation, or for other agents, the priority order is:
 
 1. the agent's configured `resumeCmd`, if present;
 2. `claude --continue` (argv prefix `["claude", "--continue"]`) plus its configured arguments when the executable is
-   literally `claude`;
+   named `claude`;
 3. otherwise a fresh start with the standard workflow prompt and a note that
    prior committed and uncommitted work already exists in the worktree.
 
@@ -908,6 +948,16 @@ it holds.
 It is not security — an editor can force-write, and anyone can `chmod
 u+w` it back. It is a guard rail against the CLI and the tools built on it,
 which is what was writing those mid-flight commits.
+
+**Switching a paused task's agent.** Leave the locked main copy alone. In
+the task's own worktree (on its worker, if remote), run
+`backlog task edit TASK-123 -a @codex`, commit that task file on the branch,
+then Resume or re-spawn. Both use the worktree's assignee first and warn if
+an unreadable or missing worktree task forces fallback to main. On Resume,
+a new agent without a conversation for that worktree starts fresh with the
+prior-work note; switching back to an agent that ran there before continues
+its earlier conversation. See the Resume section above for the commands
+and conversation rules.
 
 **What to do instead: `POST /api/rule`.** An orchestrator with a ruling
 on a spawned task sends it there (`{"project", "taskId", "sender",

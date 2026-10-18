@@ -438,6 +438,8 @@ def _check_capacity(config, machine, project, name, sessions):
                 f"Machine {machine['name']} has {len(live)} live agent sessions (maxAgents: {cap}): "
                 f"{', '.join(live)}. End a session before launching another agent.", status=409)
 
+    spawn.check_machine_project_capacity(config, project, machine["name"], sessions)
+
 
 def _check_external(machine, project, task_id, home, checkouts):
     branch = spawn.branch_name(task_id)
@@ -553,9 +555,17 @@ def check_worker_readiness(config, machine, project, base_sha):
     command = shlex.join(argv)
     links = []
     for rel in project.get("worktreeLinks") or []:
-        links += [rel, machines.links_source_path(machine, project, rel)]
-    result = machines.run_on_machine(config, machine["name"], _sh(
-        _WORKER_CHECK_SCRIPT, machines.repo_git_dir_path(machine, project), base_sha,
+        source = machines.links_source_path(machine, project, rel) if machine else os.path.join(project["path"], rel)
+        links += [rel, source]
+    if machine:
+        git_dir = machines.repo_git_dir_path(machine, project)
+    else:
+        proc = server.run_git(["rev-parse", "--absolute-git-dir"], project["path"])
+        if proc.returncode or not proc.stdout.strip():
+            return False, "cannot locate hub git directory for worker check"
+        git_dir = proc.stdout.strip()
+    result = machines.run_on_machine(config, machine["name"] if machine else None, _sh(
+        _WORKER_CHECK_SCRIPT, git_dir, base_sha,
         str(WORKER_CHECK_SECONDS), str(WORKER_CHECK_GRACE_SECONDS), _WORKER_SWEEP_PROGRAM,
         command, argv[0], *links), timeout=WORKER_CHECK_SECONDS + WORKER_CHECK_GRACE_SECONDS + 20)
     output = (result.stdout + "\n" + result.stderr).strip()[-WORKER_CHECK_OUTPUT_LIMIT:]
@@ -573,6 +583,14 @@ def check_worker_readiness(config, machine, project, base_sha):
     else:
         reason = f"worker check failed (exit {rc})"
     return False, f"{reason}: {output or 'no output'}"
+
+
+def check_hub_readiness(config, project):
+    """Auto placement applies the same bounded scratch-tree check on the hub."""
+    pin = server.run_git(["rev-parse", "--verify", "HEAD"], project["path"])
+    if pin.returncode or not pin.stdout.strip():
+        return False, "cannot pin the hub base for worker check"
+    return check_worker_readiness(config, None, project, pin.stdout.strip())
 
 
 def prepare_worker_readiness(config, machine, project):
@@ -860,15 +878,23 @@ def spawn_on_machine(config, project_name, task_id, agent=None, machine_name=Non
 
     task = None if spawn.spawn_cmd_override() else spawn._check_not_done(project, task_id)
     _check_external(machine, project, task_id, home, checkouts)
+    warnings = []
+    main_task = task
+    wt = worktree_path(machine, project_name, task_id)
+    if not spawn.spawn_cmd_override():
+        # A registration can outlive a deleted directory. Check existence
+        # on the worker, in the same command that reads its task (task-252).
+        checked_wt = wt if checkouts.get(spawn.branch_name(task_id)) == expand(wt, home) else ""
+        task = branch_agent_task(config, machine, project, task_id, task, warnings, checked_wt)
     agent_name, cmd, prompt_suffix, agent_kind, recorded, choice_warning = (
-        spawn._choose_spawn_agent(config, task_id, task, requested))
+        spawn._choose_spawn_agent(config, task_id, task, requested, claim_task=main_task))
     if project.get("workerCheck"):
         passed, reason = prepare_worker_readiness(config, machine, project)
         if not passed:
             check = project["workerCheck"]
             raise SpawnError(f"machine {machine['name']}: {reason}; read {check['doc']} in "
                              f"{project_name} and set up {machine['name']}, or spawn on the hub", status=409)
-    warnings = spawn._claim_for_spawn(config, project, task_id, recorded, choice_warning)
+    warnings.extend(spawn._claim_for_spawn(config, project, task_id, recorded, choice_warning))
 
     base = push_base(config, machine, project)
     wt, created = ensure_worktree(config, machine, project, task_id, base, warnings)
@@ -883,6 +909,77 @@ def spawn_on_machine(config, project_name, task_id, agent=None, machine_name=Non
                       [("PATH", session_path)], [*argv, prompt],
                       agent_name, agent_kind, warnings)
     return _result(machine, name, agent_name, wt, spawn_id, warnings)
+
+
+# task-252: read the worker's committed branch through Backlog without
+# reserving the task branch or leaving a task worktree behind. TMPDIR is
+# worker-local; the EXIT trap removes both registration and directory.
+_BRANCH_AGENT_SCRIPT = r'''set -e
+repo=$1
+branch=$2
+task=$3
+if [ -n "${4:-}" ] && [ -d "$4" ]; then
+    cd "$4"
+    exec backlog task view "$task" --json
+fi
+if ! git --git-dir="$repo" rev-parse --git-dir >/dev/null; then exit 1; fi
+if ! git --git-dir="$repo" show-ref --verify --quiet "refs/heads/$branch"; then
+    printf 'centrale-no-branch\n'
+    exit 0
+fi
+snapshot=$(mktemp -d "${TMPDIR:-/tmp}/centrale-branch-snapshot-XXXXXX")
+cleanup() {
+    git --git-dir="$repo" worktree remove --force "$snapshot" >/dev/null 2>&1 || true
+    rm -rf -- "$snapshot"
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+rmdir "$snapshot"
+git --git-dir="$repo" worktree add --quiet --detach "$snapshot" "$branch"
+cd "$snapshot"
+backlog task view "$task" --json
+'''
+
+
+def branch_agent_task(config, machine, project, task_id, main_task, warnings, wt=""):
+    result = machines.run_batch(config, machine["name"], [
+        (["bash", "-ic", _BRANCH_AGENT_SCRIPT, "bash",
+          machines.repo_git_dir_path(machine, project), spawn.branch_name(task_id), task_id, wt], None),
+    ])[0]
+    if result.ok and result.stdout.strip() == "centrale-no-branch":
+        return main_task
+    data, reason = None, None
+    if result.ok:
+        try:
+            data = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            reason = "Backlog returned invalid JSON"
+    else:
+        reason = result.stderr or result.stdout or f"worker read {result.status} (exit {result.returncode})"
+    return spawn.branch_agent_task(data, main_task, task_id, warnings,
+                                   f"machine {machine['name']}: {reason}" if reason else None)
+
+
+def worktree_agent_inputs(config, machine, wt, task_id, conversation=False):
+    """One bounded round trip for fresh task data and optional Claude evidence.
+
+    Resolve backlog in the worker's interactive PATH in the same command,
+    rather than spending a separate ssh call on executable resolution.
+    """
+    commands = [(["bash", "-ic", 'exec backlog task view "$1" --json', "bash", task_id], wt)]
+    if conversation:
+        program = inspect.getsource(spawn.claude_conversation_exists)
+        program += "\nimport json, sys\nprint(json.dumps(claude_conversation_exists(sys.argv[1])))\n"
+        commands.append((["python3", "-c", program, wt], None))
+    results = machines.run_batch(config, machine["name"], commands)
+    data = None
+    if results[0].ok:
+        try:
+            data = json.loads(results[0].stdout)
+        except (ValueError, TypeError):
+            pass
+    claude_exists = bool(conversation and results[1].ok and results[1].stdout.strip() == "true")
+    return data, claude_exists
 
 
 def resume_on_machine(config, project_name, task_id, reconcile=False, machine_name=None):
@@ -904,8 +1001,13 @@ def resume_on_machine(config, project_name, task_id, reconcile=False, machine_na
     base = push_base(config, machine, project)
     wt, created = ensure_worktree(config, machine, project, task_id, base, warnings)
 
+    claude_exists = False
+    if not spawn.spawn_cmd_override():
+        data, claude_exists = worktree_agent_inputs(config, machine, wt, task_id, conversation=True)
+        task = spawn.worktree_agent_task(data, task, task_id, warnings)
     launch = spawn._resume_launch(config, project, task_id, task, reconcile, wt,
-                                  lambda: codex_lookup(config, machine, wt))
+                                  lambda: codex_lookup(config, machine, wt),
+                                  claude_lookup=lambda: claude_exists)
     warnings.extend(launch["warnings"])
     agent_name, agent_kind = launch["agent_name"], launch["agent_kind"]
     argv = _agent_argv(config, machine, launch["cmd"], agent_name)

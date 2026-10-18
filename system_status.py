@@ -93,11 +93,30 @@ class Cache:
         self.updated = float("-inf")
         self.thread = None
 
+    @staticmethod
+    def config_key(config):
+        paths = [p["path"] for p in config.get("projects", [])]
+        path = paths[0] if paths else os.getcwd()
+        return json.dumps([path, config.get("machines") or []], sort_keys=True)
+
+    def peek(self, config):
+        """Copy existing observations without reads or refresh threads (task-247).
+
+        A changed configuration must not inherit another target's figures.
+        The dashboard remains responsible for warming/refreshing this cache.
+        """
+        key = self.config_key(config)
+        with self.lock:
+            if key == self.key:
+                return [dict(row) for row in self.rows]
+        return [empty(name, None) for name in
+                ["hub"] + [m["name"] for m in config.get("machines") or []]]
+
     def get(self, config):
         paths = [p["path"] for p in config.get("projects", [])]
         path = paths[0] if paths else os.getcwd()
         workers = config.get("machines") or []
-        key = json.dumps([path, workers], sort_keys=True)
+        key = self.config_key(config)
         with self.lock:
             if key != self.key:
                 self.key = key

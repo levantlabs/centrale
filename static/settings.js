@@ -147,6 +147,7 @@
     C.byId("settings-session-reply-toggle").checked = data.sessionPreviewMode === "interact";
     syncSettingsReplyToggle();
     C.byId("settings-refresh-interval").value = data.refreshIntervalSeconds;
+    C.byId("settings-hub-max-agents").value = data.hubMaxAgents == null ? "" : String(data.hubMaxAgents);
     populateStatusPage(data.statusPage);
 
     var container = C.byId("settings-check-commands");
@@ -237,6 +238,29 @@
       linksInput.value = (worktreeLinks[name] || []).join("\n");
       addField("Worktree links", "Linked from the main checkout into each new worktree. One repo-relative path per line.", linksInput, "worktreeLinks");
 
+      // task-245: hub capacity is always available; worker limits follow the machine checkboxes.
+      var limitsGroup = document.createElement("div");
+      var machineLimits = (data.machineMaxAgents || {})[name] || {};
+      function machineLimit(machine, parent, enabled) {
+        var label = C.h("label", { text: machine + " max agents " });
+        var limit = document.createElement("input");
+        limit.type = "number";
+        limit.min = "1";
+        limit.step = "1";
+        limit.className = "settings-machine-limit";
+        limit.setAttribute("data-setting", "machineMaxAgents");
+        limit.setAttribute("data-project", name);
+        limit.setAttribute("data-limit-machine", machine);
+        limit.setAttribute("aria-label", name + " max agents on " + machine);
+        limit.value = machineLimits[machine] == null ? "" : String(machineLimits[machine]);
+        limit.disabled = !enabled;
+        label.hidden = !enabled;
+        label.appendChild(limit);
+        parent.appendChild(label);
+        return { input: limit, label: label };
+      }
+      machineLimit("hub", limitsGroup, true);
+      addField("Project limits per machine", "This project's live sessions on each machine. Blank = no limit.", limitsGroup, "machineMaxAgents");
       // task-225: with machines configured, which of them this project's
       // tasks may run on and where a spawn naming none goes. Absent
       // entirely without machines, so a single-machine form is unchanged.
@@ -254,6 +278,11 @@
           label.appendChild(box);
           label.appendChild(document.createTextNode(machine));
           group.appendChild(label);
+          var limit = machineLimit(machine, group, box.checked);
+          box.addEventListener("change", function () {
+            limit.input.disabled = !box.checked;
+            limit.label.hidden = !box.checked;
+          });
           return box;
         });
         addField("Machines", "Besides this machine, where this project's tasks may run. Removing one is refused while the project still has tasks there.", group, "projectMachines");
@@ -261,17 +290,17 @@
         defaultSelect = document.createElement("select");
         addField("Default machine", "Where a spawn that names no machine goes.", defaultSelect, "defaultMachine");
         var syncDefaultOptions = function (preferred) {
-          var allowed = ["hub"].concat(machineChecks.filter(function (b) { return b.checked; }).map(function (b) { return b.value; }));
+          var allowed = ["", "hub"].concat(machineChecks.filter(function (b) { return b.checked; }).map(function (b) { return b.value; }));
           C.clearChildren(defaultSelect);
           allowed.forEach(function (machine) {
             var opt = document.createElement("option");
             opt.value = machine;
-            opt.textContent = machine === "hub" ? "hub (this machine)" : machine;
+            opt.textContent = machine === "" ? "Automatic" : (machine === "hub" ? "hub (this machine)" : machine);
             defaultSelect.appendChild(opt);
           });
           defaultSelect.value = allowed.indexOf(preferred) !== -1 ? preferred : "hub";
         };
-        syncDefaultOptions(defaultMachines[name] || "hub");
+        syncDefaultOptions(defaultMachines[name] === null ? "" : (defaultMachines[name] || "hub"));
         machineChecks.forEach(function (box) {
           box.addEventListener("change", function () { syncDefaultOptions(defaultSelect.value); });
         });
@@ -884,7 +913,7 @@
     // when there is one: the server validates against projects.json, so
     // it can name a project this form is not showing.
     var projectSetting = fieldName.split(".")[0];
-    if (["checkCommands", "workerCheck", "maxAgents", "worktreeLinks", "projectMachines", "defaultMachine"].indexOf(projectSetting) !== -1 &&
+    if (["checkCommands", "workerCheck", "maxAgents", "machineMaxAgents", "worktreeLinks", "projectMachines", "defaultMachine"].indexOf(projectSetting) !== -1 &&
         fieldName.indexOf(projectSetting + ".") === 0) {
       var project = fieldName.slice(projectSetting.length + 1);
       var setting = projectSetting === "checkCommands" ? "checkCommand" :
@@ -955,6 +984,22 @@
       maxAgents[input.getAttribute("data-project")] = value === "" ? null :
         (/^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : value);
     });
+    function readLimit(input, field) {
+      if (input.validity && input.validity.badInput) {
+        capErrors[field] = "Finish the number, or clear the field to remove the limit.";
+      }
+      var value = input.value.trim();
+      return value === "" ? null : (/^[0-9]+$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : value);
+    }
+    var hubMaxAgents = readLimit(C.byId("settings-hub-max-agents"), "hubMaxAgents");
+    var machineMaxAgents = {};
+    document.querySelectorAll('#settings-check-commands input[data-setting="machineMaxAgents"]').forEach(function (input) {
+      var name = input.getAttribute("data-project");
+      if (!machineMaxAgents[name]) machineMaxAgents[name] = {};
+      if (input.disabled) return;
+      var value = readLimit(input, "machineMaxAgents." + name);
+      if (value !== null) machineMaxAgents[name][input.getAttribute("data-limit-machine")] = value;
+    });
     if (Object.keys(capErrors).length) {
       setSettingsStatus(applySettingsFieldErrors(capErrors), "error");
       settingsSaveInFlight = false;
@@ -984,6 +1029,8 @@
       refreshIntervalSeconds: parseInt(C.byId("settings-refresh-interval").value, 10),
       checkCommands: checkCommands,
       maxAgents: maxAgents,
+      hubMaxAgents: hubMaxAgents,
+      machineMaxAgents: machineMaxAgents,
       worktreeLinks: worktreeLinks,
       defaultAgent: C.byId("settings-default-agent").value
     };
@@ -995,11 +1042,11 @@
       body.defaultMachine = {};
       machineGroups.forEach(function (group) {
         body.projectMachines[group.getAttribute("data-project")] = Array.prototype.filter.call(
-          group.querySelectorAll("input"), function (box) { return box.checked; }
+          group.querySelectorAll("input[data-machine]"), function (box) { return box.checked; }
         ).map(function (box) { return box.value; });
       });
       document.querySelectorAll('#settings-check-commands [data-setting="defaultMachine"]').forEach(function (select) {
-        body.defaultMachine[select.getAttribute("data-project")] = select.value;
+        body.defaultMachine[select.getAttribute("data-project")] = select.value || null;
       });
     }
     // task-78: only a touched Agents section rewrites the map -- an

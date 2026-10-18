@@ -1113,7 +1113,7 @@ class SpawnAgentChoiceTests(unittest.TestCase):
         self.config["requireAgentAssignment"] = False
         result, _, run_backlog_raw, _ = self._spawn(backlog_error=True)
         self.assertEqual(result["agent"], "claude")
-        self.assertIn("did not record @claude", result["warnings"][0])
+        self.assertTrue(any("did not record @claude" in w for w in result["warnings"]))
         self.assertEqual(self._claim_args(run_backlog_raw), ["task", "edit", "TASK-2", "-s", "In Progress"])
 
     def test_resume_of_an_unassigned_task_still_falls_back_silently(self):
@@ -2614,6 +2614,11 @@ class ResumeIntegrationTests(unittest.TestCase):
         self.codex_home = tempfile.TemporaryDirectory()
         self.addCleanup(self.codex_home.cleanup)
         os.environ["CODEX_HOME"] = self.codex_home.name
+        os.environ["CLAUDE_CONFIG_DIR"] = self.codex_home.name
+        folder = os.path.join(self.codex_home.name, "projects", "-worktrees-my-app-task-2")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "conversation.jsonl"), "w") as f:
+            f.write(json.dumps({"type": "user", "cwd": "/worktrees/my-app-task-2", "isSidechain": False}) + "\n")
         folder = os.path.join(self.codex_home.name, "sessions")
         os.makedirs(folder)
         with open(os.path.join(folder, f"rollout-{CodexConversationTests.A}.jsonl"), "w") as f:
@@ -2622,22 +2627,90 @@ class ResumeIntegrationTests(unittest.TestCase):
             }}) + "\n")
 
 
-    def _run_resume(self, config, assignees, reconcile=False, sessions=None, status=None):
+    def _run_resume(self, config, assignees, reconcile=False, sessions=None, status=None, reader=None, respawn=False):
         fake_git = FakeGit(branch_exists=True, worktree_registered=True, wt_dir="/worktrees/my-app-task-2")
         with mock.patch.object(server, "run_git", side_effect=fake_git), \
              mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)) as run_tmux, \
              mock.patch.object(server, "list_sessions", return_value=sessions or []), \
-             mock.patch.object(server, "run_backlog", return_value=task_view(assignees, status=status)), \
+             mock.patch.object(server, "run_backlog", side_effect=reader, return_value=task_view(assignees, status=status)), \
              mock.patch.object(server, "run_backlog_raw") as run_backlog_raw, \
              mock.patch.object(server, "capture_session_pane", return_value=["› Ask Codex to do anything", "? for shortcuts"]), \
              mock.patch.object(server, "probe_codex_hook_trust", return_value=False), \
              mock.patch("os.path.isdir", return_value=True), \
              mock.patch("os.makedirs"):
-            if reconcile:
+            if respawn:
+                with mock.patch.object(spawn, "_claim_for_spawn", return_value=[]):
+                    result = spawn.spawn(config, "my-app", "TASK-2")
+            elif reconcile:
                 result = spawn.resume(config, "my-app", "TASK-2", reconcile=True)
             else:
                 result = spawn.resume(config, "my-app", "TASK-2")
         return result, run_tmux, run_backlog_raw, fake_git
+
+    def test_claude_launch_inherits_config_environment(self):
+        _, tmux, _, _ = self._run_resume(self.config, ["@claude"])
+        self.assertFalse(any(arg.startswith("CLAUDE_CONFIG_DIR=") for arg in new_session_argv(tmux)))
+
+    def test_respawn_claim_keeps_main_assignees_when_selection_uses_worktree(self):
+        config = dict(self.config, requireAgentAssignment=False)
+        def read(args, cwd):
+            return task_view(["@bob"]) if cwd.startswith("/worktrees") else task_view(["@alice"])
+        fake_git = FakeGit(branch_exists=True, worktree_registered=True, wt_dir="/worktrees/my-app-task-2")
+        with mock.patch.object(server, "run_git", side_effect=fake_git), \
+             mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)), \
+             mock.patch.object(server, "list_sessions", return_value=[]), \
+             mock.patch.object(server, "run_backlog", side_effect=read), \
+             mock.patch.object(spawn, "_claim_for_spawn", return_value=[]) as claim, \
+             mock.patch("os.path.isdir", return_value=True), mock.patch("os.makedirs"):
+            spawn.spawn(config, "my-app", "TASK-2", agent="claude")
+        self.assertEqual(claim.call_args.args[3], ["@claude", "@alice"])
+
+    def test_respawn_uses_worktree_first_assignee(self):
+        config = dict(self.config, agents=server.normalize_agents_map({
+            "claude": ["claude"], "reviewer": ["reviewer"]}))
+        def read(args, cwd):
+            return task_view(["@reviewer", "@claude"]) if cwd.startswith("/worktrees") else task_view(["@claude"])
+        result, tmux, _, _ = self._run_resume(config, [], reader=read, respawn=True)
+        self.assertEqual(result["agent"], "reviewer")
+        self.assertIn("reviewer", new_session_argv(tmux))
+
+    def test_worktree_read_failures_fall_back_for_resume_and_respawn(self):
+        for bad in (None, {}, {"schemaVersion": 99, "task": {"assignees": ["@codex"]}},
+                    {"schemaVersion": 1, "task": "invalid"}, server.BacklogError("unreadable")):
+            for respawn in (False, True):
+                def read(args, cwd):
+                    if cwd.startswith("/worktrees"):
+                        if isinstance(bad, Exception):
+                            raise bad
+                        return bad
+                    return task_view(["@claude"])
+                with self.subTest(bad=bad, respawn=respawn):
+                    result, _, _, _ = self._run_resume(self.config, [], reader=read, respawn=respawn)
+                    self.assertEqual(result["agent"], "claude")
+                    self.assertTrue(any("main copy" in w for w in result.get("warnings", [])))
+
+    def test_resume_uses_worktree_assignee_and_keeps_main_done_check(self):
+        config = dict(self.config, agents=server.normalize_agents_map({
+            "claude": ["claude"], "reviewer": ["reviewer"]}))
+        def read(args, cwd):
+            return task_view(["@reviewer", "@claude"], status="Done") if cwd.startswith("/worktrees") else task_view(["@claude"], status="In Progress")
+        fake_git = FakeGit(branch_exists=True, worktree_registered=True, wt_dir="/worktrees/my-app-task-2")
+        with mock.patch.object(server, "run_git", side_effect=fake_git), \
+             mock.patch.object(server, "run_tmux", return_value=tmux_proc([], 0)) as tmux, \
+             mock.patch.object(server, "list_sessions", return_value=[]), \
+             mock.patch.object(server, "run_backlog", side_effect=read), \
+             mock.patch("os.path.isdir", return_value=True), mock.patch("os.makedirs"):
+            result = spawn.resume(config, "my-app", "TASK-2")
+        self.assertEqual(result["agent"], "reviewer")
+        self.assertIn("reviewer", new_session_argv(tmux))
+
+    def test_claude_without_conversation_starts_fresh(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": home}):
+            result, tmux, _, _ = self._run_resume(self.config, ["@claude"])
+        argv = new_session_argv(tmux)
+        self.assertNotIn("--continue", argv)
+        self.assertIn(spawn.RESUME_FALLBACK_NOTE, argv[-1])
+        self.assertTrue(any("Claude conversation" in w for w in result.get("warnings", [])))
 
     def test_codex_without_own_conversation_starts_fresh_and_says_so(self):
         config = dict(self.config, agents=server.normalize_agents_map({"codex": ["codex"]}),
@@ -3359,16 +3432,44 @@ class DoneStatusRefusalTests(unittest.TestCase):
         self.assertEqual(result["session"], "centrale-my-app-task-2")
         new_session_argv(run_tmux)  # exactly one session launched
 
-    def test_status_check_reuses_the_single_task_view_fetch_for_agent_resolution(self):
-        # task-41's refactor: the Done-status check and resolve_agent's
-        # assignee lookup must share one `backlog task view` call, not
-        # make two, for a real (non-override) spawn.
+    def test_respawn_without_worktree_reads_committed_branch_agent(self):
+        for branch_exists, broken in ((True, False), (True, True), (False, False)):
+            with self.subTest(branch_exists=branch_exists, broken=broken):
+                mocks, fake_git = self._mocks("In Progress", branch_exists, False)
+                reads = []
+                def read(args, cwd):
+                    reads.append(cwd)
+                    if cwd == "/repos/my-app":
+                        return task_view(["@claude"])
+                    if broken:
+                        raise server.BacklogError("branch task missing")
+                    return task_view(["@codex"])
+                with mocks["run_git"], mocks["run_tmux"] as tmux, mocks["list_sessions"], \
+                     mock.patch.object(server, "run_backlog", side_effect=read), \
+                     mocks["run_backlog_raw"], mock.patch("os.path.isdir", return_value=False), \
+                     mocks["makedirs"]:
+                    result = spawn.spawn(self.config, "my-app", "TASK-2")
+                expected = "codex" if branch_exists and not broken else "claude"
+                self.assertEqual(result["agent"], expected)
+                self.assertIn(expected, new_session_argv(tmux))
+                if branch_exists and broken:
+                    self.assertTrue(any("branch task missing" in w and "main copy" in w
+                                        for w in result.get("warnings", [])))
+                if not branch_exists:
+                    self.assertEqual(reads, ["/repos/my-app"])
+
+    def test_respawn_reads_main_status_and_worktree_agent_separately(self):
+        # task-248: re-spawn keeps main as the Done gate but reads its
+        # agent from the existing worktree.
         mocks, fake_git = self._mocks(status="In Progress")
         with mocks["run_git"], mocks["run_tmux"], mocks["list_sessions"], \
              mocks["run_backlog"] as run_backlog, mocks["run_backlog_raw"], \
              mocks["isdir"], mocks["makedirs"]:
             spawn.spawn(self.config, "my-app", "TASK-2")
-        run_backlog.assert_called_once_with(["task", "view", "TASK-2", "--json"], cwd="/repos/my-app")
+        self.assertEqual(run_backlog.call_args_list, [
+            mock.call(["task", "view", "TASK-2", "--json"], cwd="/repos/my-app"),
+            mock.call(["task", "view", "TASK-2", "--json"], cwd="/worktrees/my-app-task-2"),
+        ])
 
 
 FOREIGN_WT = "/repos/my-app/.worktrees/task-2-integrated"
@@ -3790,3 +3891,19 @@ class SpawnHttpApiTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClaudeConversationLookupTests(unittest.TestCase):
+    def test_only_interactive_messages_at_exact_worktree_count(self):
+        with tempfile.TemporaryDirectory() as home, mock.patch.dict(os.environ, {"CLAUDE_CONFIG_DIR": home}):
+            folder = os.path.join(home, "projects", "-worktrees-my-app-task-2")
+            os.makedirs(folder)
+            path = os.path.join(folder, "conversation.jsonl")
+            for row in ({}, {"type": "queue-operation"},
+                        {"type": "user", "isSidechain": True, "cwd": "/worktrees/my-app-task-2"},
+                        {"type": "user", "isSidechain": False, "cwd": "/elsewhere"},
+                        {"type": "user", "isSidechain": False, "cwd": "/worktrees/my-app-task-2"}):
+                with open(path, "w") as f:
+                    f.write("malformed\n" + json.dumps(row) + "\n")
+                expected = row.get("cwd") == "/worktrees/my-app-task-2" and row.get("isSidechain") is False
+                self.assertEqual(spawn.claude_conversation_exists("/worktrees/my-app-task-2"), expected)

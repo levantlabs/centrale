@@ -192,7 +192,7 @@ class RouteTests(ListenerTestBase, unittest.TestCase):
         self.assertNotIn(PRIVATE_DIR.encode(), body)
         data = json.loads(body)
         self.assertEqual(set(data), {"kind", "timestamp", "window", "refreshIntervalSeconds", "projects",
-                                     "agents", "history", "needsYou", "historyUnavailable"})
+                                     "agents", "history", "needsYou", "historyUnavailable", "machineMetrics"})
         self.assertEqual(data["agents"], [{"project": "app", "taskId": "TASK-1", "agent": "claude",
                                            "state": "waiting", "stateSince": 199900.0, "parked": True}])
         self.assertEqual(data["history"], [{"project": "app", "taskId": "TASK-1", "agent": "claude",
@@ -613,3 +613,43 @@ class SettingsTests(KeyFileMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PhoneMetricSnapshotTests(unittest.TestCase):
+    def test_cache_only_allowlist_and_configuration_changes(self):
+        import system_status as S
+        config = {"projects": [{"path": "/projects"}], "machines": [
+            {"name": "box-b", "worktreeRoot": "~/work"}]}
+        cache = S.Cache()
+        fields = {"ramTotal", "ramAvailable", "swapUsed", "swapTotal",
+                  "diskTotal", "diskFree", "load1", "cores", "reachable"}
+        with mock.patch.object(S, "cache", cache), \
+             mock.patch.object(S, "read_local", side_effect=AssertionError("local probe")), \
+             mock.patch.object(S, "read_worker", side_effect=AssertionError("ssh probe")), \
+             mock.patch.object(S.threading, "Thread", side_effect=AssertionError("thread")):
+            cold = status_page.strip_snapshot({}, config).get("machineMetrics")
+            self.assertIsNotNone(cold)
+            self.assertEqual([r["name"] for r in cold], ["hub", "box-b"])
+            for row in cold:
+                self.assertEqual(set(row), fields | {"name"})
+                self.assertTrue(all(row[k] is None for k in fields))
+        # Warm through the real cache path, then prove phone reads do not refresh it.
+        with mock.patch.object(S, "read_local", return_value={"ramTotal": 100}), \
+             mock.patch.object(S, "read_worker", return_value={"name": "box-b", "reachable": True,
+                 "ramTotal": 200, "ssh": "PRIVATE", "error": "PRIVATE", "futureField": "PRIVATE"}):
+            cache.get(config)
+            cache.thread.join(10)
+        with mock.patch.object(S, "cache", cache), \
+             mock.patch.object(S, "read_local", side_effect=AssertionError("local probe")), \
+             mock.patch.object(S.threading, "Thread", side_effect=AssertionError("thread")), \
+             mock.patch.object(S.time, "monotonic", return_value=cache.updated + 60):
+            rows = status_page.strip_snapshot({}, config)["machineMetrics"]
+            self.assertEqual([r["ramTotal"] for r in rows], [100, 200])
+            for row in rows:
+                self.assertEqual(set(row), fields | {"name"})
+            self.assertNotIn("PRIVATE", json.dumps(rows))
+            changed = dict(config, machines=[{"name": "box-b", "worktreeRoot": "~/new"}])
+            self.assertTrue(all(r["reachable"] is None for r in
+                                status_page.strip_snapshot({}, changed)["machineMetrics"]))
+            single = status_page.strip_snapshot({}, {"projects": []})["machineMetrics"]
+            self.assertEqual([r["name"] for r in single], ["hub"])

@@ -882,13 +882,22 @@ def main(argv=None):
                 for shot in shots:
                     spec = dict(shot)
                     if shot.get("machines") and machine_url is None:
+                        machine_config = stand_up_machines(server, config, fixture, sandbox)
                         machine_httpd = server.CentraleHTTPServer(
-                            ("127.0.0.1", 0), server.Handler,
-                            stand_up_machines(server, config, fixture, sandbox))
+                            ("127.0.0.1", 0), server.Handler, machine_config)
                         threading.Thread(target=machine_httpd.serve_forever, daemon=True).start()
                         machine_url = f"http://127.0.0.1:{machine_httpd.server_address[1]}/"
-                    spec["url"] = (machine_url if shot.get("machines") else
-                                   status_url if shot["kind"] == "phone" else url)
+                    if shot["kind"] == "phone":
+                        # Only invented figures enter published phone images; no probes.
+                        import system_status
+                        status_httpd.centrale_config = dict(
+                            machine_config if shot.get("machines") else config,
+                            refreshIntervalSeconds=10)
+                        with system_status.cache.lock:
+                            system_status.cache.key = system_status.cache.config_key(status_httpd.centrale_config)
+                            system_status.cache.rows = fixture["phoneMetrics"]
+                    spec["url"] = (status_url if shot["kind"] == "phone" else
+                                   machine_url if shot.get("machines") else url)
                     spec.setdefault("cardTitle", _card_title(fixture, shot))
                     written.append(shoot(context_factory, spec, args.out, expected_cards, Image))
                     print(f"wrote {_display_path(written[-1])}")

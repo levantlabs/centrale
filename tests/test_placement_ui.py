@@ -233,7 +233,7 @@ global.fetch = function (url, opts) {
 function byId(id) { return document.getElementById(id); }
 function group(project) { return byId("settings-check-commands").querySelectorAll('[data-setting="projectMachines"][data-project="' + project + '"]')[0]; }
 function defSel(project) { return byId("settings-check-commands").querySelectorAll('[data-setting="defaultMachine"][data-project="' + project + '"]')[0]; }
-function boxes(project) { return group(project).querySelectorAll("input"); }
+function boxes(project) { return group(project).querySelectorAll("input[data-machine]"); }
 function options(select) { return select.childNodes.map(function (o) { return o.value; }); }
 function errs() {
   return document.querySelectorAll("#settings-modal .settings-field-error").filter(function (e) { return !e.hidden; })
@@ -291,11 +291,11 @@ class SettingsMachinesTests(unittest.TestCase):
         self.assertEqual(out["names"], ["box-b", "box-c"])
         self.assertEqual(out["checked"], {"alpha": [True, False], "beta": [False, False]})
         self.assertEqual(out["defaults"], {"alpha": "box-b", "beta": "hub"})
-        self.assertEqual(out["options"], {"alpha": ["hub", "box-b"], "beta": ["hub"]})
+        self.assertEqual(out["options"], {"alpha": ["", "hub", "box-b"], "beta": ["", "hub"]})
 
     def test_the_default_only_offers_the_machines_ticked(self):
-        self.assertEqual(self.out["afterTick"], ["hub", "box-c"])
-        self.assertEqual(self.out["afterUntick"], {"options": ["hub"], "value": "hub"})
+        self.assertEqual(self.out["afterTick"], ["", "hub", "box-c"])
+        self.assertEqual(self.out["afterUntick"], {"options": ["", "hub"], "value": "hub"})
 
     def test_save_sends_both_maps_for_every_project(self):
         self.assertEqual(self.out["saved"], {
@@ -359,3 +359,37 @@ class WorkerSettingsTests(unittest.TestCase):
         self.assertEqual(out['workerLoaded'], {'command': 'scripts/check.sh --check', 'doc': 'docs/setup.md'})
         self.assertEqual(out['workerSaved'], {'alpha': {'command': 'scripts/ready.sh', 'doc': 'docs/worker.md'}, 'beta': None})
         self.assertEqual(out['refused']['errors'], ['command and doc required'])
+
+
+@js_harness.requires_node
+class SettingsAutomaticPlacementTests(unittest.TestCase):
+    def test_absent_default_survives_open_and_save_as_automatic(self):
+        driver = SETTINGS_DRIVER_JS.replace(
+            'data.defaultMachine = { alpha: "box-b", beta: "hub" };',
+            'data.defaultMachine = { alpha: null, beta: "hub" };')
+        out = js_harness.run_driver(self, driver, timeout=30)
+        self.assertEqual(out['open']['defaults']['alpha'], '')
+        self.assertIsNone(out['saved']['defaultMachine']['alpha'])
+        self.assertEqual(out['saved']['defaultMachine']['beta'], 'hub')
+
+
+@js_harness.requires_node
+class MachineLimitSettingsTests(unittest.TestCase):
+    def test_limits_load_save_clear_and_follow_machine_selection(self):
+        driver = SETTINGS_DRIVER_JS.replace(
+            'harvestMode: "click", sessionPreviewMode:',
+            'hubMaxAgents: 8, machineMaxAgents: {alpha: {hub: 2, "box-b": 3}}, harvestMode: "click", sessionPreviewMode:'
+        ).replace('  // Ticking a machine adds', r'''  function cap(project, machine) { return document.querySelector('input[data-project="' + project + '"][data-limit-machine="' + machine + '"]'); }
+  out.limitsLoaded = [byId("settings-hub-max-agents").value, cap("alpha", "hub").value, cap("alpha", "box-b").value, cap("beta", "box-c").disabled];
+  byId("settings-hub-max-agents").value = "9";
+  cap("alpha", "hub").value = "";
+  cap("beta", "box-c").value = "4";
+  // Ticking a machine adds''').replace(
+            '  out.saved = { projectMachines:',
+            '  out.limitsSaved = {hub: saved.hubMaxAgents, projects: saved.machineMaxAgents};\n  out.saved = { projectMachines:'
+        ).replace('  out.withoutBody = { has:',
+                  '  out.soloLimits = saved.machineMaxAgents;\n  out.withoutBody = { has:')
+        out = js_harness.run_driver(self, driver, timeout=30)
+        self.assertEqual(out['limitsLoaded'], ['8', '2', '3', True])
+        self.assertEqual(out['limitsSaved'], {'hub': 9, 'projects': {'alpha': {}, 'beta': {'box-c': 4}}})
+        self.assertEqual(out['soloLimits'], {'alpha': {'hub': 2}, 'beta': {}})

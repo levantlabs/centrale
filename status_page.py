@@ -331,6 +331,8 @@ def strip_snapshot(snapshot, config):
     """The status page's data: an allowlist over a get_fleet() snapshot.
     Every field is copied by name; nothing is passed through whole, so a
     field added to the fleet snapshot later never reaches the network."""
+    import system_status
+
     projects = [{"name": p.get("name"), "maxAgents": p.get("maxAgents"), "agentCount": p.get("agentCount", 0)}
                 for p in snapshot.get("projects") or []]
     agents = [{"project": a.get("project"), "taskId": a.get("taskId"), "agent": a.get("agent"),
@@ -359,6 +361,11 @@ def strip_snapshot(snapshot, config):
             "unavailable": len(snapshot.get("needsYouErrors") or []),
         },
         "historyUnavailable": bool(snapshot.get("historyError")),
+        # Copy by name, never expose future cache fields or start probes here.
+        "machineMetrics": [{key: row.get(key) for key in (
+            "name", "ramTotal", "ramAvailable", "swapUsed", "swapTotal",
+            "diskTotal", "diskFree", "load1", "cores", "reachable")}
+            for row in system_status.cache.peek(config)],
     }
     if snapshot.get("machines"):
         # task-236: machine names and reach are enough to place agents on

@@ -638,12 +638,44 @@
     {
       "name": "status-page-light",
       "kind": "phone",
-      "theme": "light"
+      "theme": "light",
+      "machines": true
     },
     {
       "name": "status-page-dark",
       "kind": "phone",
-      "theme": "dark"
+      "theme": "dark",
+      "machines": true
+    }
+  ],
+  "phoneMetrics": [
+    {
+      "name": "hub",
+      "reachable": true,
+      "ramTotal": 32000000000,
+      "ramAvailable": 18000000000,
+      "swapTotal": 8000000000,
+      "swapUsed": 0,
+      "diskTotal": 1000000000000,
+      "diskFree": 420000000000,
+      "load1": 2.1,
+      "cores": 8
+    },
+    {
+      "name": "box-b",
+      "reachable": true,
+      "ramTotal": 16000000000,
+      "ramAvailable": 2500000000,
+      "swapTotal": 8000000000,
+      "swapUsed": 1000000000,
+      "diskTotal": 500000000000,
+      "diskFree": 20000000000,
+      "load1": 6.2,
+      "cores": 4
+    },
+    {
+      "name": "box-c",
+      "reachable": false
     }
   ]
 }

@@ -88,8 +88,13 @@ def identity_commands(target, project, task_id, kind):
 def control_argv(machine):
     """The ssh command that opens `machine`'s control connection: control
     mode (-C, no terminal needed) attached to CONTROL_SESSION, created
-    with a window that does nothing if it is not there yet."""
-    remote = shlex.join([*machines.tmux_argv(machine), "-C", "new-session", "-A",
+    with a window that does nothing if it is not there yet.
+
+    With -A, -D detaches only the other clients of this session, including
+    orphans left by dead ssh connections, on every attach (task-249).
+    Agent sessions and their clients are untouched. Do this in the attach
+    itself so cleanup cannot accidentally detach the new client."""
+    remote = shlex.join([*machines.tmux_argv(machine), "-C", "new-session", "-A", "-D",
                          "-s", CONTROL_SESSION, "sleep infinity"])
     return [*machines.ssh_command(), machine["ssh"], remote]
 

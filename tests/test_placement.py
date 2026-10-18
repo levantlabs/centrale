@@ -211,7 +211,7 @@ class SpawnDispatchTests(PlacementCase):
             self.on_box("TASK-8")
             spawn.resume(self.config, "app", "TASK-8")
             with self.assertRaises(spawn.SpawnError) as caught:
-                spawn.spawn(self.config, "app", "TASK-9")
+                spawn.spawn(self.config, "app", "TASK-9", machine="hub")
         self.assertEqual(calls, [("spawn", {"agent": None, "machine_name": "box-b"}),
                                  ("resume", {"reconcile": False, "machine_name": "box-b"})])
         self.assertEqual(caught.exception.status, 418)
@@ -241,6 +241,84 @@ class SpawnDispatchTests(PlacementCase):
             remote._check_capacity(self.config, machine, machines.placed(self.project, "box-b"),
                                    "centrale-app-task-7", remote._parse_sessions("centrale-app-task-2\t1\n"))
         self.assertIn("Machine box-b has 1 live agent sessions (maxAgents: 1)", caught.exception.message)
+
+
+class MachineLimitTests(PlacementCase):
+    def setUp(self):
+        super().setUp()
+        self.config["capabilities"] = {"tmux": True}
+
+    def test_bound_worker_launch_does_not_wait_on_held_hub_lock(self):
+        self.config["hubMaxAgents"] = 1
+        for launch, remote_name in ((spawn.spawn, "spawn_on_machine"),
+                                    (spawn.resume, "resume_on_machine")):
+            for binding in ("explicit", "default", "located"):
+                with self.subTest(launch=launch.__name__, binding=binding):
+                    self.project["defaultMachine"] = "box-b" if binding == "default" else None
+                    self.world.workers["box-b"]["worktrees"].clear()
+                    if binding == "located":
+                        self.on_box("TASK-7")
+                    arrived = threading.Event()
+                    errors = []
+                    def run():
+                        try:
+                            launch(self.config, "app", "TASK-7",
+                                   machine="box-b" if binding == "explicit" else None)
+                        except Exception as exc:
+                            errors.append(exc)
+                    with mock.patch.object(remote, remote_name,
+                                           side_effect=lambda *a, **kw: arrived.set() or {}):
+                        spawn._hub_capacity_lock.acquire()
+                        thread = threading.Thread(target=run)
+                        try:
+                            thread.start()
+                            progressed = arrived.wait(1)
+                        finally:
+                            spawn._hub_capacity_lock.release()
+                            thread.join(5)
+                        self.assertFalse(thread.is_alive())
+                        self.assertEqual(errors, [])
+                        self.assertTrue(progressed, "worker launch waited on the hub lock")
+
+    def test_hub_limits_refuse_spawn_and_resume_with_live_names(self):
+        for setting in ("hubMaxAgents", "machineMaxAgents"):
+            for launch in (spawn.spawn, spawn.resume):
+                with self.subTest(setting=setting, launch=launch.__name__):
+                    self.config.pop("hubMaxAgents", None)
+                    self.project.pop("machineMaxAgents", None)
+                    if setting == "hubMaxAgents":
+                        self.config[setting] = 1
+                        self.world.hub_sessions = ["centrale-solo-task-1"]
+                    else:
+                        self.project[setting] = {"hub": 1}
+                        self.world.hub_sessions = ["centrale-app-task-1"]
+                    with self.assertRaises(spawn.SpawnError) as caught:
+                        launch(self.config, "app", "TASK-7", machine="hub")
+                    self.assertEqual(caught.exception.status, 409)
+                    self.assertIn(setting + ": 1", caught.exception.message)
+                    self.assertIn(self.world.hub_sessions[0], caught.exception.message)
+
+    def test_worker_project_limit_refuses_spawn_and_resume(self):
+        self.project["machineMaxAgents"] = {"box-b": 1}
+        self.world.workers["box-b"]["sessions"] = ["centrale-app-task-1"]
+        for launch in (spawn.spawn, spawn.resume):
+            with self.subTest(launch=launch.__name__), self.assertRaises(spawn.SpawnError) as caught:
+                launch(self.config, "app", "TASK-7", machine="box-b")
+            self.assertEqual(caught.exception.status, 409)
+            self.assertIn("machineMaxAgents: 1", caught.exception.message)
+            self.assertIn("centrale-app-task-1", caught.exception.message)
+
+    def test_limits_are_scoped_to_machine_and_project(self):
+        self.config["hubMaxAgents"] = 1
+        self.project["machineMaxAgents"] = {"hub": 1, "box-b": 1}
+        self.world.hub_sessions = ["centrale-solo-task-1"]
+        remote._check_capacity(self.config, self.config["machines"][0], self.project,
+                               "centrale-app-task-7", [{"name": "centrale-solo-task-2"}])
+        self.project["machineMaxAgents"] = {"box-b": 1}
+        self.config.pop("hubMaxAgents")
+        spawn._validate_and_check_session(self.config, "app", "TASK-7")
+        remote._check_capacity(self.config, self.config["machines"][1], self.project,
+                               "centrale-app-task-7", [{"name": "centrale-app-task-2"}])
 
 
 class MixedProjectHttpTests(PlacementCase):
@@ -362,8 +440,9 @@ class MixedProjectHttpTests(PlacementCase):
 
     def test_task_responses_carry_the_location(self):
         view = {"schemaVersion": 1, "task": {"id": "TASK-1"}}
+        branch_view = {"schemaVersion": 1, "task": {"id": "TASK-2", "assignees": ["@codex"]}}
         with mock.patch.object(server, "run_backlog", lambda *a, **k: view), \
-             mock.patch.object(server, "_branch_task_view", lambda *a, **k: None), \
+             mock.patch.object(server, "_branch_task_view", lambda *a, **k: branch_view if a[2] == "TASK-2" else None), \
              mock.patch.object(machines, "run_batch", side_effect=AssertionError("no ssh on a drawer open")):
             self.world.fetched["box-b"].add("task/task-2")
             self.world.fetched["box-b"].add("task/task-3")
@@ -375,6 +454,7 @@ class MixedProjectHttpTests(PlacementCase):
         self.assertEqual((bodies["TASK-2"]["machine"], bodies["TASK-2"]["worktree"]), ("box-b", "~/work/app-task-2"))
         self.assertEqual(bodies["TASK-3"]["location"]["conflict"], ["hub", "box-b"])
         self.assertNotIn("machine", bodies["TASK-3"])
+        self.assertEqual(bodies["TASK-2"]["resumeAgent"], "codex")
 
     def test_spawn_refuses_an_unlisted_machine_over_http(self):
         status, body = self.request("POST", "/api/spawn", {"project": "app", "taskId": "TASK-9", "machine": "box-c"})
@@ -438,6 +518,230 @@ class BoardPlacementTests(PlacementCase):
         self.assertFalse({"location", "machine"} & set(board["projects"][1]["tasks"][0]))
         self.assertNotIn("machines", board["projects"][1])
         self.assertEqual(self.world.asked.count("box-b"), 1)
+
+
+
+
+class AutoChoiceTests(unittest.TestCase):
+    def row(self, name, ram=None, load=None, cores=None, **extra):
+        return dict(name=name, reachable=True, ramAvailable=ram, load1=load,
+                    cores=cores, **extra)
+
+    def test_most_ram_then_lower_load_per_core_and_stable_ties(self):
+        rows = [self.row('hub', 1e9, 0, 8), self.row('box-b', 5e9, 4, 4),
+                self.row('box-c', 5e9, 2, 8)]
+        chosen, reason = spawn.choose_placement(rows)
+        self.assertEqual(chosen, 'box-c')
+        self.assertIn('hub skipped:', reason)
+        self.assertIn('box-b skipped:', reason)
+        self.assertIn('load/core', reason)
+        rows[1]['load1'] = 1
+        self.assertEqual(spawn.choose_placement(rows)[0], 'box-b')
+
+    def test_unknown_figures_rank_last_but_are_eligible(self):
+        unknown = self.row('box-b')
+        self.assertEqual(spawn.choose_placement([unknown, self.row('hub', 0)])[0], 'hub')
+        self.assertEqual(spawn.choose_placement([unknown])[0], 'box-b')
+        self.assertIn('unknown', spawn.choose_placement([unknown])[1])
+        self.assertEqual(spawn.choose_placement([
+            self.row('hub', 10), self.row('box-b', 10, 0, 4)])[0], 'box-b')
+
+    def test_every_filter_and_empty_result_names_reasons(self):
+        rows = [dict(self.row('hub', 100), reachable=False),
+                self.row('box-b', 200, capacityReason='maxAgents: 2'),
+                self.row('box-c', 300, workerCheckReason='missing compiler')]
+        chosen, reason = spawn.choose_placement(rows)
+        self.assertIsNone(chosen)
+        for part in ('hub', 'unreachable', 'box-b', 'maxAgents: 2', 'box-c', 'missing compiler'):
+            self.assertIn(part, reason)
+        self.assertIsNone(spawn.choose_placement([])[0])
+        rows.append(self.row('box-d'))
+        self.assertEqual(spawn.choose_placement(rows)[0], 'box-d')
+
+
+class AutoSpawnHttpTests(PlacementCase):
+    request = MixedProjectHttpTests.request
+
+    def setUp(self):
+        super().setUp()
+        import system_status
+        self.config['capabilities'] = {'tmux': True}
+        self.project['machines'] = ['box-b', 'box-c']
+        self.figures = {'hub': dict(ramAvailable=1e9, load1=0, cores=4),
+                        'box-b': dict(name='box-b', reachable=True, ramAvailable=5e9, load1=1, cores=4),
+                        'box-c': dict(name='box-c', reachable=True, ramAvailable=3e9, load1=0, cores=4)}
+        self.launched = []
+        patches = [mock.patch.object(server, 'run_tmux', lambda args, **kw: subprocess.CompletedProcess(args, 0, '', '')),
+                   mock.patch.object(spawn, '_claim_for_spawn', return_value=[]),
+                   mock.patch.object(system_status, 'read_local', lambda p: self.figures['hub']),
+                   mock.patch.object(system_status, 'read_worker', lambda c, m: self.figures[m['name']]),
+                   mock.patch.dict(os.environ, {'CENTRALE_SPAWN_CMD': 'true'}),
+                   mock.patch.object(remote, 'spawn_on_machine', self.launch)]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.httpd = server.CentraleHTTPServer(('127.0.0.1', 0), server.Handler, self.config)
+        thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(lambda: (self.httpd.shutdown(), self.httpd.server_close(), thread.join(5)))
+
+    def launch(self, config, project, task, **kw):
+        self.launched.append(kw['machine_name'])
+        return {'session': 'centrale-app-task-7', 'machine': kw['machine_name']}
+
+    def post(self, **extra):
+        return self.request('POST', '/api/spawn', dict(project='app', taskId='TASK-7', **extra))
+
+    def test_auto_placed_reply_names_choice_and_skipped_machines(self):
+        status, body = self.post()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.launched, ['box-b'])
+        self.assertEqual(body['machine'], 'box-b')
+        self.assertIn('hub skipped:', body['placementReason'])
+        self.assertIn('box-c skipped:', body['placementReason'])
+
+    def test_new_limits_skip_full_candidates_and_explain_no_capacity(self):
+        self.config['hubMaxAgents'] = 1
+        self.world.hub_sessions = ['centrale-solo-task-1']
+        self.project['machineMaxAgents'] = {'box-b': 1}
+        self.world.workers['box-b']['sessions'] = ['centrale-app-task-2']
+        status, body = self.post()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['machine'], 'box-c')
+        for limit in ('hubMaxAgents: 1', 'machineMaxAgents: 1'):
+            self.assertIn(limit, body['placementReason'])
+        self.project['machineMaxAgents']['box-c'] = 1
+        self.world.workers['box-c']['sessions'] = ['centrale-app-task-3']
+        status, body = self.post()
+        self.assertEqual(status, 409, body)
+        for part in ('hub skipped:', 'box-b skipped:', 'box-c skipped:', 'hubMaxAgents', 'machineMaxAgents'):
+            self.assertIn(part, body['error'])
+
+    def test_project_full_refuses_every_candidate_before_launch(self):
+        self.project['maxAgents'] = 1
+        self.world.hub_sessions = ['centrale-app-task-1']
+        status, body = self.post()
+        self.assertEqual(status, 409, body)
+        for part in ('hub', 'box-b', 'box-c', 'maxAgents'):
+            self.assertIn(part, body['error'])
+        self.assertEqual(self.launched, [])
+
+    def test_full_unreachable_and_failed_check_workers_are_excluded(self):
+        self.config['machines'][0]['maxAgents'] = 1
+        self.world.workers['box-b']['sessions'] = ['centrale-app-task-1']
+        self.project['workerCheck'] = {'command': 'check.sh', 'doc': 'setup.md'}
+        with mock.patch.object(remote, 'prepare_worker_readiness', return_value=(True, 'passed')), \
+             mock.patch.object(remote, 'check_hub_readiness', return_value=(False, 'missing tool')):
+            status, body = self.post()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['machine'], 'box-c')
+        self.assertIn('maxAgents', body['placementReason'])
+        self.assertIn('missing tool', body['placementReason'])
+
+    def test_explicit_default_existing_location_and_hub_only_skip_auto_probes(self):
+        import system_status
+        with mock.patch.object(system_status, 'read_local', side_effect=AssertionError('probe')):
+            self.assertEqual(self.post(machine='box-c')[0], 200)
+            self.project['defaultMachine'] = 'box-b'
+            self.assertEqual(self.post()[0], 200)
+            self.project['defaultMachine'] = None
+            self.on_box('TASK-7')
+            self.assertEqual(self.post()[0], 200)
+            self.world.workers['box-b']['worktrees'].clear()
+            with mock.patch.object(spawn, '_validate_and_check_session',
+                                   side_effect=spawn.SpawnError('hub selected', status=418)):
+                self.project['defaultMachineExplicit'] = True
+                self.assertEqual(self.post()[0], 418)
+                self.project['defaultMachineExplicit'] = False
+                self.project['machines'] = []
+                self.assertEqual(self.post()[0], 418)
+
+    def test_unreachable_and_worker_check_failure_refuse_with_each_reason(self):
+        self.figures['box-b']['reachable'] = False
+        self.project['workerCheck'] = {'command': 'check.sh', 'doc': 'setup.md'}
+        with mock.patch.object(remote, 'prepare_worker_readiness', return_value=(False, 'missing compiler')), \
+             mock.patch.object(remote, 'check_hub_readiness', return_value=(False, 'missing hub tool')):
+            status, body = self.post()
+        self.assertEqual(status, 409, body)
+        for part in ('box-b skipped: unreachable', 'box-c skipped: missing compiler',
+                     'hub skipped: missing hub tool', 'setup.md'):
+            self.assertIn(part, body['error'])
+        self.assertEqual(self.launched, [])
+
+    def test_hub_choice_includes_reason_and_unknown_worker_can_win(self):
+        self.figures['hub']['ramAvailable'] = 8e9
+        with mock.patch.object(spawn, '_ensure_worktree', return_value=self.repo):
+            status, body = self.post()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['machine'], 'hub')
+        self.assertIn('placed on hub:', body['placementReason'])
+        self.figures['hub']['ramAvailable'] = None
+        self.figures['box-b']['ramAvailable'] = None
+        self.figures['box-c']['ramAvailable'] = None
+        self.project['workerCheck'] = {'command': 'check.sh', 'doc': 'setup.md'}
+        with mock.patch.object(remote, 'prepare_worker_readiness', return_value=(True, 'passed')), \
+             mock.patch.object(remote, 'check_hub_readiness', return_value=(False, 'failed')):
+            status, body = self.post()
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['machine'], 'box-c')
+        self.assertIn('free RAM unknown', body['placementReason'])
+
+    def test_invalid_agent_and_done_task_are_refused_before_readiness_side_effects(self):
+        self.project['workerCheck'] = {'command': 'check.sh', 'doc': 'setup.md'}
+        with mock.patch.object(remote, 'prepare_worker_readiness', side_effect=AssertionError('readiness')), \
+             mock.patch.object(remote, 'check_hub_readiness', side_effect=AssertionError('readiness')):
+            self.assertEqual(self.post(agent='missing-agent')[0], 400)
+            with mock.patch.object(spawn, 'spawn_cmd_override', return_value=None), \
+                 mock.patch.object(server, 'run_backlog', return_value={'task': {'status': 'Done'}}):
+                self.assertEqual(self.post()[0], 409)
+
+
+
+class ExplicitHubDefaultTests(unittest.TestCase):
+    def test_explicit_hub_survives_load_save_reload_and_null_restores_auto(self):
+        import settings
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'projects.json')
+            raw = {'machines': [BOX], 'projects': [
+                {'name': 'app', 'path': directory, 'machines': ['box-b'], 'defaultMachine': 'hub'}]}
+            with open(path, 'w') as stream:
+                json.dump(raw, stream)
+            config = server.load_config(path)
+            self.assertTrue(config['projects'][0].get('defaultMachineExplicit'))
+            with mock.patch.object(server, 'which', return_value='/fake/tool'):
+                settings.apply_settings(config, {'defaultMachine': {'app': 'hub'}}, path=path)
+            self.assertTrue(config['projects'][0]['defaultMachineExplicit'])
+            self.assertTrue(server.load_config(path)['projects'][0].get('defaultMachineExplicit'))
+            with open(path) as stream:
+                self.assertEqual(json.load(stream)['projects'][0]['defaultMachine'], 'hub')
+            with mock.patch.object(server, 'which', return_value='/fake/tool'):
+                settings.apply_settings(config, {'defaultMachine': {'app': None}}, path=path)
+            self.assertFalse(config['projects'][0]['defaultMachineExplicit'])
+            self.assertFalse(server.load_config(path)['projects'][0].get('defaultMachineExplicit'))
+
+    def test_settings_get_save_retains_auto_and_later_workers_retain_explicit_hub(self):
+        import settings
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'projects.json')
+            raw = {'machines': [BOX], 'projects': [
+                {'name': 'app', 'path': directory, 'machines': ['box-b']},
+                {'name': 'solo', 'path': directory}]}
+            with open(path, 'w') as stream:
+                json.dump(raw, stream)
+            config = server.load_config(path)
+            with mock.patch.object(server, 'which', return_value='/fake/tool'):
+                defaults = settings.current_settings(config)['defaultMachine']
+                self.assertEqual(defaults, {'app': None, 'solo': None})
+                settings.apply_settings(config, {'defaultMachine': defaults}, path=path)
+                self.assertFalse(config['projects'][0].get('defaultMachineExplicit'))
+                self.assertIsNone(settings.current_settings(config)['defaultMachine']['app'])
+                settings.apply_settings(config, {'defaultMachine': {'solo': 'hub'}}, path=path)
+                settings.apply_settings(config, {'projectMachines': {'solo': ['box-b']}}, path=path)
+                self.assertTrue(config['projects'][1]['defaultMachineExplicit'])
+                self.assertEqual(settings.current_settings(config)['defaultMachine']['solo'], 'hub')
+            reloaded = server.load_config(path)
+            self.assertFalse(reloaded['projects'][0].get('defaultMachineExplicit'))
+            self.assertTrue(reloaded['projects'][1]['defaultMachineExplicit'])
 
 
 if __name__ == "__main__":

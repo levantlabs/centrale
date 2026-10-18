@@ -307,6 +307,10 @@
       </div>
 
       <div class="settings-section">
+        <label class="settings-label" for="settings-hub-max-agents">Hub max agents</label>
+        <input type="number" id="settings-hub-max-agents" class="settings-input" min="1" step="1">
+        <div class="settings-hint">All projects on this machine. Blank = no limit.</div>
+        <div id="settings-error-hubMaxAgents" class="settings-field-error" hidden></div>
         <label class="settings-label" for="settings-refresh-interval">Board auto-refresh interval (seconds)</label>
         <input type="number" id="settings-refresh-interval" class="settings-input" min="5" step="1">
         <div class="settings-hint">Only affects future refreshes -- won't change the countdown already running.</div>

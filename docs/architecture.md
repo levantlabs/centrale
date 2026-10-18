@@ -19,7 +19,7 @@ layout behind it.
 |---|---|
 | `system_status.py` | Read-only hub and worker resource readers, tolerant JSON parser and shared 30-second in-memory cache behind `/api/system`; worker probes use the existing bounded machine boundary in background threads (task-242) |
 | `server.py` | Backend: config loading, board aggregation, subprocess boundaries, HTTP server + routing |
-| `spawn.py` | Worktree + tmux spawn engine behind `POST /api/spawn` |
+| `spawn.py` | Worktree + tmux spawn engine behind `POST /api/spawn`; `choose_placement` is the pure filter/rank policy, while `auto_placement` gathers fresh resource, capacity and readiness observations for new tasks with no machine/default (task-244) |
 | `fleet.py` | Bounded durable fleet observation journal (task-186), loaded explicitly at startup; never a source of live badges or task status |
 | `orchestrator.py` | Optional condition-backed notification history for `GET /api/orchestrator-wait`, fed by existing hook transitions and harvest attempt results (task-174). No task decisions or subprocesses |
 | `harvest.py` | Gated merge engine behind `POST /api/harvest` (and the live `GET /api/harvest-progress` record) |
@@ -51,7 +51,9 @@ Everything shared lives here:
   defaults, and normalizes the `agents` map to one canonical shape
   (`{name: {"cmd": [...], "promptSuffix": ..., "resumeCmd": ...}}`) via
   `normalize_agents_map`. Malformed agent entries raise `ConfigError` at
-  startup.
+  startup. Project normalization retains an internal `defaultMachineExplicit`
+  flag only for an explicit hub default: the legacy normalized `None` value
+  otherwise cannot distinguish that opt-out from automatic placement.
 - **Subprocess boundaries** — small, patchable functions (`run_backlog`,
   `run_backlog_raw`, `run_git`, `run_tmux`, `which`,
   `launch_browser_process`) are the only places subprocesses run. All calls
@@ -126,7 +128,10 @@ Everything shared lives here:
   no cycle. Spawn and resume also take a per-project launch lock inside
   the task lock, covering the fresh tmux count through session creation
   (task-177); a launch never asks for another task lock. This prevents two
-  tasks from both taking the last `maxAgents` slot and serializes writes to
+  tasks from both taking the last `maxAgents` slot. With `hubMaxAgents` set,
+  launches additionally take a shared lock inside the project lock, covering
+  placement through launch across projects (task-245); its holder never
+  asks for another project lock. The project lock also serializes writes to
   the project's link exclusions. Read-only routes take none of these locks.
   The destructive throwaway routes
   additionally require the state their confirm described
@@ -166,6 +171,19 @@ reading a branch Centrale must not check out: a throwaway detached worktree
 under the `TMPDIR`-overridable temporary directory, always removed
 (registration and directory) on every path, used by both harvest's gate 2
 and `GET /api/task` for a parked branch.
+
+Resume and re-spawn with an existing worktree resolve the agent from that
+worktree's Backlog task, with a warned fallback to main (task-248). The main
+Done check remains separate. With a branch but no worktree, re-spawn reads
+the committed task through Backlog in a disposable detached snapshot on
+the owning machine, warning with the failure reason before falling back
+to main (task-252). The drawer's `resumeAgent` preview uses the
+branch task; workers use the hub's fetched copy with no ssh on drawer open,
+while launch reads the live worktree. Worker Resume batches that read with the Claude
+conversation check in one added round trip. Claude's transcript reader is
+self-contained in spawn.py and sent to the worker as Python source; it reads
+`CLAUDE_CONFIG_DIR` (default `~/.claude`) without creating a store or setting
+that variable on the launched process.
 
 The task-file lock (task-172) lives here too, as plain filesystem state
 with nothing recording it: `lock_task_file`/`unlock_task_file` flip the

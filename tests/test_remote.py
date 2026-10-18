@@ -8,6 +8,8 @@ runs here; the worker scripts themselves run for real in
 tests_integration/test_remote_integration.py."""
 
 import os
+import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -49,6 +51,9 @@ class FakeWorker:
     """Answers each run_batch call by the step it recognises."""
 
     def __init__(self):
+        self.task_view = ok(json.dumps({"schemaVersion": 1, "task": {"id": "TASK-7", "assignees": ["@claude"]}}))
+        self.worktree_missing = False
+        self.claude_conversation = True
         self.sessions = []          # names of live centrale-* sessions
         self.checkouts = {}         # branch -> path
         self.tip = None             # task branch tip in the bare repo
@@ -74,6 +79,10 @@ class FakeWorker:
                                 ("cleanup", remote._CLEANUP_SCRIPT)):
                 if script == known:
                     return step
+        if argv[:2] == ["bash", "-ic"] and "centrale-branch-snapshot" in argv[2]:
+            return "branch-task"
+        if argv[:2] == ["bash", "-ic"] and "task view" in argv[2]:
+            return "task-view"
         if argv[:2] == ["bash", "-ic"]:
             return "resolve"
         if argv[:2] == ["sh", "-c"] and argv[2] == 'printf "%s\\n" "$PATH"':
@@ -87,10 +96,16 @@ class FakeWorker:
         if argv[:2] == ["git", "--git-dir"]:
             return "tip"
         if argv[:2] == ["python3", "-c"]:
-            return "codex-lookup"
+            return "claude-lookup" if "def claude_conversation_exists" in argv[2] else "codex-lookup"
         raise AssertionError(f"unexpected worker command {argv!r}")
 
     def answer(self, step, argv):
+        if step == "branch-task":
+            return self.task_view if self.tip or self.checkouts else ok("centrale-no-branch\n")
+        if step == "task-view":
+            return ok(rc=1, stderr="missing directory") if self.worktree_missing else self.task_view
+        if step == "claude-lookup":
+            return ok(json.dumps(self.claude_conversation))
         if step == "sessions":
             return ok("".join(f"{n}\t100\n" for n in self.sessions))
         if step == "home":
@@ -211,10 +226,11 @@ class SpawnOnMachineTests(RemoteTestCase):
 
     def test_claims_on_hub_then_pushes_main_then_launches_by_full_path(self):
         result = spawn.spawn(_config(), "app", "TASK-7")
+        self.assertNotIn("warnings", result)
         self.assertEqual(self.order[:2], ["claim", "push"])
         self.assertEqual(self.hub_git[0][-2:], ["user@box-b:centrale-repos/app/.git", "refs/heads/main:refs/heads/main"])
         self.assertEqual(self.worker.steps(), ["checkouts", "branches",  # where the task is (locate)
-                                               "sessions", "home", "checkouts", "worktree", "resolve",
+                                               "sessions", "home", "checkouts", "branch-task", "worktree", "resolve",
                                                "login-path", "resolve", "resolve", "resolve", "launch"])
         worktree = self.worker.argv("worktree")
         self.assertEqual(worktree[4:8], ["~/centrale-repos/app/.git", "~/centrale-work/app-task-7",
@@ -347,7 +363,146 @@ class SpawnOnMachineTests(RemoteTestCase):
 
 
 class ResumeOnMachineTests(RemoteTestCase):
+    def test_respawn_without_worktree_reads_worker_branch(self):
+        self.worker.tip = "a" * 40
+        self.worker.task_view = ok(json.dumps({"schemaVersion": 1, "task": {"assignees": ["@codex"]}}))
+        result = spawn.spawn(_config(), "app", "TASK-7")
+        self.assertEqual(result["agent"], "codex")
+        self.assertIn(f"{HOME}/.codex/bin/codex", self.worker.argv("launch"))
+        self.assertLess(self.worker.steps().index("branch-task"), self.worker.steps().index("worktree"))
+
+    def test_deleted_worker_directory_reads_branch_despite_registration(self):
+        self.worker.tip = "a" * 40
+        self.worker.checkouts = {"task/task-7": WT}
+        self.worker.worktree_missing = True
+        self.worker.task_view = ok(json.dumps({"schemaVersion": 1, "task": {"assignees": ["@codex"]}}))
+        result = spawn.spawn(_config(), "app", "TASK-7")
+        self.assertEqual(result["agent"], "codex")
+
+    def test_unreadable_worker_branch_warns_with_reason(self):
+        self.worker.tip = "a" * 40
+        self.worker.task_view = ok(rc=1, stderr="branch task missing")
+        result = spawn.spawn(_config(), "app", "TASK-7")
+        self.assertEqual(result["agent"], "claude")
+        self.assertTrue(any("branch task missing" in w and "main copy" in w
+                            for w in result.get("warnings", [])))
+
+    def test_invalid_worker_branch_response_warns(self):
+        self.worker.tip = "a" * 40
+        for response in (ok("not JSON"), ok('{}'), ok(rc=1)):
+            with self.subTest(response=response):
+                self.worker.task_view = response
+                result = spawn.spawn(_config(), "app", "TASK-7")
+                self.assertEqual(result["agent"], "claude")
+                self.assertTrue(any("branch task" in w and "main copy" in w
+                                    for w in result.get("warnings", [])))
+
+    def test_branch_agent_refusal_precedes_claim_and_worker_creation(self):
+        self.worker.tip = "a" * 40
+        self.worker.task_view = ok(json.dumps({"schemaVersion": 1, "task": {"assignees": ["@unknown"]}}))
+        with self.assertRaises(spawn.SpawnError) as caught:
+            spawn.spawn(_config(), "app", "TASK-7")
+        self.assertEqual(caught.exception.status, 409)
+        self.assertEqual(self.order, [])
+        self.assertNotIn("worktree", self.worker.steps())
+        self.assertNotIn("launch", self.worker.steps())
+
+    def test_branch_snapshot_script_cleans_up_success_and_failed_reads(self):
+        # Drive the actual script with stand-in executables; no real git,
+        # backlog, ssh or agents. Every file stays inside this test's root.
+        with tempfile.TemporaryDirectory(prefix="c252-script-") as root:
+            bindir = os.path.join(root, "bin")
+            snapshots = os.path.join(root, "snapshots")
+            os.mkdir(bindir)
+            os.mkdir(snapshots)
+            log = os.path.join(root, "git.log")
+            scripts = {
+                "git": '#!/bin/sh\nprintf "%s\n" "$*" >> "$TEST_LOG"\n'
+                       'shift\ncase "$1" in\n'
+                       'show-ref) exit "$BRANCH_RC";;\n'
+                       'worktree) if [ "$2" = add ]; then mkdir "$5"; fi;;\n'
+                       'esac\n',
+                "backlog": "#!/bin/sh\nprintf '%s\\n' " +
+                           "'{\"schemaVersion\":1,\"task\":{\"assignees\":[\"@codex\"]}}'\n" +
+                           'exit "$BACKLOG_RC"\n',
+            }
+            for name, script in scripts.items():
+                path = os.path.join(bindir, name)
+                with open(path, "w") as stream:
+                    stream.write(script)
+                os.chmod(path, 0o755)
+            for branch_rc, backlog_rc, checkout in ((0, 0, ""), (0, 1, ""), (1, 0, ""),
+                                                    (0, 0, os.path.join(root, "deleted")),
+                                                    (0, 0, root)):
+                with self.subTest(branch_rc=branch_rc, backlog_rc=backlog_rc, checkout=checkout):
+                    if os.path.exists(log):
+                        os.unlink(log)
+                    env = {**os.environ, "PATH": bindir + os.pathsep + os.environ["PATH"],
+                           "TMPDIR": snapshots, "TEST_LOG": log,
+                           "BRANCH_RC": str(branch_rc), "BACKLOG_RC": str(backlog_rc)}
+                    proc = subprocess.run(["bash", "-c", remote._BRANCH_AGENT_SCRIPT,
+                                           "bash", root, "task/task-7", "TASK-7", checkout],
+                                          env=env, capture_output=True, text=True)
+                    self.assertEqual(proc.returncode, backlog_rc)
+                    self.assertEqual(os.listdir(snapshots), [])
+                    if branch_rc:
+                        self.assertEqual(proc.stdout.strip(), "centrale-no-branch")
+                    else:
+                        self.assertEqual(json.loads(proc.stdout)["task"]["assignees"], ["@codex"])
+                        if checkout == root:
+                            self.assertFalse(os.path.exists(log))
+                        else:
+                            with open(log) as stream:
+                                self.assertIn("worktree remove --force", stream.read())
+
+    def test_respawn_claim_preserves_main_assignees(self):
+        self.worker.checkouts = {"task/task-7": WT}
+        self.worker.worktree = "reused"
+        self.worker.task_view = ok(json.dumps({"schemaVersion": 1, "task": {"assignees": ["@bob"]}}))
+        with mock.patch.object(spawn, "_check_not_done", return_value={"assignees": ["@alice"]}), \
+             mock.patch.object(spawn, "_claim_for_spawn", return_value=[]) as claim:
+            result = spawn.spawn(_config(), "app", "TASK-7", agent="codex")
+        self.assertEqual(result["agent"], "codex")
+        self.assertEqual(claim.call_args.args[3], ["@codex", "@alice"])
+
+    def test_respawn_missing_worker_task_warns_and_keeps_main_agent(self):
+        self.worker.checkouts = {"task/task-7": WT}
+        self.worker.worktree = "reused"
+        self.worker.task_view = ok(rc=1)
+        result = spawn.spawn(_config(), "app", "TASK-7")
+        self.assertEqual(result["agent"], "claude")
+        self.assertTrue(any("main copy" in w for w in result.get("warnings", [])))
+
+    def test_resume_uses_worker_worktree_assignee(self):
+        self.worker.worktree = "reused"
+        self.worker.task_view = ok(json.dumps({"schemaVersion": 1, "task": {"assignees": ["@codex"]}}))
+        result = spawn.resume(_config(), "app", "TASK-7")
+        self.assertEqual(result["agent"], "codex")
+        self.assertIn(f"{HOME}/.codex/bin/codex", self.worker.argv("launch"))
+
+    def test_missing_worker_task_falls_back_with_warning(self):
+        self.worker.task_view = ok(rc=1, stderr="task missing")
+        result = spawn.resume(_config(), "app", "TASK-7")
+        self.assertEqual(result["agent"], "claude")
+        self.assertTrue(any("main copy" in w for w in result.get("warnings", [])))
+
+    def test_claude_without_worker_conversation_starts_fresh(self):
+        self.worker.claude_conversation = False
+        result = spawn.resume(_config(), "app", "TASK-7")
+        argv = self.worker.argv("launch")
+        self.assertNotIn("--continue", argv)
+        self.assertTrue(any(spawn.RESUME_FALLBACK_NOTE in arg for arg in argv))
+        self.assertTrue(any("Claude conversation" in w for w in result.get("warnings", [])))
+
+    def test_respawn_uses_worker_worktree_assignee(self):
+        self.worker.checkouts = {"task/task-7": WT}
+        self.worker.worktree = "reused"
+        self.worker.task_view = ok(json.dumps({"schemaVersion": 1, "task": {"assignees": ["@codex"]}}))
+        result = spawn.spawn(_config(), "app", "TASK-7")
+        self.assertEqual(result["agent"], "codex")
+
     def test_codex_resume_uses_the_workers_conversation_store(self):
+        self.worker.task_view = ok(json.dumps({"schemaVersion": 1, "task": {"assignees": ["@codex"]}}))
         self.worker.worktree = "reused"
         config = _config()
         with mock.patch.object(spawn, "_check_not_done", lambda p, t: {"status": "In Progress",
@@ -372,6 +527,7 @@ class ResumeOnMachineTests(RemoteTestCase):
         launch = self.worker.argv("launch")
         i = launch.index(f"{HOME}/.npm-global/bin/claude")
         self.assertEqual(launch[i + 1], "--continue")
+        self.assertFalse(any(arg.startswith("CLAUDE_CONFIG_DIR=") for arg in launch))
 
 
 class EndSessionTests(RemoteTestCase):
@@ -556,8 +712,6 @@ class GitUrlTests(unittest.TestCase):
         self.assertEqual(remote.git_url({"ssh": "ssh://u@h:2222"}, "~/r.git"), "ssh://u@h:2222/~/r.git")
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 class WorkerReadinessTests(RemoteTestCase):
     def test_refuses_before_claim_and_creation(self):
@@ -653,3 +807,37 @@ class WorkerReadinessTests(RemoteTestCase):
             with self.assertRaises(SystemExit) as caught:
                 exec(remote._WORKER_SWEEP_PROGRAM, {})
         self.assertEqual(caught.exception.code, 0)
+
+
+class HubReadinessTests(unittest.TestCase):
+    def test_hub_check_pins_head_and_uses_existing_bounded_scratch_runner(self):
+        project = {'name': 'app', 'path': '/hub/app', 'worktreeLinks': ['.venv'],
+                   'workerCheck': {'command': 'scripts/check.sh --check', 'doc': 'setup.md'}}
+        def git(args, cwd):
+            self.assertEqual(cwd, '/hub/app')
+            output = {'rev-parse --verify HEAD': 'a' * 40,
+                      'rev-parse --absolute-git-dir': '/hub/app/.git'}[' '.join(args)]
+            return subprocess.CompletedProcess(args, 0, output, '')
+        def run(config, name, argv, **kw):
+            self.assertIsNone(name)
+            self.assertEqual(argv[:4], ['sh', '-c', remote._WORKER_CHECK_SCRIPT, 'sh'])
+            self.assertEqual(argv[4:6], ['/hub/app/.git', 'a' * 40])
+            self.assertEqual(argv[-2:], ['.venv', '/hub/app/.venv'])
+            self.assertGreater(kw['timeout'], remote.WORKER_CHECK_SECONDS)
+            return machines.MachineResult(machines.ANSWERED, 124, '', 'timeout', None)
+        with mock.patch.object(server, 'run_git', side_effect=git), \
+             mock.patch.object(machines, 'run_on_machine', side_effect=run):
+            passed, reason = remote.check_hub_readiness({}, project)
+        self.assertFalse(passed)
+        self.assertIn('timed out', reason)
+
+    def test_unpinnable_hub_never_starts_check(self):
+        with mock.patch.object(server, 'run_git', return_value=subprocess.CompletedProcess([], 1, '', 'bad ref')), \
+             mock.patch.object(machines, 'run_on_machine', side_effect=AssertionError('must not run')):
+            passed, reason = remote.check_hub_readiness({}, {'path': '/hub/app'})
+        self.assertFalse(passed)
+        self.assertIn('cannot pin', reason)
+
+
+if __name__ == "__main__":
+    unittest.main()

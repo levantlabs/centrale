@@ -23,6 +23,63 @@ would protect is the shape of `projects.json`, the `/api` endpoints
 documented in [docs/api.md](docs/api.md), and what a spawned agent is
 handed.
 
+## v0.7.0 — automatic placement and per-machine limits
+
+Centrale can now choose a machine for you, and agent limits can be set
+for each machine.
+
+Tested against **`backlog` v1.53.0**, unchanged from v0.6.0. Remote machines
+are tested with Ubuntu 24.04 workers; other Linux systems and macOS are
+untested.
+
+**New:**
+
+- **Automatic placement.** When a spawn names no machine and the project
+  has no default machine, Centrale picks one from the hub and the
+  project's own machines. It skips machines that are unreachable, at an
+  agent limit or failing the project's readiness check, then takes the
+  one with the most free RAM (lowest load per core breaks ties). The
+  spawn API's reply says where the agent went and why (`placementReason`).
+  Settings' default machine has an **Automatic** choice; picking
+  **hub (this machine)** keeps every spawn on the hub. Details: [docs/api.md](docs/api.md#post-apispawn).
+- **Agent limits per machine.** A project's `machineMaxAgents` (for
+  example `{"hub": 2, "box-b": 4}`) caps its agents on each machine, and a
+  top-level `hubMaxAgents` caps all projects' agents on the hub together.
+  Both are optional and editable in Settings; the existing limits are
+  unchanged. See [docs/configuration.md](docs/configuration.md).
+- **Machine metrics on the phone status page**: free RAM, swap, disk and
+  load under each machine's heading.
+
+**Changed:**
+
+- **A project that lists machines but has no default machine is now
+  placed automatically** instead of always going to the hub. To keep the
+  old behaviour, set its default machine to **hub (this machine)**
+  (`"hub"`).
+- **Switching a task's agent follows the task file.** Resume and re-spawn
+  read the assignee from the task's own branch (its worktree, or the
+  branch itself when the worktree is gone), on the hub and on workers, so
+  an assignee change committed there takes effect. When that copy cannot
+  be read, Centrale uses the main checkout's copy and says so. Resuming
+  with an agent that has no earlier conversation for the task starts it
+  fresh with a note about the work so far.
+- **Fleet always shows this machine's group** and its metrics when
+  machines are configured, even with no agents running here.
+
+**Fixed:**
+
+- **Worker connections survive short network drops**, and leftover
+  control connections are cleared on reconnect instead of piling up on
+  the worker.
+- **The version in the sidebar names only release tags**, never a
+  recovery tag such as `abandoned/...`.
+
+**Docs:**
+
+- Setting up a worker covers Codex installed without npm (one AppArmor
+  rule for every release), and Troubleshooting covers workers that drop
+  off because they sleep or because of Realtek Wi-Fi power saving.
+
 ## v0.6.0 — agents on other machines
 
 Centrale can now run agents on other machines over ssh, while the board,

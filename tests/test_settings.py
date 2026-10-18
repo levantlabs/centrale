@@ -306,6 +306,49 @@ class ApplySettingsSuccessTests(unittest.TestCase):
         with open(self.tmp_path) as f:
             return json.load(f)
 
+    def test_machine_limits_round_trip_clear_and_validate(self):
+        body = {"hubMaxAgents": 5, "machineMaxAgents": {"my-app": {"hub": 2}}}
+        result = settings.apply_settings(self.config, body, path=self.tmp_path)
+        self.assertEqual(result["hubMaxAgents"], 5)
+        self.assertEqual(result["machineMaxAgents"]["my-app"], {"hub": 2})
+        loaded = server.load_config(path=self.tmp_path)
+        self.assertEqual(loaded["hubMaxAgents"], 5)
+        self.assertEqual(loaded["projects"][0]["machineMaxAgents"], {"hub": 2})
+        for value in (0, -1, True, 1.5, "2"):
+            for body in ({"hubMaxAgents": value}, {"machineMaxAgents": {"my-app": {"hub": value}}}):
+                with self.subTest(body=body), self.assertRaises(settings.ValidationError):
+                    settings.apply_settings(self.config, body, path=self.tmp_path)
+        for value in ({"unknown": 1}, {"hub": None}, []):
+            with self.subTest(value=value), self.assertRaises(server.ConfigError):
+                server.normalize_machine_max_agents(value, [])
+        settings.apply_settings(self.config, {"hubMaxAgents": None, "machineMaxAgents": {"my-app": {}}}, path=self.tmp_path)
+        disk = self._read_disk()
+        self.assertNotIn("hubMaxAgents", disk)
+        self.assertNotIn("machineMaxAgents", disk["projects"][0])
+
+    def test_config_rejects_machine_limit_outside_its_project(self):
+        self.on_disk["machines"] = [{"name": "worker", "ssh": "worker", "repoRoot": "~/repos", "worktreeRoot": "~/work"}]
+        for caps in ({"worker": 2}, {"hub": 0}, {"hub": True}, {"hub": "2"}):
+            self.on_disk["projects"][0]["machineMaxAgents"] = caps
+            with open(self.tmp_path, "w") as stream:
+                json.dump(self.on_disk, stream)
+            with self.subTest(caps=caps), self.assertRaises(server.ConfigError):
+                server.load_config(path=self.tmp_path)
+
+    def test_machine_removal_drops_limits_in_live_and_disk_config(self):
+        import machines
+        machine = {"name": "worker", "ssh": "worker", "repoRoot": "~/repos", "worktreeRoot": "~/work"}
+        for remove in ({"projectMachines": {"my-app": []}}, {"machines": []}):
+            self.on_disk["machines"] = [machine]
+            self.on_disk["projects"][0].update(machines=["worker"], machineMaxAgents={"hub": 2, "worker": 3})
+            with open(self.tmp_path, "w") as stream:
+                json.dump(self.on_disk, stream)
+            config = server.load_config(path=self.tmp_path)
+            with mock.patch.object(machines, "machines_removal_refusal", return_value=None):
+                settings.apply_settings(config, remove, path=self.tmp_path)
+            self.assertEqual(config["projects"][0]["machineMaxAgents"], {"hub": 2})
+            self.assertEqual(server.load_config(path=self.tmp_path)["projects"][0]["machineMaxAgents"], {"hub": 2})
+
     def test_harvest_mode_applies_to_live_config_and_disk(self):
         result = settings.apply_settings(self.config, {"harvestMode": "auto"}, path=self.tmp_path)
         self.assertEqual(result["harvestMode"], "auto")

@@ -138,7 +138,7 @@ class SshConfigTests(SshDirTestCase):
         self.assertLess(user, host)
         self.assertLess(host, system)
         for option in ("BatchMode yes", "ConnectTimeout 5", "ServerAliveInterval 5",
-                       "ServerAliveCountMax 1", "ControlMaster auto", "ControlPersist 60",
+                       "ServerAliveCountMax 3", "ControlMaster auto", "ControlPersist 60",
                        f"ControlPath {M.ssh_dir()}/%C"):
             self.assertIn(option, body[host:system])
         self.assertEqual(stat.S_IMODE(os.stat(M.ssh_dir()).st_mode), 0o700)
@@ -592,7 +592,7 @@ class RemovalTests(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             saved = json.load(f)["projects"][0]
         self.assertNotIn("machines", saved)
-        self.assertNotIn("defaultMachine", saved)
+        self.assertEqual(saved["defaultMachine"], "hub")
         self.assertEqual(config["projects"][0]["machines"], [])
 
     def test_settings_rejects_unknown_machines_and_projects(self):
